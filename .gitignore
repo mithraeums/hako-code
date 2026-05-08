@@ -1,0 +1,12 @@
+.DS_Store
+*.swp
+hakoc
+hakoc.exe
+hakoc_asan
+hakoCLAW.rc
+hakoCLAW.res
+.hakoclaw.r
+*.o
+*.obj
+.claw/
+*.dSYM/
