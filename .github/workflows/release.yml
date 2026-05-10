@@ -1,0 +1,177 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v0.1*"
+      - "v[1-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.2)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            platform: linux
+            artifact: hakoCLAW-linux-x86_64.tar.gz
+            staging: hakoCLAW-linux-x86_64
+            sha: hakoCLAW-linux-x86_64.sha256
+
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            platform: linux
+            artifact: hakoCLAW-linux-arm64.tar.gz
+            staging: hakoCLAW-linux-arm64
+            sha: hakoCLAW-linux-arm64.sha256
+
+          - name: macos-universal
+            os: macos-latest
+            platform: macos
+            artifact: hakoCLAW-macos-universal.tar.gz
+            staging: hakoCLAW-macos-universal
+            sha: hakoCLAW-macos-universal.sha256
+
+          - name: windows-x86_64
+            os: windows-latest
+            platform: windows
+            artifact: hakoCLAW-windows-x86_64.zip
+            staging: hakoCLAW-windows-x86_64
+            sha: hakoCLAW-windows-x86_64.sha256
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (linux)
+        if: matrix.platform == 'linux'
+        run: |
+          make
+          ./hakoc --version
+          mkdir -p ${{ matrix.staging }}
+          cp hakoc README.md ${{ matrix.staging }}/
+          [ -f icon/hakoCLAW.png ] && cp icon/hakoCLAW.png ${{ matrix.staging }}/ || true
+          tar czf ${{ matrix.artifact }} ${{ matrix.staging }}
+          (cd ${{ matrix.staging }} && sha256sum hakoc > ../${{ matrix.sha }})
+
+      - name: Build (macos universal2)
+        if: matrix.platform == 'macos'
+        run: |
+          make UNIVERSAL=1
+          ./hakoc --version
+          file hakoc
+          mkdir -p ${{ matrix.staging }}
+          cp hakoc README.md ${{ matrix.staging }}/
+          [ -f icon/hakoCLAW.icns ] && cp icon/hakoCLAW.icns ${{ matrix.staging }}/ || true
+          tar czf ${{ matrix.artifact }} ${{ matrix.staging }}
+          (cd ${{ matrix.staging }} && shasum -a 256 hakoc > ../${{ matrix.sha }})
+
+      - name: Set up MSYS2
+        if: matrix.platform == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-binutils
+            make
+            zip
+
+      - name: Build (windows)
+        if: matrix.platform == 'windows'
+        shell: msys2 {0}
+        run: |
+          export PATH=/mingw64/bin:$PATH
+          make CC=gcc
+          ./hakoc.exe --version
+          mkdir -p ${{ matrix.staging }}
+          cp hakoc.exe README.md ${{ matrix.staging }}/
+          [ -f icon/hakoCLAW.ico ] && cp icon/hakoCLAW.ico ${{ matrix.staging }}/ || true
+          zip -r ${{ matrix.artifact }} ${{ matrix.staging }}
+          (cd ${{ matrix.staging }} && sha256sum hakoc.exe > ../${{ matrix.sha }})
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.sha }}
+          if-no-files-found: error
+
+  build-freebsd:
+    name: build (freebsd-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.1"
+          usesh: true
+          prepare: |
+            pkg install -y curl gmake gcc
+          run: |
+            gmake CC=gcc
+            ./hakoc --version
+            mkdir -p hakoCLAW-freebsd-x86_64
+            cp hakoc README.md hakoCLAW-freebsd-x86_64/
+            tar czf hakoCLAW-freebsd-x86_64.tar.gz hakoCLAW-freebsd-x86_64
+            (cd hakoCLAW-freebsd-x86_64 && printf '%s  hakoc\n' "$(sha256 -q hakoc)" > ../hakoCLAW-freebsd-x86_64.sha256)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-x86_64
+          path: |
+            hakoCLAW-freebsd-x86_64.tar.gz
+            hakoCLAW-freebsd-x86_64.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [build, build-freebsd]
+    runs-on: ubuntu-latest
+    if: always() && needs.build.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: hakoCLAW ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/**/hakoCLAW-linux-x86_64.tar.gz
+            dist/**/hakoCLAW-linux-arm64.tar.gz
+            dist/**/hakoCLAW-macos-universal.tar.gz
+            dist/**/hakoCLAW-windows-x86_64.zip
+            dist/**/hakoCLAW-freebsd-x86_64.tar.gz
+            dist/**/*.sha256

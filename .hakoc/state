@@ -1,0 +1,11 @@
+ai_provider=openai
+ai_model=gemini-2.5-flash
+ai_endpoint=https://generativelanguage.googleapis.com/v1beta/openai
+ai_api_key=AIzaSyDDX3cMZR9308M9cMVy2CK_YP9qPqtE-Sg
+ai_tools_enabled=1
+ai_stream=1
+ai_autowrite=1
+session_id=69fd8eac7d5b
+session_started=1778432612
+session_last_used=1778432636
+session_turn_count=2
