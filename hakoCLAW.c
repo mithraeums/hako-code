@@ -40,9 +40,12 @@
 #include <windows.h>
 #include <conio.h>
 #include <io.h>
+#include <direct.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifndef PATH_MAX
 #define PATH_MAX MAX_PATH
+#endif
 #define popen _popen
 #define pclose _pclose
 #define getcwd _getcwd
@@ -50,9 +53,11 @@
 #define STDOUT_FILENO 1
 #define read(fd, buf, n) _read(fd, buf, n)
 #define write(fd, buf, n) _write(fd, buf, n)
-#ifdef _MSC_VER
-#include <direct.h>
+/* mkdir(): <direct.h> declares 1-arg _mkdir; POSIX expects 2-arg. Map all 2-arg calls to _mkdir. */
 #define mkdir(p, m) _mkdir(p)
+/* realpath(): not in Windows libc. Use _fullpath. */
+#define realpath(p, r) _fullpath((r), (p), PATH_MAX)
+#ifdef _MSC_VER
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #define strcasecmp _stricmp
@@ -66,10 +71,6 @@
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #endif
-/* MinGW <direct.h> exports a 1-arg mkdir that conflicts with POSIX 2-arg form. Force ours. */
-#define mkdir(p, m) _mkdir(p)
-/* MinGW lacks POSIX realpath; _fullpath is the closest. */
-#define realpath(p, r) _fullpath((r), (p), PATH_MAX)
 /* MinGW <stdio.h> doesn't always expose POSIX getline. Provide a fallback. */
 #include <stdlib.h>
 static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
