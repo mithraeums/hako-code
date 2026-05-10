@@ -6,8 +6,9 @@ hakoc_asan
 hakoCLAW.rc
 hakoCLAW.res
 .hakoclaw.r
-.hakoc/
 *.o
 *.obj
 .claw/
+.hakoc/
+*.hakoc-pending
 *.dSYM/

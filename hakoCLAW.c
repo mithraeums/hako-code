@@ -40,7 +40,8 @@
 #include <windows.h>
 #include <conio.h>
 #include <io.h>
-#include <direct.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #define PATH_MAX MAX_PATH
 #define popen _popen
 #define pclose _pclose
@@ -50,8 +51,46 @@
 #define read(fd, buf, n) _read(fd, buf, n)
 #define write(fd, buf, n) _write(fd, buf, n)
 #ifdef _MSC_VER
+#include <direct.h>
+#define mkdir(p, m) _mkdir(p)
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
 #define strcasecmp _stricmp
+#endif
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#include <dirent.h>
+#include <unistd.h>
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#endif
+/* MinGW <direct.h> exports a 1-arg mkdir that conflicts with POSIX 2-arg form. Force ours. */
+#define mkdir(p, m) _mkdir(p)
+/* MinGW lacks POSIX realpath; _fullpath is the closest. */
+#define realpath(p, r) _fullpath((r), (p), PATH_MAX)
+/* MinGW <stdio.h> doesn't always expose POSIX getline. Provide a fallback. */
+#include <stdlib.h>
+static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
+	if (!lineptr || !n || !stream) return -1;
+	if (!*lineptr || *n == 0) { *n = 256; *lineptr = realloc(*lineptr, *n); if (!*lineptr) return -1; }
+	size_t len = 0; int c;
+	while ((c = fgetc(stream)) != EOF) {
+		if (len + 1 >= *n) {
+			size_t nn = *n * 2;
+			char *t = realloc(*lineptr, nn);
+			if (!t) return -1;
+			*lineptr = t; *n = nn;
+		}
+		(*lineptr)[len++] = (char)c;
+		if (c == '\n') break;
+	}
+	if (len == 0 && c == EOF) return -1;
+	(*lineptr)[len] = '\0';
+	return (long)len;
+}
+#define getline hk_getline
 #endif
 #else
 #include <sys/ioctl.h>
@@ -672,13 +711,13 @@ static void clApplyEnv(void) {
 }
 
 /*** session/state ***/
-static void hkWriteSessionFile(const char *path) {
+static void hkWriteSessionFile(const char *path, int include_secrets) {
 	FILE *fp = fopen(path, "w");
 	if (!fp) return;
 	fprintf(fp, "ai_provider=%s\n", hkProviderName(E.ai_provider_type));
 	if (E.ai_model) fprintf(fp, "ai_model=%s\n", E.ai_model);
-	if (E.ai_endpoint) fprintf(fp, "ai_endpoint=%s\n", E.ai_endpoint);
-	if (E.ai_api_key) fprintf(fp, "ai_api_key=%s\n", E.ai_api_key);
+	if (include_secrets && E.ai_endpoint) fprintf(fp, "ai_endpoint=%s\n", E.ai_endpoint);
+	if (include_secrets && E.ai_api_key)  fprintf(fp, "ai_api_key=%s\n", E.ai_api_key);
 	fprintf(fp, "ai_tools_enabled=%d\n", E.ai_tools_enabled);
 	fprintf(fp, "ai_stream=%d\n", E.ai_stream);
 	fprintf(fp, "ai_autowrite=%d\n", E.ai_autowrite);
@@ -687,8 +726,8 @@ static void hkWriteSessionFile(const char *path) {
 	fprintf(fp, "session_last_used=%ld\n", (long)time(NULL));
 	fprintf(fp, "session_turn_count=%d\n", E.session_turn_count);
 	fclose(fp);
-	/* permission tighten: ~/.hakoc/state holds api_key */
 #ifndef _WIN32
+	/* Always 0600 — defense in depth even when no secret present this run. */
 	chmod(path, 0600);
 #endif
 }
@@ -699,7 +738,7 @@ static void hkSaveSession(void) {
 	if (dir[0]) {
 		char path[640];
 		snprintf(path, sizeof(path), "%s/state", dir);
-		hkWriteSessionFile(path);
+		hkWriteSessionFile(path, 1);   /* global: holds key */
 	}
 	char pdir[PATH_MAX];
 	if (hkProjectDirPath(pdir, sizeof(pdir))) {
@@ -707,7 +746,7 @@ static void hkSaveSession(void) {
 		snprintf(ppath, sizeof(ppath), "%s/state", pdir);
 		struct stat st;
 		if (stat(pdir, &st) == 0 && S_ISDIR(st.st_mode)) {
-			hkWriteSessionFile(ppath);
+			hkWriteSessionFile(ppath, 0);  /* per-project: NEVER write api_key/endpoint */
 		}
 	}
 }

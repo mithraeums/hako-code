@@ -38,9 +38,17 @@ endif
 
 all: $(BIN)
 
-# ---------- Windows: embed icon via resource ----------
+# ---------- Windows: embed icon via resource (optional — skip if .ico missing) ----------
 ifeq ($(PLATFORM),windows)
 
+HAS_ICO := $(wildcard $(ICON_DIR)/hakoCLAW.ico)
+
+ifeq ($(HAS_ICO),)
+# No icon — plain build.
+$(BIN): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDLIBS)
+else
+# Embed icon via windres.
 hakoCLAW.rc:
 	@printf 'IDI_ICON1 ICON "$(ICON_DIR)/hakoCLAW.ico"\n' > $@
 
@@ -49,6 +57,7 @@ hakoCLAW.res: hakoCLAW.rc $(ICON_DIR)/hakoCLAW.ico
 
 $(BIN): $(SRC) hakoCLAW.res
 	$(CC) $(CFLAGS) $(SRC) hakoCLAW.res -o $@ $(LDLIBS)
+endif
 
 endif
 
