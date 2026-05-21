@@ -16,6 +16,7 @@ BIN      = hakoc
 ifeq ($(OS),Windows_NT)
     PLATFORM = windows
     BIN := hakoc.exe
+    LDLIBS += -lws2_32
 else
     UNAME_S := $(shell uname -s)
     ifeq ($(UNAME_S),Darwin)
