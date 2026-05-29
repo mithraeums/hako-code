@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
-# hakoCLAW installer. Fetches latest GitHub release for current OS/arch.
-# Usage:  curl -fsSL https://raw.githubusercontent.com/mithraeums/hakoCLAW/main/install.sh | sh
-# Env:    REPO=owner/hakoCLAW   (override default)
-#         PREFIX=/usr/local      (install dir; defaults to ~/.local if not writable)
-#         VERIFY=0               (skip sha256 verify; default 1)
+# hako-code installer. Fetches latest GitHub release for current OS/arch.
+# Usage:  curl -fsSL https://raw.githubusercontent.com/mithraeums/hako-code/main/install.sh | sh
+# Env:    REPO=owner/hako-code   (override default)
+#         PREFIX=/usr/local       (install dir; defaults to ~/.local if not writable)
+#         VERIFY=0                (skip sha256 verify; default 1)
 
 set -eu
 
-REPO="${REPO:-mithraeums/hakoCLAW}"
+REPO="${REPO:-mithraeums/hako-code}"
 PREFIX="${PREFIX:-}"
 VERIFY="${VERIFY:-1}"
 
@@ -17,22 +17,22 @@ uname_m="$(uname -m)"
 case "$uname_s" in
 	Linux*)
 		case "$uname_m" in
-			x86_64|amd64)   asset="hakoCLAW-linux-x86_64.tar.gz";   dirname="hakoCLAW-linux-x86_64";   bin=hakoc; ext=tar.gz ;;
-			arm64|aarch64)  asset="hakoCLAW-linux-arm64.tar.gz";    dirname="hakoCLAW-linux-arm64";    bin=hakoc; ext=tar.gz ;;
+			x86_64|amd64)   asset="hako-code-linux-x86_64.tar.gz";   dirname="hako-code-linux-x86_64";   bin=hako; ext=tar.gz ;;
+			arm64|aarch64)  asset="hako-code-linux-arm64.tar.gz";    dirname="hako-code-linux-arm64";    bin=hako; ext=tar.gz ;;
 			*) echo "unsupported linux arch: $uname_m" >&2; exit 1 ;;
 		esac
 		;;
 	Darwin*)
-		asset="hakoCLAW-macos-universal.tar.gz"; dirname="hakoCLAW-macos-universal"; bin=hakoc; ext=tar.gz
+		asset="hako-code-macos-universal.tar.gz"; dirname="hako-code-macos-universal"; bin=hako; ext=tar.gz
 		;;
 	FreeBSD*)
 		case "$uname_m" in
-			amd64|x86_64) asset="hakoCLAW-freebsd-x86_64.tar.gz"; dirname="hakoCLAW-freebsd-x86_64"; bin=hakoc; ext=tar.gz ;;
+			amd64|x86_64) asset="hako-code-freebsd-x86_64.tar.gz"; dirname="hako-code-freebsd-x86_64"; bin=hako; ext=tar.gz ;;
 			*) echo "unsupported freebsd arch: $uname_m" >&2; exit 1 ;;
 		esac
 		;;
 	MINGW*|MSYS*|CYGWIN*)
-		asset="hakoCLAW-windows-x86_64.zip"; dirname="hakoCLAW-windows-x86_64"; bin=hakoc.exe; ext=zip
+		asset="hako-code-windows-x86_64.zip"; dirname="hako-code-windows-x86_64"; bin=hako.exe; ext=zip
 		;;
 	*) echo "unsupported OS: $uname_s" >&2; exit 1 ;;
 esac
