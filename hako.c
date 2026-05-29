@@ -62,6 +62,10 @@
 #define mkdir(p, m) _mkdir(p)
 /* realpath(): not in Windows libc. Use _fullpath. */
 #define realpath(p, r) _fullpath((r), (p), PATH_MAX)
+/* No <sys/wait.h> on Windows; _pclose returns the exit status directly. */
+#ifndef WEXITSTATUS
+#define WEXITSTATUS(x) (x)
+#endif
 #ifdef _MSC_VER
 #define S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
 #define S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
