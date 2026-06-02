@@ -53,10 +53,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build (linux)
+      # The native engine lives in mithraeums/hako; `make hakm` links its
+      # libhakm.a. Check it out alongside so ../hako/engine is reachable.
+      - name: Checkout engine (mithraeums/hako)
+        uses: actions/checkout@v4
+        with:
+          repository: mithraeums/hako
+          path: hako-engine-src
+
+      - name: Build (linux — engine-linked)
         if: matrix.platform == 'linux'
         run: |
-          make
+          make hakm HAKM_DIR=hako-engine-src/engine
           ./hako --version
           mkdir -p ${{ matrix.staging }}
           cp hako README.md ${{ matrix.staging }}/
@@ -64,10 +72,12 @@ jobs:
           tar czf ${{ matrix.artifact }} ${{ matrix.staging }}
           (cd ${{ matrix.staging }} && sha256sum hako > ../${{ matrix.sha }})
 
-      - name: Build (macos universal2)
+      # Universal2: -march=native is incompatible with multi-arch, so the engine
+      # builds its portable path (-arch arm64 -arch x86_64, scalar/auto-vec int8).
+      - name: Build (macos universal2 — engine-linked)
         if: matrix.platform == 'macos'
         run: |
-          make UNIVERSAL=1
+          make hakm UNIVERSAL=1 HAKM_DIR=hako-engine-src/engine
           ./hako --version
           file hako
           mkdir -p ${{ matrix.staging }}
@@ -88,7 +98,11 @@ jobs:
             make
             zip
 
-      - name: Build (windows)
+      # Windows: plain build, NO engine. The engine uses POSIX mmap (sys/mman.h)
+      # which MinGW lacks, so `make hakm` won't compile here. Cloud providers work;
+      # local `:provider mithraeum` is unavailable on Windows until an mmap shim
+      # lands. Linux/macOS/FreeBSD ship the engine.
+      - name: Build (windows — cloud only, no local engine)
         if: matrix.platform == 'windows'
         shell: msys2 {0}
         run: |
@@ -116,7 +130,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build in FreeBSD VM
+      - name: Checkout engine (mithraeums/hako)
+        uses: actions/checkout@v4
+        with:
+          repository: mithraeums/hako
+          path: hako-engine-src
+
+      - name: Build in FreeBSD VM (engine-linked)
         uses: vmactions/freebsd-vm@v1
         with:
           release: "14.1"
@@ -124,7 +144,7 @@ jobs:
           prepare: |
             pkg install -y curl gmake gcc
           run: |
-            gmake CC=gcc
+            gmake hakm CC=gcc MAKE=gmake HAKM_DIR=hako-engine-src/engine
             ./hako --version
             mkdir -p hako-code-freebsd-x86_64
             cp hako README.md hako-code-freebsd-x86_64/

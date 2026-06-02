@@ -3,7 +3,23 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
-## [v0.1.6] — 2026-05-25 (unreleased)
+## [v0.1.7] — 2026-06-02
+
+### Changed — `mithraeum` provider runs the native engine IN-PROCESS (no ollama)
+- **The `mithraeum` provider no longer speaks ollama HTTP.** It links the hako engine (`libhakm.a`) and runs the model **in this process** via `hakm_chat`. Zero subprocess / socket / server / ollama. The earlier "hakm-server v0.1.7 port" plan is dead — superseded by the in-process engine.
+- **Build: `make hakm`** — links `../hako/engine/libhakm.a` (`make -C ../hako/engine lib` bootstraps it) + `-DHAKO_HAVE_HAKM`. Plain `make` still builds but omits the engine (MITHRAEUM would fail), so the shipped release asset MUST be the `make hakm` build. Endpoint sentinel: `hakm://in-process` (curl path never taken for mithraeum).
+- **Send path intercepted** — `hkMithraeumChat` builds `hakm_msg[]` from `data->messages`, runs `hakm_chat`, feeds the reply into the existing prose-XML tool loop. Never reaches `aiBuildCurlCommand`. All under `#ifdef HAKO_HAVE_HAKM`.
+
+### Added — filesystem model resolution + graceful fallback
+- **Model id → `~/.hako/models/<id>.mlf2`.** `clDetectKoiDefault` + `:models` now scan `~/.hako/models/*.mlf2`, NOT `ollama list` / `/api/tags`. Preference: koi > koi-mini > sho; `-v*` over `-stock`. (`clDetectKoiDefault` keeps an ollama-list fallback only when no local `.mlf2` exists.)
+- **Graceful weight fallback** — if the configured model has no weights, `hkMithraeumFirstAvailable` picks the first installed `.mlf2` (prefers sho), warns, repoints `E.ai_model`, `hkSaveSession()`. Fixes the stale per-project `ai_model=hako-koi-*` "no such file" crash.
+
+### Notes
+- `AI_PROVIDER_OLLAMA` stays as a SEPARATE optional provider (run qwen3.6 via ollama). Only the hako-models path is ollama-free.
+- Engine perf (in `mithraeums/hako`): int8 dot path → ~2.25 tok/s on the 3B (Intel i3).
+- Windows ships plain `make` (cloud-only; engine uses POSIX `mmap`, MinGW lacks `sys/mman.h`).
+
+## [v0.1.6] — 2026-05-25
 
 ### Added — mithraeum provider (real, distinct from ollama)
 - **`AI_PROVIDER_MITHRAEUM`** — distinct enum, displays as `mithraeum` in the status chip (was aliasing to `ollama`). Wire format = ollama-compat HTTP for v0.1.6 (port 11434), swaps to native `hakm-server` port in v0.1.7. Aliases: `:provider mithraeum` / `hakm` / `koi`.

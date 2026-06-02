@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define HAKO_VERSION "0.1.6"
+#define HAKO_VERSION "0.1.7"
 
 /* GitHub Copilot OAuth + API constants. Public client_id from VS Code Copilot extension.
    Defined here so hkBuildCurlCmd (earlier in file) can reference the Editor-* headers. */
@@ -910,9 +910,10 @@ static enum aiProviderType hkParseProvider(const char *s) {
 
 static const char *hkProviderDefaultEndpoint(const char *s) {
 	if (strcmp(s, "ollama") == 0 || strcmp(s, "local") == 0) return "http://localhost:11434";
-	/* mithraeum: same port as ollama for v0.1.6 (transitional). v0.1.7 swaps to own port. */
+	/* mithraeum: runs IN-PROCESS via the linked hako engine — no network, no
+	   ollama. This endpoint is a sentinel only; the curl path is never taken. */
 	if (strcmp(s, "mithraeum") == 0 || strcmp(s, "hakm") == 0 || strcmp(s, "koi") == 0)
-		return "http://localhost:11434";
+		return "hakm://in-process";
 	if (strcmp(s, "ollamacloud") == 0 || strcmp(s, "ocloud") == 0 || strcmp(s, "ollama-cloud") == 0)
 		return "https://ollama.com";
 	if (strcmp(s, "deepseek") == 0)   return "https://api.deepseek.com";
@@ -3269,6 +3270,141 @@ static long clWallMs(void) {
 }
 
 /*** worker thread ***/
+#ifdef HAKO_HAVE_HAKM
+/* ── Local in-process inference (no ollama / server / socket) ──
+   The hako engine is linked directly into this binary. MITHRAEUM models run
+   here, in this process, over mmap'd MLF2 weights. See hako/engine/src/. */
+#include "hakm_api.h"
+
+static hakm_session *g_hakm = NULL;      /* resident engine session */
+static char         *g_hakm_path = NULL; /* weight file currently open */
+
+/* Resolve a model id to a weight file. Absolute paths pass through; bare ids
+   map to ~/.hako/models/<id>.mlf2 . Caller frees. */
+static char *hkMithraeumModelPath(const char *model) {
+	if (!model || !*model) model = "hako-sho-stock";
+	if (model[0] == '/') return strdup(model);
+	const char *home = getenv("HOME"); if (!home) home = ".";
+	size_t n = strlen(home) + strlen(model) + 32;
+	char *p = malloc(n);
+	if (p) snprintf(p, n, "%s/.hako/models/%s.mlf2", home, model);
+	return p;
+}
+
+/* First installed weight under ~/.hako/models (strip .mlf2). Returns malloc'd
+   model id or NULL if none. Used as a fallback when the configured model — often
+   a stale per-project state pointing at a tier with no weights — is missing. */
+static char *hkMithraeumFirstAvailable(void) {
+	const char *home = getenv("HOME"); if (!home) home = ".";
+	char dir[1024];
+	snprintf(dir, sizeof(dir), "%s/.hako/models", home);
+	DIR *d = opendir(dir);
+	if (!d) return NULL;
+	char *found = NULL;
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL) {
+		size_t nl = strlen(de->d_name);
+		if (nl <= 5 || strcmp(de->d_name + nl - 5, ".mlf2") != 0) continue;
+		found = strndup(de->d_name, nl - 5);   /* prefer sho if present */
+		if (strncmp(de->d_name, "hako-sho-", 9) == 0) break;
+	}
+	closedir(d);
+	return found;
+}
+
+/* emit callback: accumulate decoded UTF-8 chunks into a growable buffer. */
+struct hkEmitBuf { char *s; size_t n; };
+static int hkMithraeumEmit(const char *chunk, int len, void *ud) {
+	struct hkEmitBuf *b = ud;
+	char *t = realloc(b->s, b->n + (size_t)len + 1);
+	if (!t) return 1;                    /* abort generation on OOM */
+	b->s = t;
+	memcpy(b->s + b->n, chunk, (size_t)len);
+	b->n += (size_t)len;
+	b->s[b->n] = '\0';
+	return 0;
+}
+
+/* Run one completion over data->messages in-process. Returns malloc'd reply
+   (caller frees) or NULL with *err set (malloc'd). Caches the session per
+   weight file so repeated turns skip the mmap/load. */
+static char *hkMithraeumChat(aiData *data, char **err) {
+	const char *model = E.ai_model ? E.ai_model : "hako-sho-stock";
+	char *path = hkMithraeumModelPath(model);
+	if (!path) { if (err) *err = strdup("Error: out of memory"); return NULL; }
+
+	/* If the configured model's weights are missing (common when per-project
+	   state remembers a tier that was never converted, e.g. hako-koi-v0), fall
+	   back to the first installed .mlf2 instead of hard-failing. Repoint
+	   E.ai_model so the rest of the session + the footer reflect reality. */
+	struct stat stbuf;
+	if (stat(path, &stbuf) != 0) {
+		char *avail = hkMithraeumFirstAvailable();
+		if (avail) {
+			pthread_mutex_lock(&data->lock);
+			char note[256];
+			snprintf(note, sizeof(note),
+				"model '%s' has no weights — falling back to '%s'. :model <name> to pick another.",
+				model, avail);
+			aiAddHistory(data, note);
+			pthread_mutex_unlock(&data->lock);
+			free(E.ai_model); E.ai_model = strdup(avail);
+			hkSaveSession();          /* stop the stale state from biting again */
+			free(path);
+			path = hkMithraeumModelPath(avail);
+			free(avail);
+			if (!path) { if (err) *err = strdup("Error: out of memory"); return NULL; }
+		}
+		/* else: no models installed at all — let hakm_session_open fail with the
+		   convert-a-GGUF hint below. */
+	}
+
+	if (!g_hakm || !g_hakm_path || strcmp(g_hakm_path, path) != 0) {
+		if (g_hakm) { hakm_session_close(g_hakm); g_hakm = NULL; }
+		free(g_hakm_path); g_hakm_path = NULL;
+		g_hakm = hakm_session_open(path, 4096);
+		if (!g_hakm) {
+			if (err) {
+				size_t n = strlen(path) + 200;
+				char *m = malloc(n);
+				if (m) snprintf(m, n,
+					"Error: hako engine could not load %s\n"
+					"  no .mlf2 in ~/.hako/models — convert a GGUF with "
+					"hako/engine/tools/gguf2mlf.py and drop it there.",
+					path);
+				*err = m;
+			}
+			free(path);
+			return NULL;
+		}
+		g_hakm_path = path; path = NULL;
+	}
+	free(path);
+
+	hakm_msg *msgs = calloc((size_t)data->message_count + 1, sizeof *msgs);
+	if (!msgs) { if (err) *err = strdup("Error: out of memory"); return NULL; }
+	int n = 0;
+	for (int i = 0; i < data->message_count; i++) {
+		aiMessage *m = &data->messages[i];
+		if (m->raw) continue;            /* engine consumes plain text only */
+		msgs[n].role    = m->role ? m->role : "user";
+		msgs[n].content = m->content ? m->content : "";
+		n++;
+	}
+	if (n == 0) { free(msgs); if (err) *err = strdup("Error: nothing to send"); return NULL; }
+
+	hakm_params p; hakm_params_default(&p);
+	p.n_new = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
+
+	struct hkEmitBuf buf = { NULL, 0 };
+	int got = hakm_chat(g_hakm, msgs, n, &p, hkMithraeumEmit, &buf);
+	free(msgs);
+	if (got < 0) { free(buf.s); if (err) *err = strdup("Error: hako engine generation failed"); return NULL; }
+	if (!buf.s) buf.s = strdup("");
+	return buf.s;
+}
+#endif /* HAKO_HAVE_HAKM */
+
 static void *aiWorkerThread(void *arg) {
 	aiData *data = (aiData *)arg;
 
@@ -3289,6 +3425,54 @@ static void *aiWorkerThread(void *arg) {
 		clStartAnim(data);
 
 		clOAuthEnsureFresh(data);
+
+#ifdef HAKO_HAVE_HAKM
+		/* Local hako models run IN-PROCESS through the linked engine — no curl,
+		   no socket, no server, no ollama. Generate, then feed the reply into
+		   the same prose-tool loop every other provider uses. */
+		if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) {
+			char *herr = NULL;
+			char *content = hkMithraeumChat(data, &herr);
+			clStopAnim(data);
+			if (!content) {
+				pthread_mutex_lock(&data->lock);
+				aiAddHistory(data, herr ? herr : "Error: hako engine failed");
+				data->streaming = 0;
+				pthread_mutex_unlock(&data->lock);
+				free(herr);
+				return NULL;
+			}
+
+			pthread_mutex_lock(&data->lock);
+			if (*content) {
+				aiAddHistoryRole(data, content, HK_ROLE_AI);
+				hkLogMessage("assistant", content);
+				free(data->current_response);
+				data->current_response = strdup(content);
+			}
+			pthread_mutex_unlock(&data->lock);
+
+			/* MITHRAEUM always uses prose-XML tools (small local models can't
+			   emit reliable JSON tool_calls). Scan + execute, else final. */
+			if (*content && (strstr(content, "<tool") || strstr(content, "<invoke name="))) {
+				pthread_mutex_lock(&data->lock);
+				aiPushMessage(data, "assistant", content);
+				pthread_mutex_unlock(&data->lock);
+				int nt = hkReactToolExecAll(data, content);
+				free(content);
+				if (nt == 0) break;      /* no parsable tool block — final answer */
+				used_tool = 1;
+				continue;
+			}
+
+			pthread_mutex_lock(&data->lock);
+			if (*content) aiPushMessage(data, "assistant", content);
+			else aiAddHistory(data, "Error: empty response from hako engine");
+			pthread_mutex_unlock(&data->lock);
+			free(content);
+			break;
+		}
+#endif /* HAKO_HAVE_HAKM */
 
 		pthread_mutex_lock(&data->lock);
 		char *cmd = aiBuildCurlCommand(data, E.ai_provider_type);
@@ -3846,8 +4030,42 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	if (strncmp(cmd, "models", cmdlen) == 0 && cmdlen == 6) {
 		const char *prov = hkProviderName(E.ai_provider_type);
 		const char *endpoint = E.ai_endpoint;
-		/* Ollama / local: live query against /api/tags. Otherwise: curated suggestions. */
-		int is_ollama = HK_IS_OLLAMA_WIRE(E.ai_provider_type);
+		/* Mithraeum: list locally-installed .mlf2 weights under ~/.hako/models.
+		   No network, no ollama — the engine runs these in-process. */
+		if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) {
+			const char *home = getenv("HOME"); if (!home) home = ".";
+			char mdir[1024];
+			snprintf(mdir, sizeof(mdir), "%s/.hako/models", home);
+			aiAddHistory(data, "hako family (mithraeum runtime — in-process, no ollama):");
+			aiAddHistory(data, "  installed (~/.hako/models):");
+			int count = 0;
+			DIR *d = opendir(mdir);
+			if (d) {
+				struct dirent *de;
+				while ((de = readdir(d)) != NULL) {
+					size_t nl = strlen(de->d_name);
+					if (nl <= 5 || strcmp(de->d_name + nl - 5, ".mlf2") != 0) continue;
+					int idn = (int)(nl - 5);   /* strip ".mlf2" */
+					int active = E.ai_model && (int)strlen(E.ai_model) == idn
+						&& !strncmp(E.ai_model, de->d_name, idn);
+					char line[300];
+					snprintf(line, sizeof(line), "    %s %.*s", active ? "◎" : " ", idn, de->d_name);
+					aiAddHistory(data, line);
+					count++;
+				}
+				closedir(d);
+			}
+			if (count == 0)
+				aiAddHistory(data, "    (none — convert a GGUF with hako/engine/tools/gguf2mlf.py → drop the .mlf2 here)");
+			else {
+				char msg[80];
+				snprintf(msg, sizeof(msg), "  %d installed. :model <name> to select.", count);
+				aiAddHistory(data, msg);
+			}
+			return 1;
+		}
+		/* Ollama: live query against /api/tags. Otherwise: curated suggestions. */
+		int is_ollama = (E.ai_provider_type == AI_PROVIDER_OLLAMA);
 		if (is_ollama) {
 			if (!endpoint || !*endpoint) endpoint = "http://localhost:11434";
 			char curlcmd[512];
@@ -3877,17 +4095,11 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				aiAddHistory(data, msg);
 				free(buf); return 1;
 			}
-			int is_mithraeum = (E.ai_provider_type == AI_PROVIDER_MITHRAEUM);
 			int count = 0;
 			const char *p = buf;
-			if (is_mithraeum) {
-				aiAddHistory(data, "hako family (mithraeum runtime):");
-				aiAddHistory(data, "  available now:");
-			} else {
-				char hdr[128];
-				snprintf(hdr, sizeof(hdr), "installed locally on %s:", endpoint);
-				aiAddHistory(data, hdr);
-			}
+			char hdr[128];
+			snprintf(hdr, sizeof(hdr), "installed locally on %s:", endpoint);
+			aiAddHistory(data, hdr);
 			while ((p = strstr(p, "\"name\":\"")) != NULL) {
 				p += 8;
 				const char *e = p;
@@ -3895,11 +4107,6 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				if (!*e) break;
 				int n = (int)(e - p);
 				if (n > 200) n = 200;
-				/* Mithraeum: only surface hako-* models; hide the unrelated ollama installs. */
-				if (is_mithraeum && (n < 5 || strncmp(p, "hako-", 5) != 0)) {
-					p = e;
-					continue;
-				}
 				int active = E.ai_model && (int)strlen(E.ai_model) == n && !strncmp(E.ai_model, p, n);
 				char line[256];
 				snprintf(line, sizeof(line), "    %s %.*s", active ? "◎" : " ", n, p);
@@ -3907,17 +4114,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				count++;
 				p = e;
 			}
-			if (is_mithraeum) {
-				if (count == 0) {
-					aiAddHistory(data, "    (none — `hakm pull sho` or `hakm pull koi-mini` to install)");
-				}
-				aiAddHistory(data, "  queued (need rented GPU):");
-				aiAddHistory(data, "    hako-sho-v0.0.1         first fine-tune (mithraeum docs + C/Zig/asm)");
-				aiAddHistory(data, "    hako-koi-mini-v0.0.1    same recipe at 7B");
-				aiAddHistory(data, "    hako-koi-v0.0.1         14B/32B fine-tune");
-				aiAddHistory(data, "  reserved:");
-				aiAddHistory(data, "    hako-samurai-v0.0.1     50B+ max tier, waits on hardware");
-			} else if (count == 0) {
+			if (count == 0) {
 				aiAddHistory(data, "  (none — `ollama pull <model>` to add one)");
 			} else {
 				char msg[64];
@@ -6256,6 +6453,65 @@ static int clPipeMode(aiData *data) {
 static int clDetectKoiDefault(void) {
 	if (E.ai_provider_type != AI_PROVIDER_NONE) return 0;
 	if (E.ai_api_key || E.ai_oauth_refresh) return 0;
+
+	/* Prefer LOCAL engine weights: scan ~/.hako/models for .mlf2 files. If any
+	   hako model is installed, default to the in-process mithraeum runtime — no
+	   ollama needed. Preference: koi > koi-mini > sho; fine-tunes over stock. */
+	{
+		const char *home = getenv("HOME"); if (!home) home = ".";
+		char mdir[1024];
+		snprintf(mdir, sizeof(mdir), "%s/.hako/models", home);
+		char lkoi[128]={0}, lmini[128]={0}, lsho[128]={0};
+		char lkoi_s[128]={0}, lmini_s[128]={0}, lsho_s[128]={0};
+		DIR *md = opendir(mdir);
+		if (md) {
+			struct dirent *de;
+			while ((de = readdir(md)) != NULL) {
+				size_t nl = strlen(de->d_name);
+				if (nl <= 5 || strcmp(de->d_name + nl - 5, ".mlf2") != 0) continue;
+				char tag[128] = {0};
+				int idn = (int)(nl - 5);
+				if (idn > (int)sizeof(tag)-1) idn = (int)sizeof(tag)-1;
+				memcpy(tag, de->d_name, idn); tag[idn] = '\0';
+				int is_stock = (strstr(tag, "-stock") != NULL);
+				int is_ver   = (strstr(tag, "-v") != NULL);
+				if (strstr(tag, "hako-koi-mini-")) {
+					if (is_ver && !lmini[0]) strncpy(lmini, tag, sizeof(lmini)-1);
+					else if (is_stock && !lmini_s[0]) strncpy(lmini_s, tag, sizeof(lmini_s)-1);
+				} else if (strstr(tag, "hako-koi-")) {
+					if (is_ver && !lkoi[0]) strncpy(lkoi, tag, sizeof(lkoi)-1);
+					else if (is_stock && !lkoi_s[0]) strncpy(lkoi_s, tag, sizeof(lkoi_s)-1);
+				}
+				if (strstr(tag, "hako-sho-")) {
+					if (is_ver && !lsho[0]) strncpy(lsho, tag, sizeof(lsho)-1);
+					else if (is_stock && !lsho_s[0]) strncpy(lsho_s, tag, sizeof(lsho_s)-1);
+				}
+			}
+			closedir(md);
+		}
+		const char *lpick = NULL;
+		if      (lkoi[0])    lpick = lkoi;
+		else if (lmini[0])   lpick = lmini;
+		else if (lsho[0])    lpick = lsho;
+		else if (lkoi_s[0])  lpick = lkoi_s;
+		else if (lmini_s[0]) lpick = lmini_s;
+		else if (lsho_s[0])  lpick = lsho_s;
+		if (lpick) {
+			hkApplyProviderAlias("mithraeum");
+			free(E.ai_endpoint); E.ai_endpoint = strdup("hakm://in-process");
+			free(E.ai_model);    E.ai_model    = strdup(lpick);
+			hkSaveSession();
+			if (isatty(STDOUT_FILENO)) {
+				const char *R = E.color_enabled ? ANSI_RESET : "";
+				const char *M = E.color_enabled ? TH_META   : "";
+				printf("  %s%s detected locally, running in-process via mithraeum (no ollama).%s\n", M, lpick, R);
+			}
+			return 1;
+		}
+	}
+
+	/* Fallback: no local weights. Detect a hako model pulled into ollama as a
+	   convenience (ollama optional — hako never requires it). */
 	FILE *fp = popen("ollama list 2>/dev/null", "r");
 	if (!fp) return 0;
 	char line[512];

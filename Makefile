@@ -13,6 +13,15 @@ ICON_DIR = icon
 SRC      = hako.c
 BIN      = hako
 
+# Local in-process inference. `make hakm` links the models project's prebuilt
+# engine library (libhakm.a, built in ../hako/engine) + defines HAKO_HAVE_HAKM so
+# the MITHRAEUM provider runs models IN-PROCESS over mmap'd MLF2 weights — zero
+# ollama at runtime. The agent never compiles engine sources; it only consumes
+# the lib + header, keeping the project boundary clean.
+HAKM_DIR ?= ../hako/engine
+HAKM_LIB := $(HAKM_DIR)/libhakm.a
+HAKM_INC := $(HAKM_DIR)/src
+
 ifeq ($(OS),Windows_NT)
     PLATFORM = windows
     BIN := hako.exe
@@ -28,16 +37,38 @@ else
     endif
 endif
 
-# macOS universal2 toggle: make UNIVERSAL=1 → fat binary (arm64 + x86_64).
+# Arch tuning for the engine-linked build. Native by default; the engine's
+# matmul uses -march=native intrinsics. For macOS universal2 (UNIVERSAL=1) swap
+# to multi-arch — -march=native and -arch are mutually exclusive, so the engine
+# falls back to its portable scalar/auto-vectorized path on a fat build.
+HAKM_ARCH ?= -march=native
 ifeq ($(PLATFORM),macos)
     ifeq ($(UNIVERSAL),1)
-        CFLAGS += -arch arm64 -arch x86_64
+        CFLAGS    += -arch arm64 -arch x86_64
+        HAKM_ARCH := -arch arm64 -arch x86_64
     endif
 endif
 
-.PHONY: all clean asan icons install uninstall
+.PHONY: all hakm clean asan icons install uninstall
 
 all: $(BIN)
+
+# ---------- engine-linked build (ollama-free local inference) ----------
+# Same `hako` binary, linked against the prebuilt libhakm.a. The engine lib is
+# built by its own Makefile in $(HAKM_DIR), passing the same ARCH so the lib and
+# the agent agree on target arch (critical for cross / universal builds). -lm for
+# the dequant math. Platform-agnostic (no icon step).
+# NOTE: when switching ARCH in an existing tree (e.g. native → UNIVERSAL=1), run
+#   make -C $(HAKM_DIR) clean   first — make won't rebuild .o on flag-only changes.
+# CI does a fresh checkout per build, so this only matters for local arch swaps.
+$(HAKM_LIB):
+	$(MAKE) -C $(HAKM_DIR) lib ARCH="$(HAKM_ARCH)"
+
+hakm: $(SRC) $(HAKM_LIB)
+	$(CC) -std=c11 -O2 -pthread -Wall $(HAKM_ARCH) \
+		-DHAKO_HAVE_HAKM -I$(HAKM_INC) \
+		$(SRC) $(HAKM_LIB) -o $(BIN) $(LDLIBS) -lm
+	@echo "built $(BIN) linked against libhakm.a (in-process, no ollama). models: ~/.hako/models/*.mlf2"
 
 # ---------- icons ----------
 # Regenerate icon/hako.{icns,ico,png} from icon/hako.svg.
