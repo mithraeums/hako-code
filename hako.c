@@ -32,6 +32,14 @@
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
 #define HAKO_REPO    "mithraeums/hako-code"
 
+/* glibc hides POSIX funcs (usleep/useconds_t, strdup, strndup, getline,
+   strcasecmp, gethostname, gettimeofday, mkstemp, readlink) behind feature-test
+   macros under strict -std=c11. macOS libc exposes them regardless; Linux does
+   not. Define before ANY system header. */
+#ifndef _WIN32
+#define _GNU_SOURCE
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -113,6 +121,8 @@ static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
 #include <signal.h>
 #include <dirent.h>
 #include <limits.h>
+#include <strings.h>	/* strcasecmp — glibc: not pulled by <string.h> */
+#include <sys/time.h>	/* gettimeofday — glibc: not pulled by <time.h> */
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
