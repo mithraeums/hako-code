@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.1.7-b89656?style=flat-square&labelColor=14130f" alt="v0.1.7"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.1.8-b89656?style=flat-square&labelColor=14130f" alt="v0.1.8"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-c8c2b2?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -74,7 +74,7 @@
 │        ⠀⠀⠀⠀⠀⠀⠀⠈⠙⠻⢿⣿⡇⢸⣿⡿⠟⠋⠁⠀⠀⠀⠀⠀⠀⠀         │
 │        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠈⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀         │
 │                                           │
-│ hako 0.1.7 · mithraeum · hako-sho-stock   │
+│ hako 0.1.8 · mithraeum · hako-sho   │
 │ trust on · session resumed                │
 │ :help :providers :models :login :theme    │
 ╰───────────────────────────────────────────╯
@@ -83,7 +83,7 @@
 
 <table>
   <tr>
-    <td width="33%" valign="top"><b>Local first.</b><br/><sub>Auto-defaults to any installed <a href="https://github.com/mithraeums/hako">hako</a> model — <code>hako-sho-stock</code> (3B) or <code>hako-koi-mini-stock</code> (7B), runs on your device, no key, no cloud. The agent detects it and just works.</sub></td>
+    <td width="33%" valign="top"><b>Local first.</b><br/><sub>Auto-defaults to any installed <a href="https://github.com/mithraeums/hako">hako</a> model — <code>hako-sho</code> (3B) or <code>hako-koi</code> (7B), runs on your device, no key, no cloud. The agent detects it and just works.</sub></td>
     <td width="33%" valign="top"><b>Single binary.</b><br/><sub>One C file. Builds with <code>gcc -lpthread</code>. Curl on PATH for HTTP. Nothing else linked.</sub></td>
     <td width="33%" valign="top"><b>13 cloud providers when you want them.</b><br/><sub>Anthropic OAuth (Claude Pro/Max sub), GitHub Copilot, GH Models (free), OpenRouter, plus 9 more over OpenAI-compat. Set a key or run a one-line <code>:login</code> — your call.</sub></td>
   </tr>
@@ -93,15 +93,19 @@
 
 ## Overview
 
-- **Local models run in-process — no ollama, no server.** Build with `make hakm`
-  and `hako` links the native [hako engine](https://github.com/mithraeums/hako)
-  (`libhakm.a`) and runs Qwen-class models **inside the process** over mmap'd
-  MLF2 weights. Drop a `.mlf2` in `~/.hako/models/` and `hako` auto-defaults to
-  the **mithraeum** provider on first launch — no key, no `:login`, no config
-  (preference: koi > koi-mini > sho, fine-tunes over stock-wraps). Force prose
-  tool mode is on so `<tool name="...">{...}</tool>` calls parse on small models.
-  Convert a GGUF with the engine's `tools/gguf2mlf.py`. (ollama is also supported
-  as a *separate* optional provider — `:login ollama` — for non-hako models.)
+- **Local models run on the native engine — no ollama, no server.** Plain `make`
+  is all the agent needs; it runs Qwen-class models by spawning the
+  [hako engine](https://github.com/mithraeums/hako) as a one-shot `hakm`
+  subprocess per turn (`hakm <model.mlf2> --chat-stdin`) over mmap'd MLF2 weights.
+  No in-process link, no compile flag, no daemon, no socket. Install the engine
+  CLI once with `make hakm` (→ `~/.hako/bin/hakm`). Drop a `.mlf2` in
+  `~/.hako/models/` and `hako` auto-defaults to the **mithraeum** provider on
+  first launch — no key, no `:login`, no config (preference: koi > sho,
+  fine-tunes over stock-wraps). Force prose tool mode is on so
+  `<tool name="...">{...}</tool>` calls parse on small models. Convert a GGUF
+  with the engine's `tools/gguf2mlf.py`, or `:pull <tier>` it from HuggingFace.
+  (ollama is also supported as a *separate* optional provider — `:login ollama` —
+  for non-hako models.)
 - **13 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. `:login <name>` walks you through OAuth or hands you to the provider's console for an API key.
 - **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
 - **Theme presets.** `:theme mithraeum|claude|nord|mono` swaps the full palette live (persisted in `~/.hakorc`). Truecolor where supported, 16-color fallback for error chip in tmux without `RGB` passthrough.
@@ -150,10 +154,11 @@ Detects OS and arch, downloads the latest signed release, verifies the sha256 si
 **Local, zero config (recommended)** — build with the engine, drop in a weight, launch:
 
 ```sh
-make hakm                                              # links the native hako engine (libhakm.a)
-# convert a Qwen2.5-Coder GGUF once → ~/.hako/models/hako-sho-stock.mlf2
-#   (python3 ../hako/engine/tools/gguf2mlf.py model.gguf ~/.hako/models/hako-sho-stock.mlf2)
-hako                                                   # auto-detects the .mlf2, runs it in-process (mithraeum)
+make                                                   # plain build — the agent
+make hakm                                              # installs the engine CLI → ~/.hako/bin/hakm
+# convert a Qwen2.5-Coder GGUF once → ~/.hako/models/hako-sho.mlf2
+#   (python3 ../hako/tools/gguf2mlf.py model.gguf ~/.hako/models/hako-sho.mlf2)
+hako                                                   # auto-detects the .mlf2, runs it via the hakm subprocess (mithraeum)
 > :trust                                                # grant tool access in this project
 > list files in this directory
 > :trust                                                # grant tool access in this project
@@ -293,7 +298,7 @@ ReAct mode injects a tool schema in the system prompt and parses `<tool>...</too
 ├── style.md                  flat skill — whole file injected
 └── corp/                     directory skill — SKILL.md is the dispatcher
     ├── SKILL.md
-    └── .claude/agents/
+    └── agents/
         ├── CEO.md
         ├── DEV.md
         └── QA.md
@@ -314,8 +319,12 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### v0.1.7 (Latest)<br>
-- **`mithraeum` provider runs the native hako engine IN-PROCESS.** No ollama, no curl, no server — links `libhakm.a` and calls `hkMithraeumChat` → `hakm_chat` in this process. Build with `make hakm` (`-DHAKO_HAVE_HAKM`, links `../hako/engine/libhakm.a`); the shipped release asset is the `make hakm` build.
+### v0.1.8 (Latest)<br>
+- **Local models now run via the `hakm` SUBPROCESS — in-process engine link REVERSED.** `hkMithraeumChat` spawns `hakm <model.mlf2> --chat-stdin` one-shot per turn and reads the reply off stdout. No ollama, no server, no daemon. **Why the reversal:** v0.1.7's in-process link was gated behind `-DHAKO_HAVE_HAKM`, so a plain `make`/`make install` shipped an engine-less `hako` → MITHRAEUM fell through to the ollama curl path → "empty response" (recurred twice). Subprocess = plain `make` always ships the path, can't be compiled out. `make hakm` now builds+installs the standalone engine CLI to `~/.hako/bin/hakm`; the agent finds it via `hkFindHakm()` (`~/.hako/bin` → PATH).
+- **Provision** — relocate misplaced weights into `~/.hako/models/`, `:pull <tier>` from HuggingFace (`mithraeum` acct), prompt-then-pull on a `:model` switch to an uninstalled tier.
+
+### v0.1.7<br>
+- **`mithraeum` provider ran the native hako engine IN-PROCESS.** Linked `libhakm.a` and called `hkMithraeumChat` → `hakm_chat` in this process; build was `make hakm` (`-DHAKO_HAVE_HAKM`). *(Reversed in v0.1.8 — the gated link kept shipping engine-less binaries.)*
 - **Model resolution off the filesystem** — `~/.hako/models/<id>.mlf2`. `clDetectKoiDefault` + `:models` scan `~/.hako/models/*.mlf2` (no more `ollama list` / `/api/tags`). koi > koi-mini > sho; `-v*` over `-stock`.
 - **Graceful weight fallback** — missing configured weight → `hkMithraeumFirstAvailable` picks the first installed `.mlf2` (prefers sho), warns, self-heals per-project state. Fixes the stale `ai_model=hako-koi-*` "no such file" crash.
 - **`AI_PROVIDER_OLLAMA` kept as a separate optional provider** — only the hako-models path is ollama-free.
@@ -361,8 +370,8 @@ See [CHANGELOG.md](CHANGELOG.md) for full history.
 - [x] universal2, Linux arm64, FreeBSD x86_64
 - [x] 4 OAuth providers (Anthropic, Copilot, GH Models, OpenRouter)
 - [x] Anthropic OAuth tool calls (CC-fingerprint prose mode)
-- [x] local hako auto-default (sho-stock / koi-mini-stock) + tool-aware Modelfile
-- [x] [hako](https://github.com/mithraeums/hako) native engine wired **in-process** (`libhakm.a`, `make hakm`) — no ollama
+- [x] local hako auto-default (`hako-sho` 3B / `hako-koi` 7B) via the hakm subprocess
+- [x] [hako](https://github.com/mithraeums/hako) native engine wired as a **`hakm` subprocess** (`--chat-stdin`, one-shot per turn) — no ollama, no in-process link
 - [ ] MCP client mode with Dynamic Client Registration
 - [ ] Inline SHA-256 to drop openssl runtime dep
 - [ ] Vim-style error codes + Buddy BLE companion approval gateway — v0.2

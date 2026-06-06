@@ -13,14 +13,13 @@ ICON_DIR = icon
 SRC      = hako.c
 BIN      = hako
 
-# Local in-process inference. `make hakm` links the models project's prebuilt
-# engine library (libhakm.a, built in ../hako/engine) + defines HAKO_HAVE_HAKM so
-# the MITHRAEUM provider runs models IN-PROCESS over mmap'd MLF2 weights — zero
-# ollama at runtime. The agent never compiles engine sources; it only consumes
-# the lib + header, keeping the project boundary clean.
-HAKM_DIR ?= ../hako/engine
-HAKM_LIB := $(HAKM_DIR)/libhakm.a
-HAKM_INC := $(HAKM_DIR)/src
+# Local hako-model inference runs through the standalone `hakm` engine binary as
+# a subprocess — NOT linked into this agent. The agent build is therefore plain
+# (`make` / `all`): there is no compile-time engine flag that could be omitted,
+# so a build can never silently lose MITHRAEUM support (the v0.1.6 trap).
+# `make hakm` is a convenience that builds the engine CLI in the hako repo (../hako)
+# and installs it to ~/.hako/bin/hakm, where the agent's hkFindHakm() looks for it.
+HAKM_DIR ?= ../hako
 
 ifeq ($(OS),Windows_NT)
     PLATFORM = windows
@@ -37,15 +36,11 @@ else
     endif
 endif
 
-# Arch tuning for the engine-linked build. Native by default; the engine's
-# matmul uses -march=native intrinsics. For macOS universal2 (UNIVERSAL=1) swap
-# to multi-arch — -march=native and -arch are mutually exclusive, so the engine
-# falls back to its portable scalar/auto-vectorized path on a fat build.
-HAKM_ARCH ?= -march=native
+# macOS universal2 build of the agent (UNIVERSAL=1). The engine binary has its
+# own Makefile/arch handling in $(HAKM_DIR); this only affects the agent.
 ifeq ($(PLATFORM),macos)
     ifeq ($(UNIVERSAL),1)
-        CFLAGS    += -arch arm64 -arch x86_64
-        HAKM_ARCH := -arch arm64 -arch x86_64
+        CFLAGS += -arch arm64 -arch x86_64
     endif
 endif
 
@@ -53,22 +48,16 @@ endif
 
 all: $(BIN)
 
-# ---------- engine-linked build (ollama-free local inference) ----------
-# Same `hako` binary, linked against the prebuilt libhakm.a. The engine lib is
-# built by its own Makefile in $(HAKM_DIR), passing the same ARCH so the lib and
-# the agent agree on target arch (critical for cross / universal builds). -lm for
-# the dequant math. Platform-agnostic (no icon step).
-# NOTE: when switching ARCH in an existing tree (e.g. native → UNIVERSAL=1), run
-#   make -C $(HAKM_DIR) clean   first — make won't rebuild .o on flag-only changes.
-# CI does a fresh checkout per build, so this only matters for local arch swaps.
-$(HAKM_LIB):
-	$(MAKE) -C $(HAKM_DIR) lib ARCH="$(HAKM_ARCH)"
-
-hakm: $(SRC) $(HAKM_LIB)
-	$(CC) -std=c11 -O2 -pthread -Wall $(HAKM_ARCH) \
-		-DHAKO_HAVE_HAKM -I$(HAKM_INC) \
-		$(SRC) $(HAKM_LIB) -o $(BIN) $(LDLIBS) -lm
-	@echo "built $(BIN) linked against libhakm.a (in-process, no ollama). models: ~/.hako/models/*.mlf2"
+# ---------- local-model engine (standalone subprocess, ollama-free) ----------
+# Builds the `hakm` engine CLI in $(HAKM_DIR) and installs it to ~/.hako/bin,
+# where hkFindHakm() looks first. This is decoupled from the agent build: update
+# the engine independently, no relink. The agent itself does NOT need this to
+# build — only to run local hako models.
+hakm:
+	$(MAKE) -C $(HAKM_DIR) hakm
+	@mkdir -p "$$HOME/.hako/bin"
+	@install -m 0755 "$(HAKM_DIR)/hakm" "$$HOME/.hako/bin/hakm"
+	@echo "installed engine: $$HOME/.hako/bin/hakm (subprocess runtime, no ollama). models: ~/.hako/models/*.mlf2"
 
 # ---------- icons ----------
 # Regenerate icon/hako.{icns,ico,png} from icon/hako.svg.

@@ -3,12 +3,20 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.1.8] — 2026-06-03
+
+### Changed — local models run via the `hakm` SUBPROCESS (in-process link REVERSED)
+- **`hkMithraeumChat` now spawns `hakm <model.mlf2> --chat-stdin` one-shot per turn** and reads the reply off stdout. No in-process link, no `-DHAKO_HAVE_HAKM`, no ollama, no server, no daemon. The agent finds the engine CLI via `hkFindHakm()` (`~/.hako/bin` → PATH).
+- **Why the reversal:** v0.1.7 linked `libhakm.a` in-process behind `-DHAKO_HAVE_HAKM`. A plain `make`/`make install` (no flag) shipped an engine-less `hako` → MITHRAEUM fell through to the ollama curl path → "empty response" (recurred twice). The subprocess path is compiled into every plain `make`, so it can't regress.
+- **Build: plain `make` is the agent.** `make hakm` now builds+installs the *standalone* engine CLI to `~/.hako/bin/hakm` (no longer an engine-linked agent). The hakm binary ships separately from `mithraeums/hako`.
+- **Provision** — relocate misplaced weights into `~/.hako/models/`, `:pull <tier>` from HuggingFace (`mithraeum` acct, 404s gracefully until uploaded), prompt-then-pull on a `:model` switch to an uninstalled tier.
+
 ## [v0.1.7] — 2026-06-02
 
-### Changed — `mithraeum` provider runs the native engine IN-PROCESS (no ollama)
-- **The `mithraeum` provider no longer speaks ollama HTTP.** It links the hako engine (`libhakm.a`) and runs the model **in this process** via `hakm_chat`. Zero subprocess / socket / server / ollama. The earlier "hakm-server v0.1.7 port" plan is dead — superseded by the in-process engine.
-- **Build: `make hakm`** — links `../hako/engine/libhakm.a` (`make -C ../hako/engine lib` bootstraps it) + `-DHAKO_HAVE_HAKM`. Plain `make` still builds but omits the engine (MITHRAEUM would fail), so the shipped release asset MUST be the `make hakm` build. Endpoint sentinel: `hakm://in-process` (curl path never taken for mithraeum).
-- **Send path intercepted** — `hkMithraeumChat` builds `hakm_msg[]` from `data->messages`, runs `hakm_chat`, feeds the reply into the existing prose-XML tool loop. Never reaches `aiBuildCurlCommand`. All under `#ifdef HAKO_HAVE_HAKM`.
+### Changed — `mithraeum` provider ran the native engine IN-PROCESS (no ollama) — *reverted in v0.1.8*
+- **The `mithraeum` provider no longer spoke ollama HTTP.** It linked the hako engine (`libhakm.a`) and ran the model **in this process** via `hakm_chat`. Zero subprocess / socket / server / ollama. The earlier "hakm-server v0.1.7 port" plan was dead — superseded by the in-process engine. *(This in-process link was REVERSED in v0.1.8: the gated build kept shipping engine-less binaries.)*
+- **Build: `make hakm`** — linked `../hako/engine/libhakm.a` + `-DHAKO_HAVE_HAKM`. Plain `make` built but omitted the engine, so the shipped asset had to be the `make hakm` build. Endpoint sentinel: `hakm://in-process`.
+- **Send path intercepted** — `hkMithraeumChat` built `hakm_msg[]` from `data->messages`, ran `hakm_chat`, fed the reply into the prose-XML tool loop. All under `#ifdef HAKO_HAVE_HAKM`.
 
 ### Added — filesystem model resolution + graceful fallback
 - **Model id → `~/.hako/models/<id>.mlf2`.** `clDetectKoiDefault` + `:models` now scan `~/.hako/models/*.mlf2`, NOT `ollama list` / `/api/tags`. Preference: koi > koi-mini > sho; `-v*` over `-stock`. (`clDetectKoiDefault` keeps an ollama-list fallback only when no local `.mlf2` exists.)
