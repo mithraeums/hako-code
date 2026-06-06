@@ -435,8 +435,10 @@ static int clOAuthOpenRouter(aiData *data);
 static int clOAuthRefresh(aiData *data);
 static void clOAuthEnsureFresh(aiData *data);
 static char *clOAuthRandomVerifier(void);
+#ifndef _WIN32
 static int clOAuthLoopbackListen(int *out_port);
 static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec);
+#endif
 static void clUrlEncodeInto(const char *s, char *out, size_t cap);
 
 /* Set by /edit slash. Pre-fills the next clReadLineRaw buffer + cursor at end. */
@@ -1087,8 +1089,9 @@ static void clCredsKey(unsigned char out[32]) {
 		0xC0FFEEUL;
 #endif
 	const char *salt = "hako-code/credentials/v1";
-	/* FNV-1a 32-byte rolling hash. */
-	unsigned long h = 0xcbf29ce484222325UL;
+	/* FNV-1a 32-byte rolling hash. 64-bit state — must be unsigned long long;
+	   plain unsigned long is 32-bit on Windows LLP64 and truncates the constant. */
+	unsigned long long h = 0xcbf29ce484222325ULL;
 	for (int i = 0; i < 32; i++) out[i] = 0;
 	int oi = 0;
 	const char *parts[3] = {host, salt, NULL};
@@ -1099,7 +1102,7 @@ static void clCredsKey(unsigned char out[32]) {
 			const char *s = parts[p];
 			for (int i = 0; s[i]; i++) {
 				h ^= (unsigned char)s[i];
-				h *= 0x100000001b3UL;
+				h *= 0x100000001b3ULL;
 				out[oi % 32] ^= (unsigned char)(h >> ((oi % 8) * 8));
 				oi++;
 			}
@@ -3354,8 +3357,13 @@ static int hkMithraeumRelocate(const char *model) {
 		snprintf(base, sizeof(base), "%s/.hako/models", home);
 		mkdir(base, 0755);
 		mkdir(mdir, 0755);                 /* ensure the per-model dir exists */
+#ifdef _WIN32
+		/* No POSIX symlink on mingw; copy the weight into the canonical spot. */
+		if (CopyFileA(cand[i], canon, FALSE)) return 1;
+#else
 		if (symlink(cand[i], canon) == 0) return 1;
-		/* symlink may fail if canon raced into existence — recheck. */
+#endif
+		/* link/copy may fail if canon raced into existence — recheck. */
 		if (stat(canon, &st) == 0) return 1;
 	}
 	return 0;
@@ -3509,8 +3517,11 @@ static char *hkMithraeumChat(aiData *data, char **err) {
 	int n = 0;
 	for (int i = 0; i < data->message_count; i++)
 		if (!data->messages[i].raw) n++;
-	if (n == 0) { fclose(ff); unlink(frame); free(hakm); free(path);
-		if (err) *err = strdup("Error: nothing to send"); return NULL; }
+	if (n == 0) {
+		fclose(ff); unlink(frame); free(hakm); free(path);
+		if (err) *err = strdup("Error: nothing to send");
+		return NULL;
+	}
 
 	fprintf(ff, "%d\n", n);
 	for (int i = 0; i < data->message_count; i++) {
@@ -4879,10 +4890,12 @@ static void clCleanupConfig(void) {
 }
 
 /*** signal ***/
+#ifndef _WIN32
 static void clSigint(int sig) {
 	(void)sig;
 	E.interrupt = 1;
 }
+#endif
 
 /*** termios raw line editor ***/
 
@@ -5905,12 +5918,8 @@ static char *clOAuthRandomVerifier(void) {
 #ifndef _WIN32
 #include <sys/socket.h>
 #include <netinet/in.h>
-#endif
 
 static int clOAuthLoopbackListen(int *out_port) {
-#ifdef _WIN32
-	(void)out_port; return -1;
-#else
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) return -1;
 	int yes = 1;
@@ -5927,13 +5936,9 @@ static int clOAuthLoopbackListen(int *out_port) {
 	}
 	close(fd);
 	return -1;
-#endif
 }
 
 static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec) {
-#ifdef _WIN32
-	(void)srv_fd; (void)timeout_sec; return NULL;
-#else
 	struct timeval tv; tv.tv_sec = timeout_sec; tv.tv_usec = 0;
 	fd_set r; FD_ZERO(&r); FD_SET(srv_fd, &r);
 	int n = select(srv_fd + 1, &r, NULL, NULL, &tv);
@@ -5965,8 +5970,8 @@ static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec) {
 	write(c, resp, strlen(resp));
 	close(c);
 	return code;
-#endif
 }
+#endif /* !_WIN32 */
 
 /* Refresh access token. Dispatches by provider:
    - anthropic: refresh_token grant against console.anthropic.com

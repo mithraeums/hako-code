@@ -1,5 +1,11 @@
 .DS_Store
 *.swp
+# current build outputs (source is hako.c / hako.rc — keep those)
+/hako
+hako.exe
+hako.res
+hako_asan
+# legacy names
 hakoc
 hakoc.exe
 hakoc_asan
