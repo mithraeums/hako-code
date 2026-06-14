@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define HAKO_VERSION "0.1.8"
+#define HAKO_VERSION "0.1.9"
 
 /* GitHub Copilot OAuth + API constants. Public client_id from VS Code Copilot extension.
    Defined here so hkBuildCurlCmd (earlier in file) can reference the Editor-* headers. */
@@ -114,6 +114,8 @@ static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/select.h>
+#include <sys/socket.h>	/* MCP stdio transport: socketpair */
+#include <poll.h>		/* MCP: await server response */
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -289,7 +291,7 @@ struct clConfig {
 	int ai_tool_gate;       /* 1 = drop tools when last user msg lacks tool-keyword */
 	int ai_toolmode;        /* 0 = native function-calling, 1 = ReAct (pseudo-XML in prose) */
 	int ai_stream;
-	int ai_autowrite;
+	int ai_auto_approve;    /* 1 = :auto / --yolo: run tools without the per-call permission prompt */
 
 	char *session_id;
 	long session_started;
@@ -407,6 +409,7 @@ static void *aiWorkerThread(void *arg);
 static int hkHandleSlash(aiData *data, const char *prompt);
 static char *hkBuildToolsSchema(int provider_format);
 static int clPromptYN(const char *q, int default_yes);
+static int hkToolApproval(const char *name, const char *input_json);
 static const char *hkProviderName(enum aiProviderType t);
 static enum aiProviderType hkParseProvider(const char *s);
 static const char *hkProviderDefaultEndpoint(const char *s);
@@ -446,9 +449,17 @@ static char *cl_preset_input = NULL;
 static char *aiExtractResponse(const char *json, enum aiProviderType type);
 static char *hkExecTool(const char *name, const char *input_json);
 static char *hkExtractContentArray(const char *response);
+static char *hkExtractRawJsonArray(const char *src, const char *key);
+/* MCP (Model Context Protocol) client — see the MCP section below. */
+static void  hkMcpInit(void);
+static void  hkMcpShutdown(void);
+static char *hkMcpCallTool(const char *qualified_name, const char *args_json);
+static void  hkMcpList(aiData *data);
+static char *hkMcpLocalToolsPrompt(void);
 static char *hkBuildToolResults(aiData *data, const char *content_array);
 static int hkFnToolExecAll(aiData *data, const char *response);
-static int hkReactToolExecAll(aiData *data, const char *content);
+static int hkReactToolExecAll(aiData *data, const char *content,
+	char ***xseen, int *xseen_n, int *xseen_cap, int *dups, int *truncated);
 static void clStartAnim(aiData *data);
 static void clStopAnim(aiData *data);
 
@@ -534,29 +545,39 @@ static int hkExtractJsonInt(const char *src, const char *key) {
 }
 
 static char *hkExtractJsonObject(const char *src, const char *key) {
+	/* Match `"key"` + optional ws + `:` + optional ws + `{` — tolerates
+	   pretty-printed JSON (mirrors hkExtractJsonString). Loops so a key that
+	   isn't followed by an object value keeps searching. */
 	char pat[64];
-	snprintf(pat, sizeof(pat), "\"%s\":{", key);
-	const char *p = strstr(src, pat);
-	if (!p) return NULL;
-	p += strlen(pat) - 1;
-	int depth = 0;
-	const char *start = p;
-	int in_str = 0, esc = 0;
-	while (*p) {
-		if (esc) { esc = 0; p++; continue; }
-		if (*p == '\\') { esc = 1; p++; continue; }
-		if (*p == '"') in_str = !in_str;
-		else if (!in_str) {
-			if (*p == '{') depth++;
-			else if (*p == '}') { depth--; if (depth == 0) { p++; break; } }
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	const char *p = src;
+	while ((p = strstr(p, pat)) != NULL) {
+		const char *q = p + strlen(pat);
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != ':') { p++; continue; }
+		q++;
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != '{') { p++; continue; }
+		int depth = 0, in_str = 0, esc = 0;
+		const char *start = q;
+		while (*q) {
+			if (esc) { esc = 0; q++; continue; }
+			if (*q == '\\') { esc = 1; q++; continue; }
+			if (*q == '"') in_str = !in_str;
+			else if (!in_str) {
+				if (*q == '{') depth++;
+				else if (*q == '}') { depth--; if (depth == 0) { q++; break; } }
+			}
+			q++;
 		}
-		p++;
+		int len = (int)(q - start);
+		char *out = malloc(len + 1);
+		if (!out) return NULL;
+		memcpy(out, start, len);
+		out[len] = '\0';
+		return out;
 	}
-	int len = p - start;
-	char *out = malloc(len + 1);
-	memcpy(out, start, len);
-	out[len] = '\0';
-	return out;
+	return NULL;
 }
 
 /* USD per million tokens, (input, output). Model match is substring of E.ai_model.
@@ -956,6 +977,34 @@ static void hkApplyProviderAlias(const char *val) {
 	E.ai_endpoint = ep ? strdup(ep) : NULL;
 }
 
+/* A reasonable default model per provider — used when a :provider switch would
+   otherwise carry a model id the new provider can't serve (e.g. local
+   `hako-sho-stock` left on while switching to anthropic → 404 → empty stream). */
+static const char *hkProviderDefaultModel(enum aiProviderType t) {
+	const char *p = hkProviderName(t);
+	if (!p) return NULL;
+	if (!strcmp(p, "anthropic")) return "claude-haiku-4-5-20251001";
+	if (!strcmp(p, "mithraeum")) return "hako-sho";
+	if (!strcmp(p, "openai"))    return "gpt-4o-mini";
+	if (!strcmp(p, "gemini"))    return "gemini-2.0-flash";
+	if (!strcmp(p, "groq"))      return "llama-3.3-70b-versatile";
+	return NULL;  /* unknown family — caller warns instead of guessing */
+}
+
+/* Heuristic: does `model` plausibly belong to provider `t`? Conservative — for
+   providers we don't have a family rule for, returns 1 (don't second-guess a
+   deliberate choice). Used only to decide whether a switch should reset the model. */
+static int hkModelFitsProvider(enum aiProviderType t, const char *model) {
+	if (!model || !*model) return 0;
+	const char *p = hkProviderName(t);
+	if (!p) return 1;
+	if (!strcmp(p, "anthropic")) return strstr(model, "claude") != NULL;
+	if (!strcmp(p, "mithraeum")) return strncmp(model, "hako-", 5) == 0;
+	if (!strcmp(p, "openai"))    return strstr(model, "gpt") || strstr(model, "o1") || strstr(model, "o3");
+	if (!strcmp(p, "gemini"))    return strstr(model, "gemini") != NULL;
+	return 1;
+}
+
 static const char *clProviderConsoleUrl(const char *name) {
 	if (!name) return NULL;
 	if (!strcmp(name, "anthropic") || !strcmp(name, "claude")) return "https://console.anthropic.com/settings/keys";
@@ -1330,7 +1379,7 @@ static void hkWriteSessionFile(const char *path, int include_secrets) {
 	fprintf(fp, "ai_toolmode=%d\n", E.ai_toolmode);
 	fprintf(fp, "theme=%s\n", TH_ACTIVE);
 	fprintf(fp, "ai_stream=%d\n", E.ai_stream);
-	fprintf(fp, "ai_autowrite=%d\n", E.ai_autowrite);
+	fprintf(fp, "ai_auto_approve=%d\n", E.ai_auto_approve);
 	if (E.session_id) fprintf(fp, "session_id=%s\n", E.session_id);
 	fprintf(fp, "session_started=%ld\n", E.session_started);
 	fprintf(fp, "session_last_used=%ld\n", (long)time(NULL));
@@ -1400,8 +1449,8 @@ static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 			clThemeApply(val);
 		} else if (strcmp(key, "ai_stream") == 0) {
 			E.ai_stream = atoi(val) ? 1 : 0;
-		} else if (strcmp(key, "ai_autowrite") == 0) {
-			E.ai_autowrite = atoi(val) ? 1 : 0;
+		} else if (strcmp(key, "ai_auto_approve") == 0) {
+			E.ai_auto_approve = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_max_tokens") == 0) {
 			E.ai_max_tokens = atoi(val);
 		} else if (allow_session_fields && strcmp(key, "session_id") == 0) {
@@ -1616,17 +1665,18 @@ static int hkLoadSkills(aiData *data) {
 	if (!data) return 0;
 	char dir[512];
 	hkClawDirPath(dir, sizeof(dir));
-	if (!dir[0]) return 0;
-	char skills[512];
-	snprintf(skills, sizeof(skills), "%s/skills", dir);
-	DIR *d = opendir(skills);
-	if (!d) return 0;
+	char skills[512] = {0};
+	if (dir[0]) snprintf(skills, sizeof(skills), "%s/skills", dir);
+	/* No skills dir is FINE — the system prompt (BASE/REACT/env/HAKO.md) below
+	   must still be built. An early return here shipped agents with NO system
+	   prompt at all (no tool schema → model never calls tools). */
+	DIR *d = skills[0] ? opendir(skills) : NULL;
 
 	char *buf = NULL;
 	size_t total = 0;
 	int loaded = 0;
 	struct dirent *e;
-	while ((e = readdir(d))) {
+	while (d && (e = readdir(d))) {
 		if (e->d_name[0] == '.') continue;
 		char path[1024];
 		snprintf(path, sizeof(path), "%s/%s", skills, e->d_name);
@@ -1682,7 +1732,7 @@ static int hkLoadSkills(aiData *data) {
 		free(body);
 		loaded++;
 	}
-	closedir(d);
+	if (d) closedir(d);
 	if (buf) buf[total] = '\0';
 
 	/* ReAct mode prepends a pseudo-XML tool schema for models that don't natively
@@ -1703,15 +1753,56 @@ static int hkLoadSkills(aiData *data) {
 		"Tools:\n"
 		"  read_file(path: string)        Read a file. Path relative to project.\n"
 		"  list_dir(path: string)         List directory entries. Use \".\" for project root.\n"
-		"  write_file(path, content)      Create/overwrite a file. Needs trust.\n"
+		"  write_file(path, content)      Create/overwrite a WHOLE file. Needs trust.\n"
+		"  edit_file(path, old, new)      Replace an exact unique snippet in a file. Prefer for small fixes.\n"
+		"  edit_lines(path, start, end, new)  Replace a 1-indexed line range. Use when you know line numbers.\n"
 		"  run_shell(cmd: string)         Run non-interactive shell command. Needs trust. 10s.\n"
 		"  read_skill(skill, path)        Read a file inside an installed skill.\n"
 		"\n"
-		"Tool names are EXACTLY as listed above. Do NOT invent names like `bash`, `create_file`, `list_files`, `view`, `edit`, `Write`, `Read`, `LS`, `Bash` — those will be silently remapped but you should use the canonical names. `write_file` REQUIRES both `path` AND `content` params; never call it with path alone.\n"
+		"Tool names are EXACTLY as listed above. Do NOT invent names like `bash`, `create_file`, `list_files`, `view`, `Write`, `Read`, `LS`, `Bash` — those will be silently remapped but you should use the canonical names. `write_file` REQUIRES both `path` AND `content` params; never call it with path alone. To fix an existing file, prefer `edit_file`/`edit_lines` over rewriting it with `write_file`.\n"
 		"\n"
 		"ORDERING RULE — STRICT. Emit the <tool> block FIRST when a tool is needed. Do not narrate ('I will create...', 'Done!', 'Perfect!') BEFORE the tool call — those sentences print to the user before the tool runs, which reads as a lie. Correct shape: (1) <tool>...</tool>, (2) wait for <observation>, (3) THEN one short sentence about what actually happened.\n"
 		"\n"
 		"For the final answer to the user, respond in plain text WITHOUT any <tool> tags.\n"
+		"\n";
+
+	/* Qwen-native tool template for local models. sho/koi are Qwen2.5-Coder
+	   wraps — they were SFT'd on EXACTLY this Hermes-style shape (<tools> JSON
+	   signatures in the system prompt, calls in <tool_call> tags). Teaching
+	   them our <tool name=…> dialect costs reliability; speaking theirs is
+	   free. Parsed by the <tool_call> pass in hkReactToolExecAll. */
+	static const char *QWEN_TOOL_PROMPT =
+		"# Tools\n"
+		"\n"
+		"You may call one or more functions to assist with the user query.\n"
+		"\n"
+		"You are provided with function signatures within <tools></tools> XML tags:\n"
+		"<tools>\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"read_file\", \"description\": \"Read a file from the project\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\", \"description\": \"path relative to the project root\"}}, \"required\": [\"path\"]}}}\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"list_dir\", \"description\": \"List directory entries; use \\\".\\\" for the project root\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}}}\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"write_file\", \"description\": \"Create or overwrite a WHOLE file. For small changes to an existing file use edit_file instead\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}}}\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"edit_file\", \"description\": \"Change PART of an existing file: replace the exact unique snippet 'old' with 'new'. Use this for fixes instead of rewriting the whole file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old\": {\"type\": \"string\"}, \"new\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old\", \"new\"]}}}\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"edit_lines\", \"description\": \"Replace an inclusive 1-indexed line range [start,end] with 'new' text. Use when you know the line number, e.g. from a traceback\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"start\": {\"type\": \"integer\"}, \"end\": {\"type\": \"integer\"}, \"new\": {\"type\": \"string\"}}, \"required\": [\"path\", \"start\", \"new\"]}}}\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"run_shell\", \"description\": \"Run a non-interactive shell command in the project, 10 second timeout\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"]}}}\n"
+		"{\"type\": \"function\", \"function\": {\"name\": \"read_skill\", \"description\": \"Read a file inside an installed skill\", \"parameters\": {\"type\": \"object\", \"properties\": {\"skill\": {\"type\": \"string\"}, \"path\": {\"type\": \"string\"}}, \"required\": [\"skill\", \"path\"]}}}\n"
+		"</tools>\n"
+		"\n"
+		"For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+		"<tool_call>\n"
+		"{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+		"</tool_call>\n"
+		"\n"
+		"To CREATE OR OVERWRITE A FILE, do NOT put the body inside the json — escaping a whole file as a json string breaks. Instead emit the file body RAW between write_file tags:\n"
+		"<write_file path=\"relative/path.ext\">\n"
+		"the complete file content, exactly as it belongs on disk, with real newlines and no escaping\n"
+		"</write_file>\n"
+		"Use <write_file> for EVERY whole-file write. read_file, list_dir, run_shell, edit_file, edit_lines still use <tool_call>.\n"
+		"\n"
+		"To CHANGE an existing file (e.g. fix one line after an error), do NOT rewrite the whole file — call edit_file with the exact 'old' snippet and the 'new' replacement, or edit_lines with the line number. Rewriting the whole file each time wastes space and loses your earlier work.\n"
+		"\n"
+		"To write a file, reply with ONLY the <write_file> block and put the content inside it exactly once. The block itself is how you show the code — no need to also paste it in a separate ``` block.\n"
+		"\n"
+		"When the user asks you to create, read, list, run, or change something in their project, CALL the matching function — do NOT describe manual steps instead. Emit the tool call FIRST, then stop and wait for the result before saying anything else.\n"
 		"\n";
 
 	/* Prepend tool-use guidance. Small models (llama3.2, qwen2.5-small) tend to
@@ -1720,14 +1811,16 @@ static int hkLoadSkills(aiData *data) {
 	static const char *BASE_PROMPT =
 		"You are hako-code, a terminal AI agent.\n"
 		"\n"
-		"RULE 1: Do NOT call any tool unless the user explicitly asks to read, list, write, or run something. Greetings, questions, and explanations get a plain text reply with ZERO tool calls.\n"
+		"RULE 1: Call a tool whenever the user wants you to read, list, write, or run something in the project — INCLUDING polite forms like \"can you create…\", \"could you read…\", \"would you make…\", \"please write…\". Those are requests to DO it, not questions. Only greetings and questions ABOUT concepts/code (\"what is recursion?\", \"how does X work?\") get a plain-text reply with no tool call.\n"
 		"\n"
 		"RULE 2: All paths are RELATIVE to the current project. Use \".\" for the project root. NEVER use absolute paths like /home/..., /Users/..., /root/..., /tmp/.... Those paths do NOT exist here and every call will fail.\n"
 		"\n"
 		"Examples — call tools:\n"
-		"  user: \"read README.md\"           -> read_file(path=\"README.md\")\n"
-		"  user: \"what files are here?\"     -> list_dir(path=\".\")\n"
-		"  user: \"create test.txt with hi\" -> write_file(path=\"test.txt\", content=\"hi\\n\")\n"
+		"  user: \"read README.md\"               -> read_file(path=\"README.md\")\n"
+		"  user: \"what files are here?\"         -> list_dir(path=\".\")\n"
+		"  user: \"create test.txt with hi\"     -> write_file(path=\"test.txt\", content=\"hi\\n\")\n"
+		"  user: \"can you create a pong game?\"  -> write_file(path=\"pong.py\", ...)\n"
+		"  user: \"could you make a hello.py?\"   -> write_file(path=\"hello.py\", ...)\n"
 		"\n"
 		"Examples — do NOT call tools:\n"
 		"  user: \"hello\"                     -> plain text reply\n"
@@ -1808,18 +1901,27 @@ static int hkLoadSkills(aiData *data) {
 	size_t hako_hlen = hako_body ? strlen(hako_hdr) : 0;
 
 	/* Prose tool prompt required when the wire can't carry native function calling:
-	   - Anthropic OAuth strips the `tools` field server-side.
-	   - MITHRAEUM (small local models): 1.5B-class can't emit OpenAI tool_calls JSON. */
-	int force_prose = (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))
-		|| (E.ai_provider_type == AI_PROVIDER_MITHRAEUM);
+	   - Anthropic OAuth strips the `tools` field server-side → REACT_PROMPT.
+	   - MITHRAEUM (local Qwen wraps) → QWEN_TOOL_PROMPT, their training format. */
+	const char *tool_prompt = NULL;
+	if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM)
+		tool_prompt = QWEN_TOOL_PROMPT;
+	else if (E.ai_toolmode == 1
+	      || (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic")))
+		tool_prompt = REACT_PROMPT;
+	/* Local models read tools from the prompt, not the curl schema — so splice any
+	   live MCP tools in here too (cloud providers get them via hkBuildToolsSchema). */
+	char *mcp_tools = (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) ? hkMcpLocalToolsPrompt() : NULL;
+	size_t mlen = mcp_tools ? strlen(mcp_tools) : 0;
 	size_t blen = strlen(BASE_PROMPT);
-	size_t rlen = (E.ai_toolmode == 1 || force_prose) ? strlen(REACT_PROMPT) : 0;
+	size_t rlen = tool_prompt ? strlen(tool_prompt) : 0;
 	size_t elen = strlen(env_probe);
-	size_t need = rlen + blen + elen + total + hako_hlen + hako_len + 1;
+	size_t need = rlen + mlen + blen + elen + total + hako_hlen + hako_len + 1;
 	char *combined = malloc(need);
 	if (combined) {
 		size_t off = 0;
-		if (rlen > 0) { memcpy(combined + off, REACT_PROMPT, rlen); off += rlen; }
+		if (rlen > 0) { memcpy(combined + off, tool_prompt, rlen); off += rlen; }
+		if (mlen > 0) { memcpy(combined + off, mcp_tools, mlen); off += mlen; }
 		memcpy(combined + off, BASE_PROMPT, blen); off += blen;
 		if (elen > 0) { memcpy(combined + off, env_probe, elen); off += elen; }
 		if (buf && total > 0) { memcpy(combined + off, buf, total); off += total; }
@@ -1835,6 +1937,7 @@ static int hkLoadSkills(aiData *data) {
 		free(data->system_prompt);
 		data->system_prompt = buf;
 	}
+	free(mcp_tools);
 	return loaded;
 }
 
@@ -1908,10 +2011,18 @@ static void clRenderMarkdownInline(const char *in, char *out, size_t cap) {
 		}
 		if ((p[0] == '*' || p[0] == '_') && p[1] && p[1] != ' ' && p[1] != *p) {
 			char delim = p[0];
-			const char *end = strchr(p + 1, delim);
+			/* CommonMark intraword rule: a delimiter glued to alphanumerics is code,
+			   not emphasis (keeps snake_case / C operators intact in the terminal) */
+			char prev = (p > in) ? p[-1] : '\0';
+			int open_ok = !(prev && (isalnum((unsigned char)prev) || prev == delim));
+			const char *end = open_ok ? strchr(p + 1, delim) : NULL;
 			if (end && end > p + 1 && end[-1] != ' ') {
-				j += snprintf(out + j, cap - j, "\x1b[3m%.*s\x1b[23m", (int)(end - p - 1), p + 1);
-				p = end + 1; continue;
+				char after = end[1];
+				int close_ok = !(after && (isalnum((unsigned char)after) || after == delim));
+				if (close_ok) {
+					j += snprintf(out + j, cap - j, "\x1b[3m%.*s\x1b[23m", (int)(end - p - 1), p + 1);
+					p = end + 1; continue;
+				}
 			}
 		}
 		if (p[0] == '`') {
@@ -2204,6 +2315,464 @@ static char *aiWriteRequestFile(const char *json) {
 }
 
 /*** tools registry ***/
+/* ===== MCP (Model Context Protocol) client — stdio transport =============
+   Connects to MCP servers in ~/.hako/mcp.json (Claude-Desktop `mcpServers`
+   shape), runs each as a child over a socketpair speaking JSON-RPC 2.0,
+   lists its tools, and exposes them to the agent tool loop as
+   `mcp__<server>__<tool>` — appended to the schema, dispatched in hkExecTool,
+   gated by the same permission prompt. POSIX only (socketpair/fork/exec);
+   Windows compiles to no-ops. Every failure is non-fatal: a bad server is
+   skipped/marked dead, the rest load. Sync request/response per call. */
+typedef struct {
+	int   server_idx;
+	char *qualified;        /* "mcp__<server>__<tool>" */
+	char *remote;           /* original tool name on the server */
+	char *description;
+	char *schema;           /* inputSchema JSON object, verbatim */
+} mcpTool;
+
+typedef struct {
+	char  *name;
+	int    fd;              /* socketpair parent end; -1 = dead/unconnected */
+	pid_t  pid;
+	int    next_id;
+	char  *rbuf; size_t rlen, rcap;   /* line-accumulation read buffer */
+} mcpServer;
+
+static mcpServer *g_mcp_servers = NULL; static int g_mcp_server_count = 0;
+static mcpTool   *g_mcp_tools   = NULL; static int g_mcp_tool_count   = 0;
+
+/* ---- small JSON walkers (reused by config + response parsing) ---- */
+/* Split a JSON array of objects "[ {..},{..} ]" into top-level object strings. */
+static char **hkJsonArrayObjects(const char *arr, int *out_n) {
+	*out_n = 0; char **out = NULL; int n = 0, cap = 0;
+	const char *p = arr; while (*p && *p != '[') p++; if (*p == '[') p++;
+	while (*p) {
+		while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t'||*p==',') p++;
+		if (*p == ']' || !*p) break;
+		if (*p != '{') { p++; continue; }
+		const char *start = p; int depth = 0, instr = 0, esc = 0;
+		while (*p) {
+			char c = *p;
+			if (esc) esc = 0;
+			else if (c == '\\') esc = 1;
+			else if (c == '"') instr = !instr;
+			else if (!instr && c == '{') depth++;
+			else if (!instr && c == '}') { depth--; if (depth == 0) { p++; break; } }
+			p++;
+		}
+		int len = (int)(p - start);
+		if (len > 0) {
+			char *obj = malloc(len + 1); if (!obj) break;
+			memcpy(obj, start, len); obj[len] = '\0';
+			if (n >= cap) { cap = cap ? cap*2 : 8; char **t = realloc(out, cap*sizeof(char*)); if (!t) { free(obj); break; } out = t; }
+			out[n++] = obj;
+		}
+	}
+	*out_n = n; return out;
+}
+
+/* Split a JSON string array "[\"a\",\"b\"]" into unescaped C strings. */
+static char **hkJsonStringArray(const char *arr, int *out_n) {
+	*out_n = 0; char **out = NULL; int n = 0, cap = 0;
+	const char *p = arr; while (*p && *p != '[') p++; if (*p == '[') p++;
+	while (*p) {
+		while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t'||*p==',') p++;
+		if (*p == ']' || !*p) break;
+		if (*p != '"') { p++; continue; }
+		p++; const char *s = p; int esc = 0;
+		while (*p && !(*p=='"' && !esc)) { esc = (!esc && *p=='\\'); p++; }
+		int len = (int)(p - s);
+		char *u = hkJsonUnescape(s, len);
+		if (u) {
+			if (n >= cap) { cap = cap ? cap*2 : 8; char **t = realloc(out, cap*sizeof(char*)); if (!t) { free(u); break; } out = t; }
+			out[n++] = u;
+		}
+		if (*p == '"') p++;
+	}
+	*out_n = n; return out;
+}
+
+/* Split a JSON object's top-level entries into parallel key[]/val[] arrays.
+   val[] holds the raw value substring (object/array/string/number). */
+static int hkJsonObjectEntries(const char *obj, char ***keys, char ***vals) {
+	*keys = NULL; *vals = NULL; int n = 0, cap = 0;
+	const char *p = obj; while (*p && *p != '{') p++; if (*p == '{') p++;
+	while (*p) {
+		while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t'||*p==',') p++;
+		if (*p == '}' || !*p) break;
+		if (*p != '"') break;
+		p++; const char *ks = p; int esc = 0;
+		while (*p && !(*p=='"' && !esc)) { esc = (!esc && *p=='\\'); p++; }
+		int klen = (int)(p - ks); if (*p == '"') p++;
+		while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
+		if (*p == ':') p++;
+		while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
+		const char *vs = p;
+		if (*p == '{' || *p == '[') {
+			char open = *p, close = (open=='{') ? '}' : ']'; int depth = 0, instr = 0; esc = 0;
+			while (*p) { char c = *p;
+				if (esc) esc = 0; else if (c=='\\') esc = 1; else if (c=='"') instr = !instr;
+				else if (!instr && c==open) depth++;
+				else if (!instr && c==close) { depth--; if (depth==0) { p++; break; } }
+				p++; }
+		} else if (*p == '"') {
+			p++; esc = 0; while (*p && !(*p=='"' && !esc)) { esc = (!esc && *p=='\\'); p++; } if (*p=='"') p++;
+		} else { while (*p && *p!=',' && *p!='}') p++; }
+		int vlen = (int)(p - vs);
+		char *k = malloc(klen+1), *v = malloc(vlen+1);
+		if (!k || !v) { free(k); free(v); break; }
+		memcpy(k, ks, klen); k[klen] = '\0';
+		memcpy(v, vs, vlen); v[vlen] = '\0';
+		if (n >= cap) { cap = cap ? cap*2 : 8;
+			char **tk = realloc(*keys, cap*sizeof(char*)), **tv = realloc(*vals, cap*sizeof(char*));
+			if (!tk || !tv) { free(k); free(v); free(tk?tk:*keys); break; }
+			*keys = tk; *vals = tv; }
+		(*keys)[n] = k; (*vals)[n] = v; n++;
+	}
+	return n;
+}
+
+/* Strip surrounding quotes + JSON-unescape a raw value substring (string values). */
+static char *hkJsonUnquote(const char *raw) {
+	if (!raw) return NULL;
+	if (raw[0] == '"') {
+		int len = (int)strlen(raw); if (len >= 2 && raw[len-1] == '"') return hkJsonUnescape(raw+1, len-2);
+	}
+	return strdup(raw);
+}
+
+#ifndef _WIN32
+static int hkMcpWriteAll(int fd, const char *buf, size_t len) {
+	size_t off = 0;
+	while (off < len) {
+		ssize_t w = write(fd, buf + off, len - off);
+		if (w <= 0) { if (errno == EINTR) continue; return -1; }
+		off += (size_t)w;
+	}
+	return 0;
+}
+
+/* Read one newline-delimited message from the server (blocking up to timeout). */
+static char *hkMcpReadLine(mcpServer *s, int timeout_ms) {
+	for (;;) {
+		for (size_t i = 0; i < s->rlen; i++) {
+			if (s->rbuf[i] == '\n') {
+				char *line = malloc(i + 1); if (!line) return NULL;
+				memcpy(line, s->rbuf, i); line[i] = '\0';
+				memmove(s->rbuf, s->rbuf + i + 1, s->rlen - i - 1);
+				s->rlen -= (i + 1);
+				return line;
+			}
+		}
+		struct pollfd pfd = { s->fd, POLLIN, 0 };
+		int pr = poll(&pfd, 1, timeout_ms);
+		if (pr <= 0) return NULL;                 /* timeout / error */
+		if (s->rcap - s->rlen < 4096) {
+			if (s->rcap >= 4u*1024*1024) return NULL;   /* runaway guard */
+			size_t nc = s->rcap ? s->rcap * 2 : 65536;
+			char *nb = realloc(s->rbuf, nc); if (!nb) return NULL;
+			s->rbuf = nb; s->rcap = nc;
+		}
+		ssize_t r = read(s->fd, s->rbuf + s->rlen, s->rcap - s->rlen);
+		if (r <= 0) { if (r < 0 && errno == EINTR) continue; return NULL; }
+		s->rlen += (size_t)r;
+	}
+}
+
+/* True if `line` carries "id":<id>. Reuses the whitespace-tolerant int parser so
+   pretty-printed responses (`"id": 1`) match as well as compact (`"id":1`). */
+static int hkMcpLineHasId(const char *line, int id) {
+	return hkExtractJsonInt(line, "id") == id;
+}
+
+/* Send a JSON-RPC request, await the matching response line (malloc'd). */
+static char *hkMcpRequest(mcpServer *s, const char *method, const char *params, int timeout_ms) {
+	if (!s || s->fd < 0) return NULL;
+	int id = s->next_id++;
+	char hdr[256];
+	int hlen = snprintf(hdr, sizeof(hdr), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\",\"params\":", id, method);
+	if (hkMcpWriteAll(s->fd, hdr, (size_t)hlen) != 0) return NULL;
+	if (hkMcpWriteAll(s->fd, params, strlen(params)) != 0) return NULL;
+	if (hkMcpWriteAll(s->fd, "}\n", 2) != 0) return NULL;
+	for (int tries = 0; tries < 1000; tries++) {
+		char *line = hkMcpReadLine(s, timeout_ms);
+		if (!line) return NULL;
+		if (hkMcpLineHasId(line, id)) return line;
+		free(line);                                /* notification / other id — skip */
+	}
+	return NULL;
+}
+
+static void hkMcpNotify(mcpServer *s, const char *method, const char *params) {
+	if (!s || s->fd < 0) return;
+	char hdr[256];
+	int hlen = snprintf(hdr, sizeof(hdr), "{\"jsonrpc\":\"2.0\",\"method\":\"%s\",\"params\":", method);
+	hkMcpWriteAll(s->fd, hdr, (size_t)hlen);
+	hkMcpWriteAll(s->fd, params, strlen(params));
+	hkMcpWriteAll(s->fd, "}\n", 2);
+}
+
+/* Parse a tools/list `tools` array and register each into g_mcp_tools. */
+static void hkMcpRegisterTools(int srv_idx, const char *tools_arr) {
+	int n = 0; char **objs = hkJsonArrayObjects(tools_arr, &n);
+	for (int i = 0; i < n; i++) {
+		char *nm = hkExtractJsonString(objs[i], "name");
+		if (nm) {
+			char *desc = hkExtractJsonString(objs[i], "description");
+			char *sch  = hkExtractJsonObject(objs[i], "inputSchema");
+			char qual[256];
+			snprintf(qual, sizeof(qual), "mcp__%s__%s", g_mcp_servers[srv_idx].name, nm);
+			mcpTool *nt = realloc(g_mcp_tools, (g_mcp_tool_count + 1) * sizeof(*nt));
+			if (nt) {
+				g_mcp_tools = nt;
+				mcpTool *t = &g_mcp_tools[g_mcp_tool_count];
+				t->server_idx  = srv_idx;
+				t->qualified   = strdup(qual);
+				t->remote      = nm;   nm   = NULL;
+				t->description = desc ? desc : strdup("(no description)"); desc = NULL;
+				t->schema      = sch  ? sch  : strdup("{\"type\":\"object\"}"); sch = NULL;
+				g_mcp_tool_count++;
+			}
+			free(nm); free(desc); free(sch);
+		}
+		free(objs[i]);
+	}
+	free(objs);
+}
+
+/* Spawn a server child, handshake, list tools. Returns the server index or -1. */
+static int hkMcpConnect(const char *name, const char *command, char **argv,
+                        char **env_k, char **env_v, int env_n) {
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+	pid_t pid = fork();
+	if (pid < 0) { close(sv[0]); close(sv[1]); return -1; }
+	if (pid == 0) {
+		close(sv[0]);
+		dup2(sv[1], STDIN_FILENO);
+		dup2(sv[1], STDOUT_FILENO);
+		if (sv[1] > 2) close(sv[1]);
+		if (!getenv("HAKO_MCP_DEBUG")) {
+			int dn = open("/dev/null", O_WRONLY);
+			if (dn >= 0) { dup2(dn, STDERR_FILENO); if (dn > 2) close(dn); }
+		}
+		for (int i = 0; i < env_n; i++) setenv(env_k[i], env_v[i], 1);
+		execvp(command, argv);
+		_exit(127);
+	}
+	close(sv[1]);
+	mcpServer *ns = realloc(g_mcp_servers, (g_mcp_server_count + 1) * sizeof(*ns));
+	if (!ns) { close(sv[0]); kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+	g_mcp_servers = ns;
+	int idx = g_mcp_server_count;
+	mcpServer *s = &g_mcp_servers[idx];
+	memset(s, 0, sizeof(*s));
+	s->name = strdup(name); s->fd = sv[0]; s->pid = pid; s->next_id = 1;
+	s->rcap = 65536; s->rbuf = malloc(s->rcap); s->rlen = 0;
+	g_mcp_server_count++;
+	if (!s->rbuf) { close(s->fd); s->fd = -1; kill(pid, SIGKILL); waitpid(pid, NULL, 0); return -1; }
+
+	char *resp = hkMcpRequest(s, "initialize",
+		"{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},"
+		"\"clientInfo\":{\"name\":\"hako-code\",\"version\":\"" HAKO_VERSION "\"}}", 10000);
+	if (!resp) {                                   /* handshake failed — mark dead */
+		close(s->fd); s->fd = -1; kill(pid, SIGKILL); waitpid(pid, NULL, 0);
+		return idx;
+	}
+	free(resp);
+	hkMcpNotify(s, "notifications/initialized", "{}");
+	char *tl = hkMcpRequest(s, "tools/list", "{}", 10000);
+	if (tl) {
+		char *arr = hkExtractRawJsonArray(tl, "tools");
+		if (arr) { hkMcpRegisterTools(idx, arr); free(arr); }
+		free(tl);
+	}
+	return idx;
+}
+#endif /* !_WIN32 */
+
+#ifndef _WIN32
+static void hkMcpInit(void) {
+	const char *home = getenv("HOME"); if (!home) home = ".";
+	char path[1024]; snprintf(path, sizeof(path), "%s/.hako/mcp.json", home);
+	char *txt = hkReadFileAll(path, 256*1024);
+	if (!txt) return;
+	char *servers = hkExtractJsonObject(txt, "mcpServers");
+	if (servers) {
+		char **keys = NULL, **vals = NULL;
+		int n = hkJsonObjectEntries(servers, &keys, &vals);
+		for (int i = 0; i < n; i++) {
+			char *cmd = hkExtractJsonString(vals[i], "command");
+			if (cmd) {
+				char *argsarr = hkExtractRawJsonArray(vals[i], "args");
+				int an = 0; char **as = argsarr ? hkJsonStringArray(argsarr, &an) : NULL;
+				char **argv = malloc((an + 2) * sizeof(char*));
+				if (argv) {
+					argv[0] = cmd;
+					for (int j = 0; j < an; j++) argv[j+1] = as[j];
+					argv[an+1] = NULL;
+					char *envobj = hkExtractJsonObject(vals[i], "env");
+					char **ek = NULL, **ev = NULL, **evq = NULL; int en = 0;
+					if (envobj) {
+						en = hkJsonObjectEntries(envobj, &ek, &ev);
+						evq = malloc(en * sizeof(char*));
+						for (int j = 0; j < en; j++) evq[j] = hkJsonUnquote(ev[j]);
+					}
+					hkMcpConnect(keys[i], cmd, argv, ek, evq, en);
+					for (int j = 0; j < en; j++) { free(ek[j]); free(ev[j]); free(evq[j]); }
+					free(ek); free(ev); free(evq); free(envobj);
+					free(argv);
+				}
+				for (int j = 0; j < an; j++) free(as[j]);
+				free(as); free(argsarr); free(cmd);
+			}
+			free(keys[i]); free(vals[i]);
+		}
+		free(keys); free(vals); free(servers);
+	}
+	free(txt);
+}
+
+static char *hkMcpCallTool(const char *qualified_name, const char *args_json) {
+	for (int i = 0; i < g_mcp_tool_count; i++) {
+		if (strcmp(g_mcp_tools[i].qualified, qualified_name) != 0) continue;
+		mcpServer *s = &g_mcp_servers[g_mcp_tools[i].server_idx];
+		if (s->fd < 0) return strdup("error: MCP server is not connected");
+		const char *a = (args_json && *args_json) ? args_json : "{}";
+		size_t plen = strlen(g_mcp_tools[i].remote) + strlen(a) + 64;
+		char *params = malloc(plen); if (!params) return strdup("error: out of memory");
+		snprintf(params, plen, "{\"name\":\"%s\",\"arguments\":%s}", g_mcp_tools[i].remote, a);
+		char *resp = hkMcpRequest(s, "tools/call", params, 60000);
+		free(params);
+		if (!resp) return strdup("error: MCP server did not respond (timeout)");
+		char *arr = hkExtractRawJsonArray(resp, "content");
+		char *out = NULL;
+		if (arr) {
+			int n = 0; char **objs = hkJsonArrayObjects(arr, &n);
+			size_t cap = 256, len = 0; out = malloc(cap); if (out) out[0] = '\0';
+			for (int j = 0; out && j < n; j++) {
+				char *tx = hkExtractJsonString(objs[j], "text");
+				if (tx) {
+					char *u = hkJsonUnescape(tx, (int)strlen(tx));
+					const char *use = u ? u : tx; size_t ul = strlen(use);
+					if (len + ul + 2 > cap) { while (len + ul + 2 > cap) cap *= 2; char *t = realloc(out, cap); if (!t) { free(u); free(tx); break; } out = t; }
+					if (len) out[len++] = '\n';
+					memcpy(out + len, use, ul); len += ul; out[len] = '\0';
+					free(u);
+				}
+				free(tx); free(objs[j]);
+			}
+			for (int j = 0; j < n; j++) (void)j;  /* objs entries already freed above */
+			free(objs); free(arr);
+			if (out && len == 0) { free(out); out = NULL; }
+		}
+		if (!out) {
+			char *ro = hkExtractJsonObject(resp, "result");
+			out = ro ? ro : strdup("(mcp: no text content in result)");
+		}
+		free(resp);
+		return out;
+	}
+	return strdup("error: unknown MCP tool");
+}
+
+static void hkMcpShutdown(void) {
+	for (int i = 0; i < g_mcp_server_count; i++) {
+		if (g_mcp_servers[i].fd >= 0) close(g_mcp_servers[i].fd);
+		if (g_mcp_servers[i].pid > 0) { kill(g_mcp_servers[i].pid, SIGTERM); waitpid(g_mcp_servers[i].pid, NULL, WNOHANG); }
+		free(g_mcp_servers[i].name); free(g_mcp_servers[i].rbuf);
+	}
+	free(g_mcp_servers); g_mcp_servers = NULL; g_mcp_server_count = 0;
+	for (int i = 0; i < g_mcp_tool_count; i++) {
+		free(g_mcp_tools[i].qualified); free(g_mcp_tools[i].remote);
+		free(g_mcp_tools[i].description); free(g_mcp_tools[i].schema);
+	}
+	free(g_mcp_tools); g_mcp_tools = NULL; g_mcp_tool_count = 0;
+}
+
+static void hkMcpList(aiData *data) {
+	if (g_mcp_server_count == 0) { aiAddHistory(data, "no MCP servers (configure ~/.hako/mcp.json)"); return; }
+	for (int i = 0; i < g_mcp_server_count; i++) {
+		int tools = 0;
+		for (int j = 0; j < g_mcp_tool_count; j++) if (g_mcp_tools[j].server_idx == i) tools++;
+		char line[256];
+		snprintf(line, sizeof(line), "%s %s — %d tool(s)",
+			g_mcp_servers[i].fd >= 0 ? "[ok]" : "[failed]", g_mcp_servers[i].name, tools);
+		aiAddHistory(data, line);
+		for (int j = 0; j < g_mcp_tool_count; j++)
+			if (g_mcp_tools[j].server_idx == i) {
+				char tl[256]; snprintf(tl, sizeof(tl), "    %s", g_mcp_tools[j].qualified);
+				aiAddHistory(data, tl);
+			}
+	}
+}
+#else  /* _WIN32: MCP stdio transport needs fork/socketpair — not available */
+static void  hkMcpInit(void) {}
+static void  hkMcpShutdown(void) {}
+static char *hkMcpCallTool(const char *q, const char *a) { (void)q; (void)a; return strdup("error: MCP is POSIX-only in this build"); }
+static void  hkMcpList(aiData *data) { aiAddHistory(data, "MCP is not supported on this platform (POSIX only)."); }
+#endif
+
+/* Render live MCP tools as a Hermes <tools> block so LOCAL (Qwen) models — whose
+   prompt is the static QWEN_TOOL_PROMPT, not hkBuildToolsSchema — can see and
+   call them too (the spec's "every provider" goal). NULL when none connected.
+   g_mcp_tool_count is always 0 on Windows (MCP no-op), so this is safe there. */
+static char *hkMcpLocalToolsPrompt(void) {
+	if (g_mcp_tool_count <= 0) return NULL;
+	size_t cap = 512, len = 0;
+	char *out = malloc(cap);
+	if (!out) return NULL;
+	len += (size_t)snprintf(out, cap, "\n# MCP tools — call these with the SAME <tool_call> format:\n<tools>\n");
+	for (int i = 0; i < g_mcp_tool_count; i++) {
+		const char *nm = g_mcp_tools[i].qualified;
+		const char *ds = g_mcp_tools[i].description ? g_mcp_tools[i].description : "";
+		const char *sc = g_mcp_tools[i].schema ? g_mcp_tools[i].schema : "{\"type\":\"object\"}";
+		size_t dsl = strlen(ds);
+		char *dse = malloc(dsl * 6 + 8);
+		if (dse) hkJsonEscapeInto(ds, dse, (int)(dsl * 6 + 8));
+		size_t need = strlen(nm) + (dse ? strlen(dse) : 0) + strlen(sc) + 96;
+		if (len + need > cap) { while (len + need > cap) cap *= 2; char *t = realloc(out, cap); if (!t) { free(dse); free(out); return NULL; } out = t; }
+		len += (size_t)snprintf(out + len, cap - len,
+			"{\"type\": \"function\", \"function\": {\"name\": \"%s\", \"description\": \"%s\", \"parameters\": %s}}\n",
+			nm, dse ? dse : "", sc);
+		free(dse);
+	}
+	if (len + 12 > cap) { char *t = realloc(out, len + 12); if (t) { out = t; cap = len + 12; } }
+	snprintf(out + len, cap - len, "</tools>\n");
+	return out;
+}
+
+/* Resolve a (possibly mangled) MCP tool name to a registered qualified name.
+   Small models garble the `mcp__server__tool` double-underscores — seen live:
+   "mcp_-testmcp__reverse". Exact match first, then a fuzzy match ignoring every
+   non-alphanumeric char. Returns a pointer into g_mcp_tools (do NOT free), or
+   NULL. count is 0 on Windows (MCP no-op), so this no-ops there. */
+static const char *hkMcpResolveName(const char *name) {
+	if (!name) return NULL;
+	for (int i = 0; i < g_mcp_tool_count; i++)
+		if (strcmp(g_mcp_tools[i].qualified, name) == 0) return g_mcp_tools[i].qualified;
+	char want[256]; int w = 0;
+	for (const char *p = name; *p && w < (int)sizeof(want) - 1; p++) {
+		unsigned char c = (unsigned char)*p;
+		if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+		if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) want[w++] = (char)c;
+	}
+	want[w] = '\0';
+	if (w == 0) return NULL;
+	for (int i = 0; i < g_mcp_tool_count; i++) {
+		char have[256]; int h = 0;
+		for (const char *p = g_mcp_tools[i].qualified; *p && h < (int)sizeof(have) - 1; p++) {
+			unsigned char c = (unsigned char)*p;
+			if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+			if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) have[h++] = (char)c;
+		}
+		have[h] = '\0';
+		if (strcmp(want, have) == 0) return g_mcp_tools[i].qualified;
+	}
+	return NULL;
+}
+
 typedef struct hkToolDef {
 	const char *name;
 	const char *description;
@@ -2221,9 +2790,17 @@ static const hkToolDef HK_TOOLS[] = {
 	 "\"path\":{\"type\":\"string\"}",
 	 "\"path\""},
 	{"write_file",
-	 "Create or overwrite a file in the trusted project directory.",
+	 "Create or overwrite a WHOLE file. For small changes to an existing file prefer edit_file.",
 	 "\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}",
 	 "\"path\",\"content\""},
+	{"edit_file",
+	 "Change part of an existing file: replace the exact unique snippet 'old' with 'new'. Cheaper and safer than rewriting the whole file. 'old' must match the file exactly (whitespace-tolerant) and be unique.",
+	 "\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"}",
+	 "\"path\",\"old\",\"new\""},
+	{"edit_lines",
+	 "Replace an inclusive 1-indexed line range [start,end] of a file with 'new' text. Use when you know exact line numbers (e.g. from a traceback). Omit 'end' to replace a single line.",
+	 "\"path\":{\"type\":\"string\"},\"start\":{\"type\":\"integer\"},\"end\":{\"type\":\"integer\"},\"new\":{\"type\":\"string\"}",
+	 "\"path\",\"start\",\"new\""},
 	{"run_shell",
 	 "Run a non-interactive shell command. 10s timeout. Requires project trust.",
 	 "\"cmd\":{\"type\":\"string\"}",
@@ -2266,10 +2843,215 @@ static char *hkBuildToolsSchema(int provider_format) {
 		}
 		free(desc_esc);
 	}
+	/* Append MCP server tools (namespaced mcp__<server>__<tool>). At least the 5
+	   builtins precede, so each MCP entry leads with a comma. schema is verbatim. */
+	for (int i = 0; i < g_mcp_tool_count; i++) {
+		mcpTool *m = &g_mcp_tools[i];
+		size_t dlen = strlen(m->description);
+		char *desc_esc = malloc(dlen * 6 + 8);
+		if (!desc_esc) continue;
+		hkJsonEscapeInto(m->description, desc_esc, (int)(dlen * 6 + 8));
+		size_t need = len + strlen(m->qualified) + strlen(desc_esc) + strlen(m->schema) + 128;
+		if (need >= cap) { while (cap < need) cap *= 2; out = realloc(out, cap); }
+		if (provider_format == 0)
+			len += snprintf(out + len, cap - len,
+				",{\"name\":\"%s\",\"description\":\"%s\",\"input_schema\":%s}",
+				m->qualified, desc_esc, m->schema);
+		else
+			len += snprintf(out + len, cap - len,
+				",{\"type\":\"function\",\"function\":{\"name\":\"%s\",\"description\":\"%s\",\"parameters\":%s}}",
+				m->qualified, desc_esc, m->schema);
+		free(desc_esc);
+	}
 	if (len + 2 >= cap) { cap += 4; out = realloc(out, cap); }
 	out[len++] = ']';
 	out[len] = '\0';
 	return out;
+}
+
+/* ---- Tool permission gate (Claude-Code-style) -----------------------------
+   Per-call approval: [y] once / [n] deny / [a] always (this session). The
+   "always" answer is SCOPED — read/write grant the project for the session,
+   run_shell grants only the EXACT command string (no blanket per-binary allow,
+   since git/npm bite when misused). Session-only, in-memory, cleared on exit.
+   Runs on the AI worker thread, but main is parked in pthread_join (clWaitWorker)
+   for the whole turn, so reading stdin here is safe — no condvar handshake.
+   Non-interactive (-p / --pipe / piped stdin) cannot prompt → denies (the caller
+   surfaces the denial to the model as an observation). :auto / --yolo
+   (E.ai_auto_approve) bypasses the gate entirely. */
+typedef enum { ALLOW_READ, ALLOW_WRITE, ALLOW_SHELL } hkAllowKind;
+typedef struct { hkAllowKind kind; char *scope; } hkAllowRule; /* scope: NULL read/write, exact cmd for shell */
+static hkAllowRule *g_allow = NULL;
+static int g_allow_count = 0;
+
+static int hkAllowHas(hkAllowKind kind, const char *scope) {
+	for (int i = 0; i < g_allow_count; i++) {
+		if (g_allow[i].kind != kind) continue;
+		if (kind == ALLOW_SHELL) {
+			if (g_allow[i].scope && scope && strcmp(g_allow[i].scope, scope) == 0) return 1;
+		} else {
+			return 1; /* read/write are project-scoped — one grant covers the session */
+		}
+	}
+	return 0;
+}
+
+static void hkAllowAdd(hkAllowKind kind, const char *scope) {
+	if (hkAllowHas(kind, scope)) return;
+	hkAllowRule *n = realloc(g_allow, (g_allow_count + 1) * sizeof(*g_allow));
+	if (!n) return;
+	g_allow = n;
+	g_allow[g_allow_count].kind  = kind;
+	g_allow[g_allow_count].scope = scope ? strdup(scope) : NULL;
+	g_allow_count++;
+}
+
+/* Returns 1 = allowed (run the tool), 0 = denied. `name` must already be the
+   canonical tool name (call AFTER alias resolution). */
+static int hkToolApproval(const char *name, const char *input_json) {
+	if (E.ai_auto_approve) return 1;                 /* :auto / --yolo bypass */
+	/* read_skill is trust-free by design (user-installed skill files, sandboxed to
+	   ~/.hako/skills) — don't gate it, matching its no-trust-grant contract. */
+	if (strcmp(name, "read_skill") == 0) return 1;
+
+	hkAllowKind kind;
+	if      (strcmp(name, "write_file") == 0) kind = ALLOW_WRITE;
+	else if (strcmp(name, "edit_file")  == 0) kind = ALLOW_WRITE;
+	else if (strcmp(name, "edit_lines") == 0) kind = ALLOW_WRITE;
+	else if (strcmp(name, "run_shell")  == 0) kind = ALLOW_SHELL;
+	else                                      kind = ALLOW_READ; /* read_file / list_dir / read_skill */
+
+	/* Subject string for display + (shell) scope — mirror hkExecTool's param aliases. */
+	char *subject = NULL;
+	if (kind == ALLOW_SHELL) {
+		subject = hkExtractJsonString(input_json, "cmd");
+		if (!subject) subject = hkExtractJsonString(input_json, "command");
+		if (!subject) subject = hkExtractJsonString(input_json, "shell");
+		if (!subject) subject = hkExtractJsonString(input_json, "script");
+	} else {
+		subject = hkExtractJsonString(input_json, "path");
+		if (!subject) subject = hkExtractJsonString(input_json, "file_path");
+		if (!subject) subject = hkExtractJsonString(input_json, "filename");
+		if (!subject) subject = hkExtractJsonString(input_json, "directory");
+		if (!subject) subject = hkExtractJsonString(input_json, "dir");
+	}
+
+	if (hkAllowHas(kind, kind == ALLOW_SHELL ? subject : NULL)) { free(subject); return 1; }
+
+	if (!isatty(STDIN_FILENO)) { free(subject); return 0; } /* can't prompt — deny */
+
+	clStopAnim(&G_AI);                               /* don't let the spinner garble the prompt */
+
+	const char *always_label =
+		(kind == ALLOW_WRITE) ? "always write to this project this session" :
+		(kind == ALLOW_SHELL) ? "always run exactly this command this session" :
+		                        "always read from this project this session";
+
+	const char *disp = subject ? subject : (kind == ALLOW_SHELL ? "(command)" : ".");
+	if (E.color_enabled)
+		printf("\n  %s\xE2\x97\x8F %s%s  %s%s%s\n", TH_TOOL, name, ANSI_RESET,
+		       TH_META, disp, ANSI_RESET);
+	else
+		printf("\n  * %s  %s\n", name, disp);
+	printf("  Allow?  [y] once   [n] no   [a] %s\n  > ", always_label);
+	fflush(stdout);
+
+	int decision = 0;                                /* 0 deny, 1 once, 2 always */
+	char buf[64];
+	if (fgets(buf, sizeof(buf), stdin)) {
+		if      (buf[0] == 'y' || buf[0] == 'Y') decision = 1;
+		else if (buf[0] == 'a' || buf[0] == 'A') decision = 2;
+	}
+	if (decision == 2) { hkAllowAdd(kind, kind == ALLOW_SHELL ? subject : NULL); decision = 1; }
+	free(subject);
+	return decision;
+}
+
+/* last path write_file/edit_* wrote, this process — fence-autowrite target */
+static char hk_last_write_path[1024] = "";
+
+/* equal ignoring trailing whitespace (spaces/tabs/CR); leading ws still significant */
+static int hkLineEqTrim(const char *a, const char *b) {
+	size_t la = strlen(a), lb = strlen(b);
+	while (la && (a[la-1] == ' ' || a[la-1] == '\t' || a[la-1] == '\r')) la--;
+	while (lb && (b[lb-1] == ' ' || b[lb-1] == '\t' || b[lb-1] == '\r')) lb--;
+	return la == lb && strncmp(a, b, la) == 0;
+}
+
+/* split into lines over a malloc'd copy; sets *n + *bufcopy; caller frees both */
+static char **hkSplitLines(const char *s, int *n, char **bufcopy) {
+	*n = 0; *bufcopy = NULL;
+	char *c = strdup(s);
+	if (!c) return NULL;
+	int cap = 64, cnt = 0;
+	char **lines = malloc((size_t)cap * sizeof(char *));
+	if (!lines) { free(c); return NULL; }
+	lines[cnt++] = c;
+	for (char *p = c; *p; p++) {
+		if (*p == '\n') {
+			*p = '\0';
+			if (*(p+1)) {
+				if (cnt == cap) {
+					cap *= 2;
+					char **t = realloc(lines, (size_t)cap * sizeof(char *));
+					if (!t) break;
+					lines = t;
+				}
+				lines[cnt++] = p + 1;
+			}
+		}
+	}
+	for (int i = 0; i < cnt; i++) {
+		size_t L = strlen(lines[i]);
+		if (L && lines[i][L-1] == '\r') lines[i][L-1] = '\0';
+	}
+	*n = cnt; *bufcopy = c;
+	return lines;
+}
+
+/* replace 1-indexed inclusive lines [a,b] of src with rep; *removed = lines cut */
+static char *hkSpliceLines(const char *src, int a, int b, const char *rep, int *removed) {
+	if (a < 1 || b < a) return NULL;
+	const char *p = src; int line = 1;
+	while (line < a && *p) { if (*p == '\n') line++; p++; }
+	if (line < a) return NULL;
+	const char *start = p;
+	int rm = 0;
+	while (line <= b && *p) {
+		if (*p == '\n') { line++; rm++; p++; if (line > b) break; }
+		else p++;
+	}
+	if (p > start && p[-1] != '\n') rm++;
+	const char *tail = p;
+	size_t pre = (size_t)(start - src), tl = strlen(tail), rl = strlen(rep);
+	int ended_nl = (tail > src && tail[-1] == '\n');
+	int need_nl = (rl > 0 && rep[rl-1] != '\n' && (tl > 0 || ended_nl));
+	char *out = malloc(pre + rl + (need_nl ? 1u : 0u) + tl + 1);
+	if (!out) return NULL;
+	size_t o = 0;
+	memcpy(out + o, src, pre); o += pre;
+	memcpy(out + o, rep, rl);  o += rl;
+	if (need_nl) out[o++] = '\n';
+	memcpy(out + o, tail, tl); o += tl;
+	out[o] = '\0';
+	if (removed) *removed = rm;
+	return out;
+}
+
+/* write content to a resolved+approved path; returns a write_file-shape summary */
+static char *hkWriteResolved(const char *full, const char *rel, const char *content) {
+	size_t clen = strlen(content);
+	int new_lines = 0;
+	for (size_t i = 0; i < clen; i++) if (content[i] == '\n') new_lines++;
+	if (clen > 0 && content[clen-1] != '\n') new_lines++;
+	FILE *fp = fopen(full, "wb");
+	if (!fp) return strdup("error: cannot open for write");
+	size_t wrote = fwrite(content, 1, clen, fp);
+	fclose(fp);
+	snprintf(hk_last_write_path, sizeof(hk_last_write_path), "%s", rel);
+	char *out = malloc(256);
+	if (out) snprintf(out, 256, "wrote %zu bytes to %s (%d lines)", wrote, full, new_lines);
+	return out ? out : strdup("wrote file");
 }
 
 static char *hkExecTool(const char *name, const char *input_json) {
@@ -2278,22 +3060,30 @@ static char *hkExecTool(const char *name, const char *input_json) {
 	   schema. Add new aliases here as field reports come in. */
 	struct { const char *from; const char *to; } aliases[] = {
 		{"create_file",  "write_file"},
+		{"writefile",    "write_file"},
 		{"write",        "write_file"},
-		{"edit",         "write_file"},
-		{"edit_file",    "write_file"},
-		{"str_replace",  "write_file"},
-		{"str_replace_based_edit_tool", "write_file"},
-		{"str_replace_editor",          "write_file"},
-		{"text_editor",                 "write_file"},
-		{"text_edit",                   "write_file"},
+		{"edit",         "edit_file"},
+		{"editfile",     "edit_file"},
+		{"replace",      "edit_file"},
+		{"str_replace",  "edit_file"},
+		{"str_replace_based_edit_tool", "edit_file"},
+		{"str_replace_editor",          "edit_file"},
+		{"text_editor",                 "edit_file"},
+		{"text_edit",                   "edit_file"},
+		{"edit_line",    "edit_lines"},
+		{"editlines",    "edit_lines"},
+		{"replace_lines","edit_lines"},
+		{"readfile",     "read_file"},
 		{"read",         "read_file"},
 		{"view",         "read_file"},
 		{"cat",          "read_file"},
 		{"open_file",    "read_file"},
 		{"ls",           "list_dir"},
+		{"listdir",      "list_dir"},
 		{"list_files",   "list_dir"},
 		{"list",         "list_dir"},
 		{"dir",          "list_dir"},
+		{"runshell",     "run_shell"},
 		{"bash",         "run_shell"},
 		{"shell",        "run_shell"},
 		{"sh",           "run_shell"},
@@ -2304,6 +3094,19 @@ static char *hkExecTool(const char *name, const char *input_json) {
 	};
 	for (int i = 0; aliases[i].from; i++) {
 		if (strcasecmp(name, aliases[i].from) == 0) { name = aliases[i].to; break; }
+	}
+	/* Permission gate — every provider/path funnels here. Denied → tell the model. */
+	if (!hkToolApproval(name, input_json)) {
+		char *d = malloc(160);
+		if (d) snprintf(d, 160, "error: user denied tool '%s'. Do not retry it; explain or ask the user how to proceed.", name);
+		return d ? d : strdup("error: user denied tool");
+	}
+	/* MCP tools (mcp__<server>__<tool>) route to their server over JSON-RPC.
+	   Match loosely on the "mcp" prefix + fuzzy-resolve the exact name — small
+	   models mangle the double underscores. */
+	if (strncmp(name, "mcp", 3) == 0) {
+		const char *q = hkMcpResolveName(name);
+		if (q) return hkMcpCallTool(q, input_json);
 	}
 	if (strcmp(name, "read_file") == 0) {
 		if (!hkProjectTrusted()) return strdup("error: project not trusted — ask the user to run :trust before any file access");
@@ -2434,27 +3237,117 @@ static char *hkExecTool(const char *name, const char *input_json) {
 			while ((ch = fgetc(ef)) != EOF) if (ch == '\n') old_lines++;
 			fclose(ef);
 		}
-		if (!E.ai_autowrite) {
-			char pending[PATH_MAX + 16];
-			snprintf(pending, sizeof(pending), "%s.hako-pending", full);
-			FILE *fp = fopen(pending, "wb");
-			if (!fp) { free(path); free(content); return strdup("error: cannot stage pending"); }
-			fwrite(content, 1, clen, fp);
-			fclose(fp);
-			char *out = malloc(512);
-			snprintf(out, 512, "preview staged at %s (new %zu bytes/%d lines, old %ld/%d). ai_autowrite=0; user must `mv` pending to apply.",
-				pending, clen, new_lines, old_size, old_lines);
-			free(path); free(content);
-			return out;
-		}
+		/* Approval already happened in hkToolApproval — write lands immediately. */
 		FILE *fp = fopen(full, "wb");
 		if (!fp) { free(path); free(content); return strdup("error: cannot open for write"); }
 		size_t wrote = fwrite(content, 1, clen, fp);
 		fclose(fp);
+		snprintf(hk_last_write_path, sizeof(hk_last_write_path), "%s", path);
 		char *out = malloc(256);
-		snprintf(out, 256, "wrote %zu bytes to %s (new %d lines, old %d)", wrote, full, new_lines, old_lines);
+		if (old_size < 0)
+			snprintf(out, 256, "wrote %zu bytes to %s (new file, %d lines)", wrote, full, new_lines);
+		else
+			snprintf(out, 256, "wrote %zu bytes to %s (%d lines; replaced %ld bytes / %d lines)",
+				wrote, full, new_lines, old_size, old_lines);
 		free(path); free(content);
 		return out;
+	}
+	if (strcmp(name, "edit_file") == 0) {
+		if (!hkProjectTrusted()) return strdup("error: project not trusted");
+		char *path = hkExtractJsonString(input_json, "path");
+		if (!path) path = hkExtractJsonString(input_json, "file_path");
+		if (!path) path = hkExtractJsonString(input_json, "filename");
+		char *old_raw = hkExtractJsonString(input_json, "old");
+		if (!old_raw) old_raw = hkExtractJsonString(input_json, "old_str");
+		if (!old_raw) old_raw = hkExtractJsonString(input_json, "old_string");
+		if (!old_raw) old_raw = hkExtractJsonString(input_json, "search");
+		char *new_raw = hkExtractJsonString(input_json, "new");
+		if (!new_raw) new_raw = hkExtractJsonString(input_json, "new_str");
+		if (!new_raw) new_raw = hkExtractJsonString(input_json, "new_string");
+		if (!new_raw) new_raw = hkExtractJsonString(input_json, "replace");
+		if (!path || !old_raw || !new_raw) {
+			free(path); free(old_raw); free(new_raw);
+			return strdup("error: edit_file needs 'path', 'old' (exact snippet to replace), and 'new' string params");
+		}
+		char full[PATH_MAX];
+		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
+			free(path); free(old_raw); free(new_raw);
+			return strdup("error: path outside project");
+		}
+		char *olds = hkJsonUnescape(old_raw, (int)strlen(old_raw)); free(old_raw);
+		char *news = hkJsonUnescape(new_raw, (int)strlen(new_raw)); free(new_raw);
+		char *buf  = (olds && news) ? hkReadFileAll(full, 4 * 1024 * 1024) : NULL;
+		if (!olds || !news || !buf) {
+			free(path); free(olds); free(news); free(buf);
+			return strdup("error: cannot read file / bad escapes in old or new");
+		}
+		int fn = 0, on = 0; char *fbuf = NULL, *obuf = NULL;
+		char **flines = hkSplitLines(buf, &fn, &fbuf);
+		char **olines = hkSplitLines(olds, &on, &obuf);
+		char *result = NULL;
+		if (flines && olines && on > 0 && on <= fn) {
+			int found = 0, at = -1;
+			for (int i = 0; i + on <= fn; i++) {
+				int ok = 1;
+				for (int j = 0; j < on; j++)
+					if (!hkLineEqTrim(flines[i+j], olines[j])) { ok = 0; break; }
+				if (ok) { found++; at = i; }
+			}
+			if (found == 1) {
+				int rm = 0;
+				char *spliced = hkSpliceLines(buf, at + 1, at + on, news, &rm);
+				if (spliced) { result = hkWriteResolved(full, path, spliced); free(spliced); }
+				else result = strdup("error: splice failed");
+			} else if (found == 0) {
+				result = strdup("error: 'old' not found — copy it EXACTLY from the file, or use edit_lines with line numbers");
+			} else {
+				result = malloc(160);
+				if (result) snprintf(result, 160,
+					"error: 'old' matches %d places — add more surrounding lines to make it unique", found);
+			}
+		} else {
+			result = strdup("error: 'old' is empty or longer than the file");
+		}
+		free(flines); free(fbuf); free(olines); free(obuf);
+		free(buf); free(olds); free(news); free(path);
+		return result ? result : strdup("error: edit failed");
+	}
+	if (strcmp(name, "edit_lines") == 0) {
+		if (!hkProjectTrusted()) return strdup("error: project not trusted");
+		char *path = hkExtractJsonString(input_json, "path");
+		if (!path) path = hkExtractJsonString(input_json, "file_path");
+		if (!path) path = hkExtractJsonString(input_json, "filename");
+		if (!path) return strdup("error: edit_lines missing 'path'");
+		int a = hkExtractJsonInt(input_json, "start");
+		if (a < 0) a = hkExtractJsonInt(input_json, "start_line");
+		if (a < 0) a = hkExtractJsonInt(input_json, "line");
+		if (a < 0) { char *s = hkExtractJsonString(input_json, "start"); if (s) { a = atoi(s); free(s); } }
+		int b = hkExtractJsonInt(input_json, "end");
+		if (b < 0) b = hkExtractJsonInt(input_json, "end_line");
+		if (b < 0) { char *s = hkExtractJsonString(input_json, "end"); if (s) { b = atoi(s); free(s); } }
+		if (b < 0) b = a;
+		char *new_raw = hkExtractJsonString(input_json, "new");
+		if (!new_raw) new_raw = hkExtractJsonString(input_json, "new_str");
+		if (!new_raw) new_raw = hkExtractJsonString(input_json, "content");
+		if (!new_raw) new_raw = hkExtractJsonString(input_json, "text");
+		if (a < 1 || b < a || !new_raw) {
+			free(path); free(new_raw);
+			return strdup("error: edit_lines needs 'start' (>=1), optional 'end' (>=start), and 'new' text");
+		}
+		char full[PATH_MAX];
+		if (hkResolveInProject(path, full, sizeof(full)) != 0) {
+			free(path); free(new_raw);
+			return strdup("error: path outside project");
+		}
+		char *news = hkJsonUnescape(new_raw, (int)strlen(new_raw)); free(new_raw);
+		char *buf  = news ? hkReadFileAll(full, 4 * 1024 * 1024) : NULL;
+		if (!news || !buf) { free(path); free(news); free(buf); return strdup("error: cannot read file / bad escapes in new"); }
+		int rm = 0;
+		char *spliced = hkSpliceLines(buf, a, b, news, &rm);
+		char *result = spliced ? hkWriteResolved(full, path, spliced)
+		                       : strdup("error: line range past end of file");
+		free(spliced); free(buf); free(news); free(path);
+		return result;
 	}
 	return strdup("error: unknown tool");
 }
@@ -2466,6 +3359,7 @@ static const char *hkToolGlyph(const char *fname, int color) {
 	    !strcmp(fname, "read_skill") || !strcmp(fname, "list_open_files") ||
 	    !strcmp(fname, "read_open_file")) return color ? "◎" : "r";
 	if (!strcmp(fname, "write_file")) return color ? "✎" : "w";
+	if (!strcmp(fname, "edit_file") || !strcmp(fname, "edit_lines")) return color ? "✐" : "e";
 	if (!strcmp(fname, "run_shell"))   return color ? "❯" : "$";
 	return color ? "▸" : ">";
 }
@@ -2497,9 +3391,12 @@ static void hkAnnounceToolResult(aiData *data, const char *result) {
 	(void)data;
 	int len = result ? (int)strlen(result) : 0;
 	int is_err = result && strncmp(result, "error:", 6) == 0;
+	/* write/edit returns its own "wrote N bytes …" summary — echo it; byte count is
+	   only meaningful for opaque blobs (read_file / shell output) */
+	int is_summary = result && strncmp(result, "wrote ", 6) == 0;
 	if (E.pipe_mode) {
 		char display[256];
-		if (is_err) snprintf(display, sizeof(display), "%s", result ? result : "error");
+		if (is_err || is_summary) snprintf(display, sizeof(display), "%s", result ? result : "error");
 		else snprintf(display, sizeof(display), "  ← %d bytes", len);
 		clPipeEmitDisplay("tool_end", display);
 		return;
@@ -2507,6 +3404,9 @@ static void hkAnnounceToolResult(aiData *data, const char *result) {
 	if (is_err) {
 		if (E.color_enabled) printf("  %s✗ %s%s\n", ANSI_ERR, result, ANSI_RESET);
 		else printf("  ! %s\n", result);
+	} else if (is_summary) {
+		if (E.color_enabled) printf("  %s← %s%s\n", ANSI_DIM, result, ANSI_RESET);
+		else printf("  ← %s\n", result);
 	} else {
 		if (E.color_enabled) printf("  %s← %d bytes%s\n", ANSI_DIM, len, ANSI_RESET);
 		else printf("  ← %d bytes\n", len);
@@ -2523,6 +3423,10 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 	const char *model = E.ai_model;
 	const char *api_key = E.ai_api_key;
 	int max_tokens = E.ai_max_tokens > 0 ? E.ai_max_tokens : 2048;
+	/* Tool calls (prose XML or native) need room to finish — a tiny cap (e.g. a
+	   speed knob set for local chat) truncates them mid-call → unparseable +
+	   suppressed → looks like an empty response. Floor it when tools are on. */
+	if (E.ai_tools_enabled && max_tokens < 1024) max_tokens = 1024;
 
 	const char *sys = (data->system_prompt && *data->system_prompt) ? data->system_prompt : "";
 	char *sys_esc = NULL;
@@ -2617,6 +3521,7 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 		   num_predict: cap generation so a runaway model doesn't burn minutes
 		   on a single turn. num_ctx kept at server default (model-dependent). */
 		int npred = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
+		if (tools_on && npred < 2048) npred = 2048;   /* writes need room before </write_file>; stop seq means surplus is never spent */
 		if (tools_on) {
 			snprintf(body, bodycap,
 				"{\"model\":\"%s\",\"messages\":%s,\"stream\":false,\"keep_alive\":\"30m\",\"options\":{\"num_predict\":%d},\"tools\":%s}",
@@ -2668,11 +3573,13 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 				"tool call AND received an observation confirming success. Prefer "
 				"write_file over bash heredocs/echo for file creation — it is "
 				"path-safe and atomic.\\n\\n"
-				"AVAILABLE TOOLS — write_file(path, content), read_file(path), "
-				"list_dir(path), run_shell(cmd). Do not invent tools like "
-				"`str_replace_based_edit_tool`, `text_editor`, `create_file`; "
-				"they are remapped but cost an extra round-trip. Use canonical "
-				"names.\\n\\n"
+				"AVAILABLE TOOLS — write_file(path, content), edit_file(path, old, new), "
+				"edit_lines(path, start, end, new), read_file(path), "
+				"list_dir(path), run_shell(cmd). Prefer edit_file/edit_lines for small "
+				"changes to an existing file instead of rewriting the whole thing. Do "
+				"not invent tools like `str_replace_based_edit_tool`, `text_editor`, "
+				"`create_file`; they are remapped but cost an extra round-trip. Use "
+				"canonical names.\\n\\n"
 				"All paths are relative to the project root. Use \\\".\\\" "
 				"for the project root. Never use absolute paths.\\n\\n";
 			size_t cl = strlen(cli_lead);
@@ -2989,11 +3896,23 @@ static char *hkBuildToolResults(aiData *data, const char *content_array) {
 
 /* Extract raw JSON array value for `key` (e.g. "tool_calls"). Returns malloc'd "[...]". */
 static char *hkExtractRawJsonArray(const char *src, const char *key) {
+	/* Match `"key"` + optional ws + `:` + optional ws + `[` — tolerates
+	   pretty-printed JSON (mirrors hkExtractJsonString/Object). */
 	char needle[64];
-	snprintf(needle, sizeof(needle), "\"%s\":[", key);
-	const char *p = strstr(src, needle);
-	if (!p) return NULL;
-	p += strlen(needle) - 1; /* point at '[' */
+	snprintf(needle, sizeof(needle), "\"%s\"", key);
+	const char *p = src;
+	for (;;) {
+		p = strstr(p, needle);
+		if (!p) return NULL;
+		const char *q = p + strlen(needle);
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != ':') { p++; continue; }
+		q++;
+		while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+		if (*q != '[') { p++; continue; }
+		p = q;
+		break;
+	}
 	const char *start = p;
 	int depth = 0, in_str = 0, esc = 0;
 	while (*p) {
@@ -3016,12 +3935,60 @@ static char *hkExtractRawJsonArray(const char *src, const char *key) {
 /* OpenAI/Ollama function-calling tool loop. Preserves tool_calls on assistant
    message and emits tool_call_id on each tool reply — required by strict
    validators (Gemini OpenAI-compat returns 400 INVALID_ARGUMENT otherwise). */
-/* Parse <tool name="X">{...json...}</tool> blocks from ReAct response content,
-   execute each, push an <observation> back as a user message. Returns count of
-   tools executed (0 = no tool blocks found = model produced final answer). */
-static int hkReactToolExecAll(aiData *data, const char *content) {
+/* Per-response dedup: a model that echoes the SAME (name,args) twice in one
+   reply — or whose output matches two parse passes below — must not run the
+   tool twice. Returns 1 if this exact call already ran this response (skip it),
+   0 if it is new (and records it). OOM fails open (allows the call). Legitimate
+   cross-turn repeats (read the same file again later) are untouched — this is
+   scoped to a single response. */
+static int hkDupCall(char ***seen, int *n, int *cap, const char *name, const char *args) {
+	if (!name) return 0;
+	if (!args) args = "";
+	size_t need = strlen(name) + 1 + strlen(args) + 1;
+	char *sig = malloc(need);
+	if (!sig) return 0;
+	snprintf(sig, need, "%s\037%s", name, args);   /* US separator can't appear in a tool name */
+	for (int i = 0; i < *n; i++) if (!strcmp((*seen)[i], sig)) { free(sig); return 1; }
+	if (*n == *cap) {
+		int nc = *cap ? *cap * 2 : 8;
+		char **t = realloc(*seen, (size_t)nc * sizeof(char *));
+		if (!t) { free(sig); return 0; }
+		*seen = t; *cap = nc;
+	}
+	(*seen)[(*n)++] = sig;
+	return 0;
+}
+
+/* True when the model output carries any executable tool-call dialect the
+   prose path can run: <tool …>/<tool_call> (the "<tool" prefix covers both),
+   Claude's <invoke>, or the raw-content <write_file> block. The worker gates
+   exec on this — miss a dialect here and a real call is silently treated as a
+   final answer (which is exactly how the <write_file> channel first slipped). */
+static int hkHasToolBlock(const char *s) {
+	return s && (strstr(s, "<tool") || strstr(s, "<invoke name=") || strstr(s, "<write_file"));
+}
+
+/* corrective for a repeated call — push instead of re-running it; worker bails after one */
+static void hkPushDupNotice(aiData *data, const char *name) {
+	char msg[256];
+	snprintf(msg, sizeof(msg),
+		"<observation tool=\"%s\">(repeat) you already ran this exact call this turn — "
+		"its result is above. Do NOT repeat it. Use what you have or give your final answer."
+		"</observation>", name ? name : "");
+	pthread_mutex_lock(&data->lock);
+	aiPushMessage(data, "user", msg);
+	pthread_mutex_unlock(&data->lock);
+}
+
+/* Parse + execute every tool/write block in a ReAct response, pushing an
+   <observation> per call. Returns NEW execs (0 = final answer or pure repeat).
+   xseen = turn-scoped (name,args) dedup set (caller-owned). *dups = cross-turn
+   repeats squashed; *truncated = a block opened with no closing tag. */
+static int hkReactToolExecAll(aiData *data, const char *content,
+	char ***xseen, int *xseen_n, int *xseen_cap, int *dups, int *truncated) {
 	if (!data || !content) return 0;
 	int count = 0;
+	char **seen = *xseen; int seen_n = *xseen_n, seen_cap = *xseen_cap;
 	const char *cursor = content;
 	while ((cursor = strstr(cursor, "<tool")) != NULL) {
 		const char *name_attr = strstr(cursor, "name=\"");
@@ -3048,6 +4015,10 @@ static int hkReactToolExecAll(aiData *data, const char *content) {
 		if (!args) { cursor = close_tag + 7; continue; }
 		memcpy(args, body, blen); args[blen] = '\0';
 
+		if (hkDupCall(&seen, &seen_n, &seen_cap, tname, args)) {
+			hkPushDupNotice(data, tname); if (dups) (*dups)++;
+			free(args); cursor = close_tag + 7; continue;
+		}
 		hkAnnounceTool(data, tname, args);
 		char *result = hkExecTool(tname, args);
 		hkAnnounceToolResult(data, result);
@@ -3066,6 +4037,66 @@ static int hkReactToolExecAll(aiData *data, const char *content) {
 		free(args); free(result);
 		count++;
 		cursor = close_tag + 7;
+	}
+
+	/* Bare-tag dialect <tool>NAME</tool>{json} — name as tag text, args after the
+	   close tag. Match "<tool>" exactly so it can't collide with <tool_call>/<tool name=. */
+	cursor = content;
+	while ((cursor = strstr(cursor, "<tool>")) != NULL) {
+		const char *name_start = cursor + 6;
+		const char *name_end = strstr(name_start, "</tool>");
+		if (!name_end) break;
+		int rawlen = (int)(name_end - name_start);
+		if (rawlen <= 0 || rawlen > 64) { cursor = name_end + 7; continue; }
+		char tname[80];
+		memcpy(tname, name_start, rawlen); tname[rawlen] = '\0';
+		char *ts = tname;
+		while (*ts == ' ' || *ts == '\n' || *ts == '\r' || *ts == '\t') ts++;
+		char *te = ts + strlen(ts);
+		while (te > ts && (te[-1]==' '||te[-1]=='\n'||te[-1]=='\r'||te[-1]=='\t')) te--;
+		*te = '\0';
+
+		const char *p = name_end + 7;
+		while (*p && *p != '{' && *p != '<') p++;
+		if (*p != '{') { cursor = name_end + 7; continue; }
+		int depth = 0, instr = 0, esc = 0;
+		const char *jend = NULL;
+		for (const char *q = p; *q; q++) {
+			char c = *q;
+			if (esc) { esc = 0; continue; }
+			if (instr) { if (c == '\\') esc = 1; else if (c == '"') instr = 0; continue; }
+			if (c == '"') instr = 1;
+			else if (c == '{') depth++;
+			else if (c == '}') { if (--depth == 0) { jend = q + 1; break; } }
+		}
+		if (!jend) { cursor = name_end + 7; continue; }
+		int alen = (int)(jend - p);
+		char *args = malloc((size_t)alen + 1);
+		if (!args) { cursor = jend; continue; }
+		memcpy(args, p, alen); args[alen] = '\0';
+
+		if (!*ts) { free(args); cursor = jend; continue; }
+		if (hkDupCall(&seen, &seen_n, &seen_cap, ts, args)) {
+			hkPushDupNotice(data, ts); if (dups) (*dups)++;
+			free(args); cursor = jend; continue;
+		}
+		hkAnnounceTool(data, ts, args);
+		char *result = hkExecTool(ts, args);
+		hkAnnounceToolResult(data, result);
+		size_t rlen = result ? strlen(result) : 0;
+		size_t nl = strlen(ts);
+		char *obs = malloc(rlen + nl + 64);
+		if (obs) {
+			snprintf(obs, rlen + nl + 64, "<observation tool=\"%s\">%s</observation>",
+				ts, result ? result : "");
+			pthread_mutex_lock(&data->lock);
+			aiPushMessage(data, "user", obs);
+			pthread_mutex_unlock(&data->lock);
+			free(obs);
+		}
+		free(args); free(result);
+		count++;
+		cursor = jend;
 	}
 
 	/* Also parse Claude Code's native XML format that OAuth-trained Claude
@@ -3121,6 +4152,10 @@ static int hkReactToolExecAll(aiData *data, const char *content) {
 		if (jl < (int)sizeof(json) - 1) json[jl++] = '}';
 		json[jl] = '\0';
 
+		if (hkDupCall(&seen, &seen_n, &seen_cap, tname, json)) {
+			hkPushDupNotice(data, tname); if (dups) (*dups)++;
+			cursor = inv_close + 9; continue;
+		}
 		hkAnnounceTool(data, tname, json);
 		char *result = hkExecTool(tname, json);
 		hkAnnounceToolResult(data, result);
@@ -3138,6 +4173,140 @@ static int hkReactToolExecAll(aiData *data, const char *content) {
 		count++;
 		cursor = inv_close + 9;
 	}
+
+	/* Also parse the Qwen/Hermes-native format the local models emit (sho/koi
+	   are Qwen2.5 wraps, SFT'd on exactly this — see QWEN_TOOL_PROMPT):
+	     <tool_call>
+	     {"name": "write_file", "arguments": {"path": "...", "content": "..."}}
+	     </tool_call> */
+	cursor = content;
+	while ((cursor = strstr(cursor, "<tool_call>")) != NULL) {
+		const char *body = cursor + 11;
+		const char *close_tag = strstr(body, "</tool_call>");
+		if (!close_tag) { if (truncated) *truncated = 1; break; }
+		size_t blen2 = (size_t)(close_tag - body);
+		char *blk = malloc(blen2 + 1);
+		if (!blk) break;
+		memcpy(blk, body, blen2); blk[blen2] = '\0';
+		char *tname = hkExtractJsonString(blk, "name");
+		char *targs = hkExtractJsonObject(blk, "arguments");
+		if (tname && *tname && strlen(tname) <= 64) {
+			const char *aj = targs ? targs : "{}";
+			if (hkDupCall(&seen, &seen_n, &seen_cap, tname, aj)) {
+				hkPushDupNotice(data, tname); if (dups) (*dups)++;
+			} else {
+				hkAnnounceTool(data, tname, aj);
+				char *result = hkExecTool(tname, aj);
+				hkAnnounceToolResult(data, result);
+				size_t rl = result ? strlen(result) : 0;
+				size_t nl = strlen(tname);
+				char *obs3 = malloc(rl + nl + 64);
+				if (obs3) {
+					snprintf(obs3, rl + nl + 64, "<observation tool=\"%s\">%s</observation>",
+						tname, result ? result : "");
+					pthread_mutex_lock(&data->lock);
+					aiPushMessage(data, "user", obs3);
+					pthread_mutex_unlock(&data->lock);
+					free(obs3);
+				}
+				free(result);
+				count++;
+			}
+		}
+		free(tname); free(targs); free(blk);
+		cursor = close_tag + 12;
+	}
+
+	/* Raw-content write channel: <write_file path="X">…raw body…</write_file>.
+	   Lets local models write whole files WITHOUT JSON-escaping the body — the
+	   single biggest small-model write failure (a 7B can't emit a 200-line file
+	   as a flawless JSON string). The model emits the body verbatim; WE escape
+	   it correctly here in C and route through the normal write_file exec, so
+	   the trust gate + path validation are unchanged. Stops cleanly because the
+	   engine treats </write_file> as an end-of-turn token (same as </tool_call>). */
+	cursor = content;
+	while ((cursor = strstr(cursor, "<write_file")) != NULL) {
+		const char *open_end = strchr(cursor, '>');
+		if (!open_end) { if (truncated) *truncated = 1; break; }
+		const char *close_tag = strstr(open_end + 1, "</write_file>");
+		if (!close_tag) { if (truncated) *truncated = 1; break; }   /* cut off mid-stream */
+
+		/* Path — LIBERAL on purpose (Postel's law). Small models reach for
+		   path=, file=, filename= or name=, and often drop the attribute
+		   entirely and put the filename on the FIRST LINE of the body. The
+		   prompt asks for path= but we don't get to insist, so accept them all
+		   — observed live: sho emits `<write_file file="x">`, `<write_file>x\n…`,
+		   and the canonical `path=` interchangeably. */
+		char *path = NULL;
+		static const char *attrs[] = { "path=\"", "file=\"", "filename=\"", "name=\"" };
+		for (int k = 0; k < 4 && !path; k++) {
+			const char *pa = strstr(cursor, attrs[k]);
+			if (!pa || pa >= open_end) continue;
+			pa += strlen(attrs[k]);
+			const char *pe = strchr(pa, '"');
+			if (!pe || pe > open_end) continue;
+			int pl = (int)(pe - pa);
+			if (pl > 0 && pl <= 1024) { path = malloc((size_t)pl + 1); if (path) { memcpy(path, pa, pl); path[pl] = '\0'; } }
+		}
+
+		const char *body = open_end + 1;
+		/* a single leading newline after the tag is formatting, not file content */
+		if (body + 1 < close_tag && body[0] == '\r' && body[1] == '\n') body += 2;
+		else if (body < close_tag && *body == '\n') body++;
+
+		if (!path) {	/* no attribute → first body line is the filename */
+			const char *nl = memchr(body, '\n', (size_t)(close_tag - body));
+			const char *e = nl ? nl : close_tag;
+			while (e > body && (e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) e--;
+			const char *s = body;
+			while (s < e && (*s == ' ' || *s == '\t')) s++;
+			int pl = (int)(e - s);
+			if (pl > 0 && pl <= 1024) {
+				path = malloc((size_t)pl + 1);
+				if (path) { memcpy(path, s, pl); path[pl] = '\0'; body = nl ? nl + 1 : close_tag; }
+			}
+		}
+		if (!path) { cursor = close_tag + 13; continue; }
+
+		int plen = (int)strlen(path);
+		int blen = (int)(close_tag - body);
+		if (blen < 0) blen = 0;
+
+		size_t jcap = (size_t)plen * 6 + (size_t)blen * 6 + 64;
+		char *raw  = malloc((size_t)blen + 1);
+		char *json = malloc(jcap);
+		char *ep   = malloc((size_t)plen * 6 + 8);
+		char *ec   = malloc((size_t)blen * 6 + 8);
+		if (raw && json && ep && ec) {
+			memcpy(raw, body, blen); raw[blen] = '\0';
+			hkJsonEscapeInto(path, ep, plen * 6 + 8);
+			hkJsonEscapeInto(raw,  ec, blen * 6 + 8);
+			snprintf(json, jcap, "{\"path\":\"%s\",\"content\":\"%s\"}", ep, ec);
+			if (hkDupCall(&seen, &seen_n, &seen_cap, "write_file", json)) {
+				hkPushDupNotice(data, "write_file"); if (dups) (*dups)++;
+			} else {
+				hkAnnounceTool(data, "write_file", json);
+				char *result = hkExecTool("write_file", json);
+				hkAnnounceToolResult(data, result);
+				size_t rl = result ? strlen(result) : 0;
+				char *obs = malloc(rl + 80);
+				if (obs) {
+					snprintf(obs, rl + 80, "<observation tool=\"write_file\">%s</observation>",
+						result ? result : "");
+					pthread_mutex_lock(&data->lock);
+					aiPushMessage(data, "user", obs);
+					pthread_mutex_unlock(&data->lock);
+					free(obs);
+				}
+				free(result);
+				count++;
+			}
+		}
+		free(path); free(raw); free(json); free(ep); free(ec);
+		cursor = close_tag + 13;
+	}
+
+	*xseen = seen; *xseen_n = seen_n; *xseen_cap = seen_cap;
 	return count;
 }
 
@@ -3230,11 +4399,13 @@ static void *clAnimThread(void *arg) {
 	aiData *data = (aiData *)arg;
 	const clAnim *a = &CL_ANIMS[data->anim_style % CL_ANIM_COUNT];
 	const char *label = CL_LABELS[data->anim_label % CL_LABEL_COUNT];
+	/* auto-rotated style → theme accent (consistent, tracks :theme); rc-pinned → its own color */
+	const char *col = (E.anim_force_style >= 0) ? *a->color : TH_ACCENT;
 	int i = 0;
 	while (data->animating) {
 		const char *fr = a->frames[i % a->frame_count];
 		if (E.color_enabled) {
-			printf(ANSI_CLR_LINE "%s%s %s...%s", *a->color, fr, label, ANSI_RESET);
+			printf(ANSI_CLR_LINE "%s%s %s...%s", col, fr, label, ANSI_RESET);
 		} else {
 			printf("\r%s %s...   ", fr, label);
 		}
@@ -3438,12 +4609,245 @@ static char *hkFindHakm(void) {
 	return NULL;
 }
 
-/* Run one completion over data->messages by spawning `hakm` once. Returns
+#ifndef _WIN32
+/* ── persistent hakm child ──────────────────────────────────────────────────
+   The engine runs resident in `--serve` mode: one long-lived child per agent
+   process, conversation re-sent whole each turn, engine prefix-matches it
+   against its KV cache and prefills only the new tail. Kills the old
+   per-turn popen cost (model re-mmap + full system-prompt re-prefill, minutes
+   on CPU). Still a subprocess — no engine link, build can't silently lose
+   local-model support. Child exits on its own when our socketpair closes. */
+static pid_t g_hakm_pid = -1;
+static FILE *g_hakm_w = NULL;        /* frame writes → child stdin */
+static FILE *g_hakm_r = NULL;        /* reply reads ← child stdout */
+static char *g_hakm_weights = NULL;  /* weight path the child was spawned on */
+
+static void hkHakmKill(void) {
+	if (g_hakm_w) { fclose(g_hakm_w); g_hakm_w = NULL; }
+	if (g_hakm_r) { fclose(g_hakm_r); g_hakm_r = NULL; }
+	if (g_hakm_pid > 0) {
+		kill(g_hakm_pid, SIGTERM);
+		waitpid(g_hakm_pid, NULL, 0);
+		g_hakm_pid = -1;
+	}
+	free(g_hakm_weights); g_hakm_weights = NULL;
+}
+
+/* Ensure a resident child is up on THIS weight file. Respawns after a model
+   switch or a dead child. Returns 0 ok, -1 spawn failure. */
+static int hkHakmEnsure(const char *hakm, const char *weights) {
+	if (g_hakm_w && g_hakm_weights && strcmp(g_hakm_weights, weights) == 0) {
+		if (waitpid(g_hakm_pid, NULL, WNOHANG) == 0) return 0;	/* alive */
+		hkHakmKill();	/* exited behind our back */
+	} else if (g_hakm_w) {
+		hkHakmKill();	/* model switched — drop the old engine */
+	}
+	int sv[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
+	pid_t pid = fork();
+	if (pid < 0) { close(sv[0]); close(sv[1]); return -1; }
+	if (pid == 0) {
+		dup2(sv[1], STDIN_FILENO);
+		dup2(sv[1], STDOUT_FILENO);
+		close(sv[0]); close(sv[1]);
+		if (!E.debug) {	/* serve stats stay visible under --debug */
+			int dn = open("/dev/null", O_WRONLY);
+			if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+		}
+		/* GQA KV is small (~600MB f32 @ 8192 on the 3B); HAKO_CTX overrides */
+		const char *ctx = getenv("HAKO_CTX");
+		if (!ctx || atoi(ctx) <= 0) ctx = "8192";
+		execlp(hakm, hakm, weights, "--serve", "--ctx", ctx, (char *)NULL);
+		_exit(127);
+	}
+	close(sv[1]);
+	g_hakm_pid = pid;
+	g_hakm_w = fdopen(sv[0], "w");
+	g_hakm_r = fdopen(dup(sv[0]), "r");
+	if (!g_hakm_w || !g_hakm_r) { hkHakmKill(); return -1; }
+	g_hakm_weights = strdup(weights);
+	return 0;
+}
+
+/* One request/response over the resident child. Returns malloc'd reply, or
+   NULL: transport death (caller may respawn+retry) when *eng stays NULL, or
+   an engine-reported error (alive, don't retry) delivered in *eng. */
+static char *hkHakmRoundtrip(const char *frame, size_t flen, char **eng) {
+	if (fwrite(frame, 1, flen, g_hakm_w) != flen) return NULL;
+	if (fflush(g_hakm_w) != 0) return NULL;
+	char hdr[64];
+	if (!fgets(hdr, sizeof(hdr), g_hakm_r)) return NULL;
+	char kind = hdr[0];
+	long len = atol(hdr + 1);
+	if ((kind != 'R' && kind != 'E') || len < 0 || len > (1l << 20)) return NULL;
+	char *out = malloc((size_t)len + 1);
+	if (!out) return NULL;
+	size_t got = len ? fread(out, 1, (size_t)len, g_hakm_r) : 0;
+	out[got] = '\0';
+	if (got != (size_t)len) { free(out); return NULL; }
+	if (kind == 'E') {
+		if (eng) {
+			size_t n = got + 32;
+			char *m = malloc(n);
+			if (m) snprintf(m, n, "Error: hakm: %s", out);
+			*eng = m;
+		}
+		free(out);
+		return NULL;
+	}
+	return out;
+}
+#endif /* !_WIN32 */
+
+/* Render data->messages (+ optional system head) into a hakm frame:
+   "N n_new\n" then per message role\n len\n <bytes>. Skips raw messages
+   (engine takes plain text). The "N n_new" header reads fine on both wires:
+   --serve uses the token cap, --chat-stdin's atoi stops at the space.
+   Returns malloc'd buffer + length in *flen, NULL when nothing to send. */
+static char *hkMithraeumFrame(aiData *data, const char *sys, int ntok, size_t *flen) {
+	int n = sys ? 1 : 0;
+	size_t need = 64 + (sys ? strlen(sys) + 40 : 0);
+	for (int i = 0; i < data->message_count; i++) {
+		aiMessage *m = &data->messages[i];
+		if (m->raw) continue;
+		n++;
+		need += strlen(m->role ? m->role : "user")
+		      + (m->content ? strlen(m->content) : 0) + 32;
+	}
+	if (n == 0 || (n == 1 && sys)) return NULL;
+	char *fb = malloc(need);
+	if (!fb) return NULL;
+	/* 3rd header field = per-request temperature in millis (temp*1000). Tool
+	   turns go GREEDY (0): the same conversation must produce the same tool
+	   call, never a malformed one on a re-roll. Plain chat keeps ai_temperature.
+	   The engine treats a missing field as "keep CLI default", so always emit it. */
+	int mt = E.ai_tools_enabled ? 0 : (E.ai_temperature > 0 ? E.ai_temperature * 10 : 0);
+	size_t fl = (size_t)snprintf(fb, need, "%d %d %d\n", n, ntok, mt);
+	if (sys) {
+		size_t sl = strlen(sys);
+		fl += (size_t)snprintf(fb + fl, need - fl, "system\n%zu\n", sl);
+		memcpy(fb + fl, sys, sl);
+		fl += sl;
+	}
+	for (int i = 0; i < data->message_count; i++) {
+		aiMessage *m = &data->messages[i];
+		if (m->raw) continue;
+		const char *role = m->role ? m->role : "user";
+		const char *content = m->content ? m->content : "";
+		size_t cl = strlen(content);
+		fl += (size_t)snprintf(fb + fl, need - fl, "%s\n%zu\n", role, cl);
+		memcpy(fb + fl, content, cl);
+		fl += cl;
+	}
+	*flen = fl;
+	return fb;
+}
+
+/* Copy src dropping ```fenced``` blocks OUTSIDE any <write_file> span — the write
+   is the artifact, the fenced copy is redundant context. Caller frees. */
+static char *hkStripCodeFences(const char *src) {
+	size_t len = strlen(src);
+	char *out = malloc(len + 1);
+	if (!out) return NULL;
+	size_t o = 0;
+	const char *p = src;
+	int in_write = 0;
+	while (*p) {
+		if (!in_write && !strncmp(p, "<write_file", 11)) in_write = 1;
+		else if (in_write && !strncmp(p, "</write_file>", 13)) {
+			memcpy(out + o, p, 13); o += 13; p += 13; in_write = 0; continue;
+		}
+		if (!in_write && p[0] == '`' && p[1] == '`' && p[2] == '`') {
+			const char *e = strstr(p + 3, "```");
+			if (e) { p = e + 3; if (*p == '\n') p++; continue; }
+		}
+		out[o++] = *p++;
+	}
+	out[o] = '\0';
+	return out;
+}
+
+/* Body of the LARGEST ```fenced``` block (not the last — a trailing run-command
+   fence must not win over the real file), language tag stripped. Caller frees. */
+static char *hkExtractBestFence(const char *src) {
+	const char *best_body = NULL; size_t best_len = 0;
+	const char *p = src;
+	while ((p = strstr(p, "```")) != NULL) {
+		const char *c = strstr(p + 3, "```");
+		if (!c) break;
+		const char *body = p + 3;
+		const char *nl = memchr(body, '\n', (size_t)(c - body));
+		if (nl) body = nl + 1;
+		size_t len = (size_t)(c - body);
+		while (len && (body[len-1] == '\n' || body[len-1] == '\r')) len--;
+		if (len > best_len) { best_len = len; best_body = body; }
+		p = c + 3;
+	}
+	if (!best_body || best_len == 0) return NULL;
+	char *out = malloc(best_len + 1);
+	if (!out) return NULL;
+	memcpy(out, best_body, best_len); out[best_len] = '\0';
+	return out;
+}
+
+/* Copy src minus <tool_call>…</tool_call> and <tool …>…</tool> spans. Display
+   only — the ✎ announce chip already shows the call; raw tool JSON through the
+   markdown renderer is noise (underscores italicize: write_file → "writefile").
+   Caller frees. */
+static char *hkStripToolBlocks(const char *src) {
+	size_t len = strlen(src);
+	char *out = malloc(len + 1);
+	if (!out) return NULL;
+	size_t o = 0;
+	const char *p = src;
+	while (*p) {
+		if (strncmp(p, "<tool_call>", 11) == 0) {
+			const char *e = strstr(p + 11, "</tool_call>");
+			if (e) { p = e + 12; continue; }
+		}
+		if (strncmp(p, "<tool ", 6) == 0) {
+			const char *e = strstr(p + 6, "</tool>");
+			if (e) { p = e + 7; continue; }
+		}
+		if (strncmp(p, "<write_file", 11) == 0) {
+			const char *e = strstr(p + 11, "</write_file>");
+			if (e) { p = e + 13; continue; }
+		}
+		out[o++] = *p++;
+	}
+	while (o && (out[o-1] == '\n' || out[o-1] == '\r' || out[o-1] == ' ' || out[o-1] == '\t')) o--;
+	out[o] = '\0';
+	return out;
+}
+
+#ifndef _WIN32
+/* Context-overflow recovery: drop the OLDEST half of the live conversation
+   (the engine already reset its KV cache when it sent the E-frame). The
+   session JSONL keeps the full log — only the model's context shrinks.
+   Never drops the newest message. Returns messages dropped. */
+static int hkMithraeumTrimOldest(aiData *data) {
+	pthread_mutex_lock(&data->lock);
+	int n = data->message_count;
+	int drop = n / 2;
+	if (drop >= n) drop = n - 1;
+	if (drop < 1) { pthread_mutex_unlock(&data->lock); return 0; }
+	for (int i = 0; i < drop; i++) {
+		free(data->messages[i].role);
+		free(data->messages[i].content);
+	}
+	memmove(data->messages, data->messages + drop,
+	        (size_t)(n - drop) * sizeof(aiMessage));
+	data->message_count = n - drop;
+	pthread_mutex_unlock(&data->lock);
+	return drop;
+}
+#endif /* !_WIN32 */
+
+/* Run one completion over data->messages via the resident `hakm --serve`
+   child (POSIX; Windows falls back to one-shot `--chat-stdin` popen). Returns
    malloc'd reply (caller frees) or NULL with *err set (malloc'd). The whole
-   conversation is written to a temp frame (binary-safe, length-prefixed) and
-   piped to `hakm --chat-stdin`; the reply is read off stdout. No persistent
-   session — the model reloads per turn (~1-2s warm), traded for a build with
-   no engine link and thus no way to silently lose local-model support. */
+   conversation goes over as a binary-safe length-prefixed frame; the engine
+   keeps the KV cache warm between turns so only the new tail prefills. */
 static char *hkMithraeumChat(aiData *data, char **err) {
 	const char *model = E.ai_model ? E.ai_model : "hako-sho";
 	char *path = hkMithraeumModelPath(model);
@@ -3507,34 +4911,90 @@ static char *hkMithraeumChat(aiData *data, char **err) {
 		return NULL;
 	}
 
-	/* Write the conversation to a temp frame: N\n then per message
-	   role\n len\n <bytes>. Skips raw messages (engine takes plain text). */
-	char frame[256];
-	snprintf(frame, sizeof(frame), "/tmp/hako-frame-%d.txt", (int)getpid());
-	FILE *ff = fopen(frame, "wb");
-	if (!ff) { if (err) *err = strdup("Error: cannot write temp frame"); free(hakm); free(path); return NULL; }
+	/* The system prompt (tool schema, rules, skills, HAKO.md) is spliced into
+	   the request by aiBuildCurlCommand for every curl provider — MITHRAEUM
+	   intercepts before curl, so it must carry it here itself or the local
+	   model never learns its tools exist. One-time prefill cost: the resident
+	   engine's KV cache holds it after the first turn. */
+	const char *sys = (data->system_prompt && *data->system_prompt) ? data->system_prompt : NULL;
+	int ntok = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
+	if (E.ai_tools_enabled && ntok < 2048) ntok = 2048;   /* writes need room: a whole file must fit before </write_file> (the stop means surplus is never wasted) */
 
-	int n = 0;
-	for (int i = 0; i < data->message_count; i++)
-		if (!data->messages[i].raw) n++;
-	if (n == 0) {
-		fclose(ff); unlink(frame); free(hakm); free(path);
+#ifndef _WIN32
+	size_t fl = 0;
+	char *fb = hkMithraeumFrame(data, sys, ntok, &fl);
+	if (!fb) {
+		free(hakm); free(path);
 		if (err) *err = strdup("Error: nothing to send");
 		return NULL;
 	}
 
-	fprintf(ff, "%d\n", n);
-	for (int i = 0; i < data->message_count; i++) {
-		aiMessage *m = &data->messages[i];
-		if (m->raw) continue;
-		const char *role = m->role ? m->role : "user";
-		const char *content = m->content ? m->content : "";
-		fprintf(ff, "%s\n%zu\n", role, strlen(content));
-		fwrite(content, 1, strlen(content), ff);
+	/* Resident child: reuse if alive on the same weights, else (re)spawn. One
+	   respawn+resend if the transport died mid-flight. Engine E-frames are
+	   fatal except context overflow, which is recoverable: drop the oldest
+	   half of the conversation and resend once. */
+	char *out = NULL;
+	int trimmed = 0;
+	for (int attempt = 0; attempt < 2 && !out; attempt++) {
+		if (hkHakmEnsure(hakm, path) != 0) break;
+		char *eng = NULL;
+		out = hkHakmRoundtrip(fb, fl, &eng);
+		if (eng) {
+			if (!trimmed && strstr(eng, "context window")) {
+				free(eng);
+				int dropped = hkMithraeumTrimOldest(data);
+				char *fb2 = NULL;
+				if (dropped > 0) fb2 = hkMithraeumFrame(data, sys, ntok, &fl);
+				if (fb2) {
+					free(fb);
+					fb = fb2;
+					pthread_mutex_lock(&data->lock);
+					char note[96];
+					snprintf(note, sizeof(note),
+						"(context full — dropped %d oldest message(s), retrying)", dropped);
+					aiAddHistory(data, note);
+					pthread_mutex_unlock(&data->lock);
+					trimmed = 1;
+					attempt = -1;	/* fresh attempt budget for the smaller frame */
+					continue;
+				}
+				free(fb); free(hakm); free(path);
+				if (err) *err = strdup("Error: conversation exceeds context window (could not trim further) — :session new");
+				return NULL;
+			}
+			free(fb); free(hakm); free(path);
+			if (err) *err = eng; else free(eng);
+			return NULL;
+		}
+		if (!out) hkHakmKill();
 	}
-	fclose(ff);
+	free(fb); free(hakm); free(path);
+	if (!out) {
+		if (err) *err = strdup(
+			"Error: hakm engine unavailable (spawn or transport failed).\n"
+			"  rebuild it: cd hako && make && cp hakm ~/.hako/bin/   (or from hako-code: make hakm)");
+		return NULL;
+	}
+	size_t total = strlen(out);
+	while (total && (out[total-1] == '\n' || out[total-1] == '\r')) out[--total] = '\0';
+	return out;
 
-	int ntok = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
+#else	/* _WIN32: no fork/socketpair — one-shot `--chat-stdin` via popen. */
+	size_t wfl = 0;
+	char *wfb = hkMithraeumFrame(data, sys, ntok, &wfl);
+	if (!wfb) {
+		free(hakm); free(path);
+		if (err) *err = strdup("Error: nothing to send");
+		return NULL;
+	}
+	char frame[256];
+	snprintf(frame, sizeof(frame), "/tmp/hako-frame-%d.txt", (int)getpid());
+	FILE *ff = fopen(frame, "wb");
+	if (!ff) { free(wfb); if (err) *err = strdup("Error: cannot write temp frame"); free(hakm); free(path); return NULL; }
+	fwrite(wfb, 1, wfl, ff);
+	fclose(ff);
+	free(wfb);
+
 	char cmd[2048];
 	snprintf(cmd, sizeof(cmd),
 		"'%s' '%s' --chat-stdin -n %d < '%s' 2>/dev/null",
@@ -3573,6 +5033,56 @@ static char *hkMithraeumChat(aiData *data, char **err) {
 	/* hakm prints one trailing newline after the reply — trim it. */
 	while (total && (out[total-1] == '\n' || out[total-1] == '\r')) out[--total] = '\0';
 	return out;
+#endif
+}
+
+/* True when the reply shows a ```code``` fence but called no tool AND the user's
+   turn implies they want a file created or fixed. Fires on create-verbs OR
+   error/fix signals (a debug turn carries no create-verb); pure-explanation Q&A
+   won't trip it. */
+static int hkShouldNudgeWrite(const char *content, const char *ask) {
+	if (!content || !ask) return 0;
+	if (hkHasToolBlock(content)) return 0;
+	if (!strstr(content, "```")) return 0;
+	char low[1024]; size_t n = 0;
+	for (const char *p = ask; *p && n < sizeof(low) - 1; p++) {
+		char c = *p;
+		low[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+	}
+	low[n] = '\0';
+	if (strstr(low, "error") || strstr(low, "traceback") || strstr(low, "exception")
+	    || strstr(low, "fix") || strstr(low, " broke") || strstr(low, "doesn't")
+	    || strstr(low, "does not") || strstr(low, "not work") || strstr(low, "fail")
+	    || strstr(low, "wrong") || strstr(low, "edit") || strstr(low, "update")
+	    || strstr(low, "change")) return 1;
+	return strstr(low, "creat") || strstr(low, "write") || strstr(low, "save")
+	    || strstr(low, "generat") || strstr(low, "make ") || strstr(low, "build ")
+	    || strstr(low, "add ");
+}
+
+/* True when the reply CLAIMS a write but showed no fence and called no tool (the
+   no-fence lie; the fence case is hkShouldNudgeWrite's). Caller also gates on "no
+   tool ran this turn" so a real post-write summary is exempt. */
+static int hkClaimedWriteNoAct(const char *content, const char *ask) {
+	if (!content || !ask) return 0;
+	if (hkHasToolBlock(content)) return 0;
+	if (strstr(content, "```")) return 0;
+	int claims = strstr(content, "has been") || strstr(content, "reated")
+	          || strstr(content, "pdated")   || strstr(content, "ritten")
+	          || strstr(content, "wrote ")   || strstr(content, "aved to")
+	          || strstr(content, "as saved");
+	if (!claims) return 0;
+	char low[1024]; size_t n = 0;
+	for (const char *p = ask; *p && n < sizeof(low) - 1; p++) {
+		char c = *p; low[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+	}
+	low[n] = '\0';
+	return strstr(low, "creat") || strstr(low, "writ") || strstr(low, "save")
+	    || strstr(low, "generat") || strstr(low, "make ") || strstr(low, "build ")
+	    || strstr(low, "add ") || strstr(low, "error") || strstr(low, "traceback")
+	    || strstr(low, "exception") || strstr(low, "fix") || strstr(low, "edit")
+	    || strstr(low, "update") || strstr(low, "change") || strstr(low, "doesn't")
+	    || strstr(low, "not work") || strstr(low, "fail") || strstr(low, "wrong");
 }
 
 static void *aiWorkerThread(void *arg) {
@@ -3589,6 +5099,9 @@ static void *aiWorkerThread(void *arg) {
 	int max_iters = 6;
 	int iter = 0;
 	int used_tool = 0;
+	int repaired = 0;	/* one write-repair nudge per turn */
+	char **xseen = NULL; int xseen_n = 0, xseen_cap = 0;	/* turn-scoped (name,args) dedup */
+	int loop_warned = 0;
 
 	while (iter++ < max_iters) {
 		data->turn_index++;
@@ -3614,7 +5127,11 @@ static void *aiWorkerThread(void *arg) {
 
 			pthread_mutex_lock(&data->lock);
 			if (*content) {
-				aiAddHistoryRole(data, content, HK_ROLE_AI);
+				/* show only the prose around tool blocks — the announce chip
+				   renders the call itself */
+				char *disp = hkStripToolBlocks(content);
+				if (disp && *disp) aiAddHistoryRole(data, disp, HK_ROLE_AI);
+				free(disp);
 				hkLogMessage("assistant", content);
 				free(data->current_response);
 				data->current_response = strdup(content);
@@ -3623,13 +5140,49 @@ static void *aiWorkerThread(void *arg) {
 
 			/* MITHRAEUM always uses prose-XML tools (small local models can't
 			   emit reliable JSON tool_calls). Scan + execute, else final. */
-			if (*content && (strstr(content, "<tool") || strstr(content, "<invoke name="))) {
+			if (*content && hkHasToolBlock(content)) {
+				/* store the response minus the redundant fence; exec runs on raw content */
+				char *hist = hkStripCodeFences(content);
 				pthread_mutex_lock(&data->lock);
-				aiPushMessage(data, "assistant", content);
+				aiPushMessage(data, "assistant", hist ? hist : content);
 				pthread_mutex_unlock(&data->lock);
-				int nt = hkReactToolExecAll(data, content);
+				free(hist);
+				int dups = 0, truncated = 0;
+				int nt = hkReactToolExecAll(data, content, &xseen, &xseen_n, &xseen_cap, &dups, &truncated);
 				free(content);
-				if (nt == 0) break;      /* no parsable tool block — final answer */
+				if (nt == 0) {
+					/* opened a write/tool block but never closed it — cut off mid-call */
+					if (truncated && !repaired) {
+						repaired = 1;
+						pthread_mutex_lock(&data->lock);
+						aiPushMessage(data, "user",
+							"Your <write_file> block was cut off before </write_file> — it ran past the "
+							"length limit. Reply with ONLY the write_file block (no explanation, no ``` "
+							"fence before it), keep the body complete, and close it with </write_file>.");
+						pthread_mutex_unlock(&data->lock);
+						continue;
+					}
+					if (dups > 0) {
+						/* every call was a cross-turn repeat — warn once, then bail */
+						if (!loop_warned) { loop_warned = 1; continue; }
+						break;
+					}
+					/* #5b malformed-call repair: the reply HAD tool markup
+					   (hkHasToolBlock) but nothing parsed — broken JSON / a half
+					   <write_file>. Nudge once to re-emit cleanly, then retry.
+					   Same one-repair-per-turn budget as the write nudge. */
+					if (!repaired) {
+						repaired = 1;
+						pthread_mutex_lock(&data->lock);
+						aiPushMessage(data, "user",
+							"Your tool call did not parse. Re-emit exactly ONE valid call and nothing else: "
+							"<tool_call>{\"name\": \"...\", \"arguments\": {...}}</tool_call> with strict JSON, "
+							"or to write a file <write_file path=\"...\">raw body</write_file>.");
+						pthread_mutex_unlock(&data->lock);
+						continue;
+					}
+					break;      /* already repaired — treat as final answer */
+				}
 				used_tool = 1;
 				continue;
 			}
@@ -3638,6 +5191,69 @@ static void *aiWorkerThread(void *arg) {
 			if (*content) aiPushMessage(data, "assistant", content);
 			else aiAddHistory(data, "Error: empty response from hako engine");
 			pthread_mutex_unlock(&data->lock);
+
+			/* Showed a fence, called no tool. If a target file is known, lift the
+			   fenced code and write it (approval still prompts) — more reliable than
+			   nudging a 3B to re-emit. Else fall back to a text nudge. */
+			if (!repaired && !used_tool && *content
+			    && hkShouldNudgeWrite(content, data->current_prompt)) {
+				repaired = 1;
+				char *fence = hk_last_write_path[0] ? hkExtractBestFence(content) : NULL;
+				/* only a file-shaped fence (multi-line, sized) — not a one-line run command */
+				if (fence) {
+					int lines = 1; for (const char *q = fence; *q; q++) if (*q == '\n') lines++;
+					if (lines < 3 || strlen(fence) < 80) { free(fence); fence = NULL; }
+				}
+				if (fence) {
+					size_t pn = strlen(hk_last_write_path), fn = strlen(fence);
+					char *ep = malloc(pn * 6 + 8), *ec = malloc(fn * 6 + 8);
+					char *json = malloc(pn * 6 + fn * 6 + 32);
+					if (ep && ec && json) {
+						hkJsonEscapeInto(hk_last_write_path, ep, (int)pn * 6 + 8);
+						hkJsonEscapeInto(fence, ec, (int)fn * 6 + 8);
+						snprintf(json, pn * 6 + fn * 6 + 32, "{\"path\":\"%s\",\"content\":\"%s\"}", ep, ec);
+						hkAnnounceTool(data, "write_file", json);
+						char *result = hkExecTool("write_file", json);
+						hkAnnounceToolResult(data, result);
+						size_t rl = result ? strlen(result) : 0;
+						char *obs = malloc(rl + 80);
+						if (obs) {
+							snprintf(obs, rl + 80, "<observation tool=\"write_file\">%s</observation>", result ? result : "");
+							pthread_mutex_lock(&data->lock);
+							aiPushMessage(data, "user", obs);
+							pthread_mutex_unlock(&data->lock);
+							free(obs);
+						}
+						free(result);
+						used_tool = 1;
+					}
+					free(ep); free(ec); free(json); free(fence);
+					free(content);
+					continue;
+				}
+				pthread_mutex_lock(&data->lock);
+				aiPushMessage(data, "user",
+					"You showed the code in a markdown block but did NOT create the file. "
+					"Emit it now as a single <write_file path=\"FILENAME\"> block holding the "
+					"complete file body (real newlines, no escaping, no ``` fences) and nothing else.");
+				pthread_mutex_unlock(&data->lock);
+				free(content);
+				continue;
+			}
+
+			/* claimed a write with no fence/tool and nothing written — call it out */
+			if (!repaired && !used_tool && *content
+			    && hkClaimedWriteNoAct(content, data->current_prompt)) {
+				repaired = 1;
+				pthread_mutex_lock(&data->lock);
+				aiPushMessage(data, "user",
+					"You said the file was written/updated, but you did NOT call write_file — "
+					"nothing was saved to disk. Emit the file now as a single "
+					"<write_file path=\"FILENAME\">complete file body</write_file> block and nothing else.");
+				pthread_mutex_unlock(&data->lock);
+				free(content);
+				continue;
+			}
 			free(content);
 			break;
 		}
@@ -3832,8 +5448,9 @@ static void *aiWorkerThread(void *arg) {
 				int prose_active = (E.ai_toolmode == 1)
 					|| (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))
 					|| (E.ai_provider_type == AI_PROVIDER_MITHRAEUM);
-				if (prose_active && (strstr(acc, "<tool") || strstr(acc, "<invoke name="))) {
-					int n = hkReactToolExecAll(data, acc);
+				if (prose_active && hkHasToolBlock(acc)) {
+					int dups = 0;
+					int n = hkReactToolExecAll(data, acc, &xseen, &xseen_n, &xseen_cap, &dups, NULL);
 					if (n > 0) {
 						free(full_response);
 						used_tool = 1;
@@ -3843,7 +5460,16 @@ static void *aiWorkerThread(void *arg) {
 			} else {
 				free(acc);
 				pthread_mutex_lock(&data->lock);
-				aiAddHistory(data, "Error: Empty stream");
+				/* Surface the raw body — a 401/expired-token error arrives as a
+				   non-SSE JSON error and otherwise looks like a genuinely empty
+				   stream. Showing it tells auth failures apart from real emptiness. */
+				if (full_response && *full_response) {
+					char err[256];
+					snprintf(err, sizeof(err), "Error: empty stream (first 180b: %.180s)", full_response);
+					aiAddHistory(data, err);
+				} else {
+					aiAddHistory(data, "Error: empty stream (no data — check network or re-:login)");
+				}
 				pthread_mutex_unlock(&data->lock);
 			}
 
@@ -3922,14 +5548,15 @@ static void *aiWorkerThread(void *arg) {
 		int prose_active = (E.ai_toolmode == 1)
 			|| (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))
 			|| (E.ai_provider_type == AI_PROVIDER_MITHRAEUM);
-		if (content && prose_active && (strstr(content, "<tool") || strstr(content, "<invoke name="))) {
+		if (content && prose_active && hkHasToolBlock(content)) {
 			pthread_mutex_lock(&data->lock);
 			aiPushMessage(data, "assistant", content);
 			pthread_mutex_unlock(&data->lock);
-			int n = hkReactToolExecAll(data, content);
+			int dups = 0;
+			int n = hkReactToolExecAll(data, content, &xseen, &xseen_n, &xseen_cap, &dups, NULL);
 			free(content);
 			free(full_response);
-			if (n == 0) break;  /* no parsable tool blocks — treat as final answer */
+			if (n == 0) break;  /* no parsable tool blocks / pure repeat — treat as final answer */
 			used_tool = 1;
 			continue;
 		}
@@ -3962,6 +5589,9 @@ static void *aiWorkerThread(void *arg) {
 		free(full_response);
 		break;
 	}
+
+	for (int i = 0; i < xseen_n; i++) free(xseen[i]);
+	free(xseen);
 
 	pthread_mutex_lock(&data->lock);
 	if (iter >= max_iters && used_tool) aiAddHistory(data, "(tool loop cap reached)");
@@ -4008,6 +5638,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		aiAddHistory(data, ":history [local|global]  :skills [reload]");
 		aiAddHistory(data, ":skill install <url>  :skill uninstall <name>");
 		aiAddHistory(data, ":tools on|off  :toolgate on|off  :toolmode native|prose  :trust [revoke]");
+		aiAddHistory(data, ":auto on|off  (skip per-tool permission prompts)  :mcp [reload]");
 		aiAddHistory(data, ":sessions  :resume <id>  :session [new]");
 		aiAddHistory(data, "(`/` still works as alias for muscle memory)");
 		return 1;
@@ -4036,6 +5667,29 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		aiDropMessagesFrom(data, u + 1);
 		hkDropTrailingHistory(data, HK_ROLE_AI);
 		aiAddHistory(data, "(undone — last AI turn dropped)");
+		return 1;
+	}
+	if (strncmp(cmd, "auto", cmdlen) == 0 && cmdlen == 4) {
+		if (arg && strcmp(arg, "on") == 0)       E.ai_auto_approve = 1;
+		else if (arg && strcmp(arg, "off") == 0) E.ai_auto_approve = 0;
+		else {
+			aiAddHistory(data, E.ai_auto_approve
+				? "auto-approve: ON — tools run without prompting. :auto off to re-enable prompts."
+				: "auto-approve: OFF — prompt per tool call. :auto on to skip prompts.");
+			return 1;
+		}
+		hkSaveSession();
+		aiAddHistory(data, E.ai_auto_approve
+			? "auto-approve ON (persisted) — tools run without prompting."
+			: "auto-approve OFF (persisted) — will prompt per tool call.");
+		return 1;
+	}
+	if (strncmp(cmd, "mcp", cmdlen) == 0 && cmdlen == 3) {
+		if (arg && strcmp(arg, "reload") == 0) {
+			hkMcpShutdown(); hkMcpInit();
+			aiAddHistory(data, "MCP reloaded from ~/.hako/mcp.json.");
+		}
+		hkMcpList(data);
 		return 1;
 	}
 	if (strncmp(cmd, "login", cmdlen) == 0 && cmdlen == 5) {
@@ -4451,6 +6105,11 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				/* Wire-format change → flatten tool-bearing messages so the new
 				   provider sees a clean role/content history it can parse. */
 				if (prev != E.ai_provider_type) {
+#ifndef _WIN32
+					/* Leaving local models — release the resident engine (weights
+					   mmap + KV cache RAM). Respawns lazily on the way back. */
+					if (prev == AI_PROVIDER_MITHRAEUM) hkHakmKill();
+#endif
 					pthread_mutex_lock(&data->lock);
 					int before = data->message_count;
 					aiFlattenMessages(data);
@@ -4460,6 +6119,20 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 						char fmsg[128];
 						snprintf(fmsg, sizeof(fmsg), "(flattened %d tool turn(s) for swap)", before - after);
 						aiAddHistory(data, fmsg);
+					}
+					/* Carried-over model may belong to the old provider — a foreign
+					   id 404s the new one (empty stream). Reset to a sane default. */
+					if (!hkModelFitsProvider(E.ai_provider_type, E.ai_model)) {
+						const char *dm = hkProviderDefaultModel(E.ai_provider_type);
+						if (dm) {
+							free(E.ai_model); E.ai_model = strdup(dm);
+							char mm[192];
+							snprintf(mm, sizeof(mm), "model \xE2\x86\x92 %s (prior model not valid for %s; :model to change, :models to list)",
+								dm, hkProviderName(E.ai_provider_type));
+							aiAddHistory(data, mm);
+						} else {
+							aiAddHistory(data, "note: pick a model for this provider — :model <id> (:models to list)");
+						}
 					}
 				}
 				clCredsSave();
@@ -4832,7 +6505,7 @@ static void clLoadRc(void) {
 		else if (strcmp(key, "ai_max_tokens") == 0) E.ai_max_tokens = atoi(val);
 		else if (strcmp(key, "ai_tools_enabled") == 0) E.ai_tools_enabled = atoi(val) ? 1 : 0;
 		else if (strcmp(key, "ai_stream") == 0) E.ai_stream = atoi(val) ? 1 : 0;
-		else if (strcmp(key, "ai_autowrite") == 0) E.ai_autowrite = atoi(val) ? 1 : 0;
+		else if (strcmp(key, "ai_auto_approve") == 0) E.ai_auto_approve = atoi(val) ? 1 : 0;
 		else if (strcmp(key, "anim_style") == 0) {
 			E.anim_force_style = -1;
 			for (int i = 0; i < CL_ANIM_COUNT; i++) {
@@ -4851,9 +6524,11 @@ static void clInitConfig(void) {
 	E.ai_temperature = 70;
 	E.ai_max_tokens = 2048;
 	E.ai_tools_enabled = 1;
-	E.ai_tool_gate = 1;
+	E.ai_tool_gate = 0;   /* default OFF — keyword-guessing stripped tools on legit
+	                         requests ("make a python program"); the per-tool
+	                         permission prompt is the real guard now. :toolgate on to restore. */
 	E.ai_stream = 1;
-	E.ai_autowrite = 1;
+	E.ai_auto_approve = 0;   /* default: prompt per tool call (Claude-Code-style) */
 	E.anim_force_style = -1;
 #ifndef _WIN32
 	E.color_enabled = isatty(STDOUT_FILENO) ? 1 : 0;
@@ -6541,6 +8216,11 @@ static void clWaitWorker(aiData *data) {
 }
 
 static int clOneShot(aiData *data, const char *prompt) {
+	/* Build the system prompt (tool schema + rules + skills) — the REPL and
+	   --pipe paths do this at startup, but one-shot skipped it, so `hako -p …`
+	   ran with NO tools (the model never learned they exist). One-shot is the
+	   scripted/automation entry point, so it needs tools the most. */
+	hkLoadSkills(data);
 	aiAddHistoryRole(data, prompt, HK_ROLE_USER);
 	hkLogMessage("user", prompt);
 	E.session_turn_count++;
@@ -6929,6 +8609,7 @@ int main(int argc, char **argv) {
 		if (strcmp(a, "--debug") == 0) { E.debug = 1; continue; }
 		if (strcmp(a, "--compact") == 0) { E.compact = 1; continue; }
 		if (strcmp(a, "--pipe") == 0) { E.pipe_mode = 1; continue; }
+		if (strcmp(a, "--yolo") == 0) { E.ai_auto_approve = 1; continue; }
 		fprintf(stderr, "unknown arg: %s (try --help)\n", a);
 		return 2;
 	}
@@ -6940,6 +8621,7 @@ int main(int argc, char **argv) {
 
 	hkMigrateHakocToHako();
 	clInitAI(&G_AI);
+	hkMcpInit();   /* connect MCP servers from ~/.hako/mcp.json (no-op if absent) */
 
 	/* Legacy layout warnings. v0.1.6 moved per-project state to
 	   ~/.hako/projects/<enc>/ and renamed home dir ~/.hakoc/ → ~/.hako/ (auto-migrated
@@ -6980,6 +8662,7 @@ int main(int argc, char **argv) {
 		fflush(stdout);
 	}
 
+	hkMcpShutdown();
 	clCleanupAI(&G_AI);
 	clCleanupConfig();
 	return rc;

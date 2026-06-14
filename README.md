@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.1.8-b89656?style=flat-square&labelColor=14130f" alt="v0.1.8"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.1.9-b89656?style=flat-square&labelColor=14130f" alt="v0.1.9"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-c8c2b2?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -74,7 +74,7 @@
 │        ⠀⠀⠀⠀⠀⠀⠀⠈⠙⠻⢿⣿⡇⢸⣿⡿⠟⠋⠁⠀⠀⠀⠀⠀⠀⠀         │
 │        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠈⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀         │
 │                                           │
-│ hako 0.1.8 · mithraeum · hako-sho         │
+│ hako 0.1.9 · mithraeum · hako-sho         │
 │ trust on · session resumed                │
 │ :help :providers :models :login :theme    │
 ╰───────────────────────────────────────────╯
@@ -110,7 +110,7 @@
 - **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
 - **Theme presets.** `:theme mithraeum|claude|nord|mono` swaps the full palette live (persisted in `~/.hakorc`). Truecolor where supported, 16-color fallback for error chip in tmux without `RGB` passthrough.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
-- **Trust-gated tools.** `read_file`, `list_dir`, `write_file` (with staging), `run_shell` (10s timeout). Untrusted dir = all tools refused. `:trust` once per project.
+- **Trust-gated tools.** `read_file`, `list_dir`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (10s timeout), `read_skill`. Per-call `[y]/[n]/[a]` approval; untrusted dir = all tools refused. `:trust` once per project.
 - **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
 - **Self-update.** `hako --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
 - **Streaming + spinners.** Anthropic SSE streams live tokens. 8 spinner styles × 12 thinking labels rotate per turn (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`).
@@ -319,7 +319,15 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### v0.1.8 (Latest)<br>
+### v0.1.9 (Latest)<br>
+- **`edit_file` + `edit_lines` — change part of a file without rewriting it.** `edit_file(path, old, new)` is a str_replace matched in line space (trailing-whitespace/CRLF tolerant, must be unique); `edit_lines(path, start, end, new)` replaces an inclusive 1-indexed line range (use with traceback line numbers). Both trust+approval gated, preserve the file's final newline, and are steered ahead of `write_file` for small changes in every tool-list surface. Stops small models burning the whole context re-dumping an 80-line file to fix one line.
+- **Local-model tool reliability (harness, not model size).** Tool turns sample greedy (deterministic); `(name,args)` dedup across the whole turn stops re-run ping-pong; `</tool_call>`/`</write_file>` stop sequences end the turn cleanly; a raw `<write_file path="…">…body…</write_file>` channel lets tiny models write whole files without JSON-escaping; a 5th parser pass handles sho's bare `<tool>NAME</tool>{json}` dialect; truncated calls (no closing tag) get a "keep it short + complete" nudge; a fence that's shown-but-not-written is either nudged or, when a target is known, lifted and written by the harness (guarded: only a file-shaped fence, only if nothing was written that turn).
+- **Display truth.** Markdown no longer eats underscores in non-fenced code (CommonMark intraword rule — `set_mode` stays `set_mode`, not `setmode`); the write chip shows the real `wrote N bytes (M lines)` instead of the result-string length (full writes had looked like 156-byte stubs); spinner color tracks the active theme.
+- **Bigger local context.** `HAKO_CTX` env (default raised 4096→8192) — Qwen2.5-3B is GQA so the KV cache is small (~300MB f32 @ 4096); 16384 fits the 8GB box and ends the "context full — dropped oldest" spirals.
+- **MCP client** (stdio JSON-RPC, `~/.hako/mcp.json`, `mcp__server__tool`) — local models see MCP tools and fuzzy-resolve mangled names; `tools/call` verified live.
+- **Claude-Code-style tool permission prompts — every provider, every model.** Each tool call prompts `[y]` once / `[n]` no / `[a]` always (this session) at the single `hkExecTool` chokepoint, so Anthropic, ollama, and local `mithraeum` all get it. "Always" is scoped: read/write grant the project for the session; `run_shell` grants only the **exact command** (no blanket `git`/`npm`). Deny feeds the model an observation so it adapts. `:auto on|off` + `--yolo` bypass (default off). Replaces the old `write_file` staging — approved writes land immediately. `read_skill` stays prompt-free.
+
+### v0.1.8<br>
 - **Local models now run via the `hakm` SUBPROCESS — in-process engine link REVERSED.** `hkMithraeumChat` spawns `hakm <model.mlf2> --chat-stdin` one-shot per turn and reads the reply off stdout. No ollama, no server, no daemon. **Why the reversal:** v0.1.7's in-process link was gated behind `-DHAKO_HAVE_HAKM`, so a plain `make`/`make install` shipped an engine-less `hako` → MITHRAEUM fell through to the ollama curl path → "empty response" (recurred twice). Subprocess = plain `make` always ships the path, can't be compiled out. `make hakm` now builds+installs the standalone engine CLI to `~/.hako/bin/hakm`; the agent finds it via `hkFindHakm()` (`~/.hako/bin` → PATH).
 - **Provision** — relocate misplaced weights into `~/.hako/models/`, `:pull <tier>` from HuggingFace (`mithraeum` acct), prompt-then-pull on a `:model` switch to an uninstalled tier.
 
@@ -372,6 +380,9 @@ See [CHANGELOG.md](CHANGELOG.md) for full history.
 - [x] Anthropic OAuth tool calls (CC-fingerprint prose mode)
 - [x] local hako auto-default (`hako-sho` 3B / `hako-koi` 7B) via the hakm subprocess
 - [x] [hako](https://github.com/mithraeums/hako) native engine wired as a **`hakm` subprocess** (`--chat-stdin`, one-shot per turn) — no ollama, no in-process link
+- [x] `edit_file` (str_replace) + `edit_lines` (line-range) tools
+- [x] local-model tool reliability — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write nudges + fence-autowrite, `HAKO_CTX`
+- [x] MCP client (stdio JSON-RPC, `mcp__server__tool`, local-model visibility + fuzzy resolve)
 - [ ] MCP client mode with Dynamic Client Registration
 - [ ] Inline SHA-256 to drop openssl runtime dep
 - [ ] Vim-style error codes + Buddy BLE companion approval gateway — v0.2

@@ -3,6 +3,58 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.1.9] — 2026-06-07 → 2026-06-14
+
+### Added — `edit_file` + `edit_lines` (change part of a file, don't rewrite it)
+- **`edit_file(path, old, new)`** — str_replace matched in **line space**, trailing-whitespace / CRLF tolerant, and **unique-required**. Not found → "copy it exactly, or use edit_lines"; matches >1 place → "add more surrounding lines to make it unique". Leading indentation must still match (correct for Python).
+- **`edit_lines(path, start, end, new)`** — replace an inclusive **1-indexed** line range; `end` optional (single line); quoted-number params tolerated. Pairs with traceback line numbers.
+- Both: trust + `[y]/[n]/[a]` approval gated (`ALLOW_WRITE`), honest `wrote N bytes (M lines)` chip, `✐` glyph, set the last-write target (so fence-autowrite still works), and **preserve the file's final newline** (a splice off-by-one that dropped the trailing `\n` when editing the last line was caught by a unit test + fixed).
+- Wired into **every** tool-list surface (native schema, Qwen prompt, ReAct list, one-shot prose) with "prefer edit_file/edit_lines over rewriting" steering. Aliases: `str_replace`/`text_editor`/`edit` → `edit_file`, `replace_lines` → `edit_lines` (removed the old `edit_file` → `write_file` alias that would have shadowed the real tool).
+- **Why:** small models burned the whole context re-dumping an 80-line file to change one line → truncation + overflow + corruption. Targeted edits are cheaper and safer.
+
+### Added — local-model tool reliability (harness, not model size)
+- **Greedy tool turns** — tool-call generations sample at temp 0 so the same prompt yields the same (parseable) call every run; ends "works once, errors next."
+- **Cross-turn dedup** — one `(name,args)` seen-set threaded through the whole turn (was per-response only). A repeated call isn't re-run; the model gets a "(repeat) you already ran this" observation and the loop bails after one warning. Kills the read→write→read→write ping-pong that filled the KV cache and crashed the engine respawn on small-RAM boxes.
+- **Stop sequences** — the engine ends the turn on a trailing `</tool_call>` / `</write_file>`, so there's no epilogue to mis-parse.
+- **Raw `<write_file>` channel** — `<write_file path="…">…raw body…</write_file>` lets a tiny model write a whole file **without** JSON-escaping it (the single biggest small-model write failure); the agent C-escapes and routes through the normal trust-gated `write_file`. Liberal path parsing (`path=`/`file=`/`filename=`/`name=`/filename-as-first-line).
+- **Bare `<tool>` dialect** — a 5th parser pass handles sho's `<tool>NAME</tool>\n{json}` form (name as tag text, args outside the tags) that matched none of the prior passes → previously 0 files written.
+- **Truncated-call detection** — a `<write_file>`/`<tool_call>` opened with no closing tag = generation hit the ceiling mid-call (the silent "said it wrote, didn't"); now nudged specifically to re-emit ONLY the write, complete.
+- **Write nudges** — a reply that shows a ``` code fence (or bare-claims "the file is updated") but calls no tool is nudged once per turn; intent now fires on **error/fix** signals too (a pasted traceback has no create-verb). When a target file is known, the harness **lifts a file-shaped fence and writes it itself** (approval still prompts) instead of nagging the model — guarded so it can't fire after a successful write or pick a one-line run-command fence over the real file.
+- **History budget** — the redundant ``` fence is stripped from the *stored* assistant message when the same response also wrote the file (display unchanged), halving the file's token cost in context.
+
+### Added — bigger local context
+- **`HAKO_CTX` env**, default raised **4096 → 8192**. Qwen2.5-3B is GQA (`n_kv_heads=2`, `kv_dim=256`) so the KV cache is small (~300MB f32 @ 4096); **16384** fits the 8GB box and ends the recurring "context full — dropped oldest" spirals (which were also the source of the fan/heat — re-prefill thrash, not the model).
+
+### Added — MCP client (stdio JSON-RPC)
+- `~/.hako/mcp.json` servers, `mcp__server__tool` dispatch, exposed to the agent tool loop. Local models now **see** MCP tools (spliced into the Qwen prompt) and **fuzzy-resolve** mangled names (`mcp__x__y` → `mcp_-x__y`). `tools/call` verified live.
+
+### Fixed — display truth (the model looked dumber than it was)
+- **Underscores no longer eaten in non-fenced code.** The inline markdown renderer italicized `_x_`/`*x*` with no intraword guard → `set_mode` rendered `setmode`, `write_file` → `writefile`. Now uses the CommonMark intraword rule (a delimiter glued to alphanumerics is code, not emphasis). Much of the apparent "corruption" in tool-call echoes was this, not the model.
+- **Honest write chip.** `← N bytes` was the length of the result *message* string ("wrote 1456 bytes to <long path> …" ≈ 156 chars), so full writes looked like 156-byte stubs. Now echoes the real `wrote N bytes (M lines; replaced …)`.
+- **Spinner color** tracks the active theme accent (consistent per turn) unless a style is pinned in the rc.
+
+### Added — Claude-Code-style tool permission prompts (every provider, every model)
+- **Per-tool-call approval** at the single `hkExecTool` dispatch chokepoint, so it covers every provider (Anthropic, ollama, local `mithraeum`) and every tool-call path (prose `<tool>`, Claude-Code `<invoke>`, OpenAI function-calling). Answers: **`[y]` once · `[n]` no · `[a]` always (this session)**.
+- **Scoped "always (this session)":** `read_file`/`list_dir` grant reads under the project for the session; `write_file` grants writes under the project; `run_shell` grants only the **exact command string** (no blanket per-binary allow — `git`/`npm` stay gated, since they bite when misused). In-memory, cleared on exit (not persisted).
+- **Deny (`n`)** returns `error: user denied tool '<x>' …` as the tool observation, so the model adapts instead of crashing or retry-looping.
+- **`:auto on|off`** (persisted) and **`--yolo`** flag bypass all prompts (default **off** = prompt).
+- `read_skill` stays trust-free (no prompt) — user-installed, sandboxed to `~/.hako/skills`.
+- Non-interactive (`-p` / `--pipe` / piped stdin) **auto-denies** (cannot prompt) with an actionable error.
+
+### Fixed — dogfooding blockers (caught live)
+- **Empty/truncated responses from a tiny `max_tokens`.** A low cap (e.g. `ai_max_tokens=48`, set as a local-speed knob) truncated tool calls mid-XML → unparseable + display-suppressed → looked like an empty response. Now **floored to ≥1024 whenever tools are enabled** (Anthropic, ollama, and mithraeum subprocess paths).
+- **Tool-gate default OFF.** The keyword heuristic stripped the tools schema on legit requests ("make a python program" has no keyword) → model couldn't use tools, just chatted code. The per-call permission prompt is the real guard now; `:toolgate on` restores the old behavior.
+- **Provider switch keeps a valid model.** `:provider anthropic` no longer carries a local model id (`hako-sho-stock`) into the request → was 404 `not_found` → empty stream. Switching now auto-selects a sane default for the new provider (anthropic→claude-haiku, mithraeum→hako-sho, openai→gpt-4o-mini, gemini→flash, groq→llama-3.3) when the carried model doesn't fit, and announces it. Startup state-load is untouched (saved models preserved).
+- **Streaming empty-stream error surfaces the body** (first 180b) so auth/404/etc. are visible instead of a bare "Empty stream".
+- **`hkExtractJsonObject` / `hkExtractRawJsonArray` whitespace tolerance** — matched only `"key":{`/`"key":[` (no space), breaking on pretty-printed JSON; now tolerant like `hkExtractJsonString`.
+
+### Changed / Removed
+- **Removed `write_file` staging** (`ai_autowrite=0` → `.hako-pending` preview). Approved writes land **immediately** on `[y]`. The `ai_autowrite` state key is renamed **`ai_auto_approve`** (old key ignored → safe default of prompting).
+
+### Internal
+- New session allow-set (`hkAllowKind` / `hkAllowRule` + `hkAllowHas` / `hkAllowAdd`) and `hkToolApproval`, reusing `hkExtractJsonString` / `clStopAnim` / global `G_AI` / theme tokens. Prompt runs on the AI worker thread — safe: main is parked in `pthread_join`, and the raw-mode line editor restores cooked mode on every return before submit. ~7100 LOC (under the 8000 budget). Builds `-Wall -Wextra` + ASan clean.
+- **Not yet live-verified:** the interactive `y/n/a` prompt + deny→observation during a real provider turn. Verify before tagging a release.
+
 ## [v0.1.8] — 2026-06-03
 
 ### Changed — local models run via the `hakm` SUBPROCESS (in-process link REVERSED)
