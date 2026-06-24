@@ -3,10 +3,11 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
-## [v0.1.9] — 2026-06-07 → 2026-06-14
+## [v0.2.0] — 2026-06-07 → 2026-06-20
 
 ### Added — `edit_file` + `edit_lines` (change part of a file, don't rewrite it)
-- **`edit_file(path, old, new)`** — str_replace matched in **line space**, trailing-whitespace / CRLF tolerant, and **unique-required**. Not found → "copy it exactly, or use edit_lines"; matches >1 place → "add more surrounding lines to make it unique". Leading indentation must still match (correct for Python).
+- **`edit_file(path, old, new)`** — str_replace matched in **line space**, trailing-whitespace / CRLF tolerant, and **unique-required**. Not found → "copy it exactly, or use edit_lines"; matches >1 place → "add more surrounding lines to make it unique".
+- **Indentation-tolerant match + reindent.** Small models routinely quote `old` without its leading indentation (`return a - b` vs the file's `\treturn a - b`). When the strict pass finds nothing, a relaxed pass matches ignoring leading whitespace; on a unique hit the replacement is **re-indented to the file's own indentation** (`hkReindentLike`) so significant whitespace (Python, Makefiles, tabs) survives. Verified e2e: sho (3B) now lands `edit_file` on the first try.
 - **`edit_lines(path, start, end, new)`** — replace an inclusive **1-indexed** line range; `end` optional (single line); quoted-number params tolerated. Pairs with traceback line numbers.
 - Both: trust + `[y]/[n]/[a]` approval gated (`ALLOW_WRITE`), honest `wrote N bytes (M lines)` chip, `✐` glyph, set the last-write target (so fence-autowrite still works), and **preserve the file's final newline** (a splice off-by-one that dropped the trailing `\n` when editing the last line was caught by a unit test + fixed).
 - Wired into **every** tool-list surface (native schema, Qwen prompt, ReAct list, one-shot prose) with "prefer edit_file/edit_lines over rewriting" steering. Aliases: `str_replace`/`text_editor`/`edit` → `edit_file`, `replace_lines` → `edit_lines` (removed the old `edit_file` → `write_file` alias that would have shadowed the real tool).
@@ -21,6 +22,8 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - **Truncated-call detection** — a `<write_file>`/`<tool_call>` opened with no closing tag = generation hit the ceiling mid-call (the silent "said it wrote, didn't"); now nudged specifically to re-emit ONLY the write, complete.
 - **Write nudges** — a reply that shows a ``` code fence (or bare-claims "the file is updated") but calls no tool is nudged once per turn; intent now fires on **error/fix** signals too (a pasted traceback has no create-verb). When a target file is known, the harness **lifts a file-shaped fence and writes it itself** (approval still prompts) instead of nagging the model — guarded so it can't fire after a successful write or pick a one-line run-command fence over the real file.
 - **History budget** — the redundant ``` fence is stripped from the *stored* assistant message when the same response also wrote the file (display unchanged), halving the file's token cost in context.
+- **Over-run / re-dump guard.** After a successful `edit_file`/`edit_lines`, a small model often keeps going and re-dumps the *whole* file via `write_file` (reflowing tabs→spaces, clobbering the edit, looping to the iteration cap). A turn-scoped set (`hkWasEditedThisTurn`) plus a whitespace-insensitive content compare (`hkContentLooseEqFile`) detects the redundant rewrite, **skips the write so the edit survives**, and returns a "fix applied — confirm and stop" observation. Live: edit lands, re-dump skipped, tab preserved, the model says "fixed" and stops.
+- **Brevity directive (RULE 3).** The local system prompt now tells the model to skip preamble ("Sure, I'll…") and step narration, confirm in one short line after a tool, and not re-paste file contents — trims the 3B's natural chattiness without touching tool behavior.
 
 ### Added — bigger local context
 - **`HAKO_CTX` env**, default raised **4096 → 8192**. Qwen2.5-3B is GQA (`n_kv_heads=2`, `kv_dim=256`) so the KV cache is small (~300MB f32 @ 4096); **16384** fits the 8GB box and ends the recurring "context full — dropped oldest" spirals (which were also the source of the fan/heat — re-prefill thrash, not the model).
@@ -28,10 +31,26 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 ### Added — MCP client (stdio JSON-RPC)
 - `~/.hako/mcp.json` servers, `mcp__server__tool` dispatch, exposed to the agent tool loop. Local models now **see** MCP tools (spliced into the Qwen prompt) and **fuzzy-resolve** mangled names (`mcp__x__y` → `mcp_-x__y`). `tools/call` verified live.
 
+### Fixed — local model derailing into "as an AI language model" / "paste the file"
+- A small model asked "why isn't pong.py working?" got a plain "please provide the contents" (RULE 1 read the question form as a concept question), then a 3B's in-context momentum kept it refusing — escalating to "as an AI language model I can't search files" even with tools available + trust on.
+- **RULE 1 broadened:** any mention of a file by name, or asking to debug/check/look at/find/search something, is now an ACTION → read/list it first instead of asking the user. The plain-text carve-out is narrowed to GENERAL concept questions with no project file involved. New examples (`why isn't pong.py working?` → `read_file`; `it's in this directory` / `use ls` → `list_dir`).
+- **New RULE 4:** the model is a real agent with working tools — NEVER ask the user to paste/provide a file's contents (it has `read_file`), NEVER claim "as an AI language model" / "I can't access files", and if the user pushes back, stop apologizing and call the tool. Verified live on sho (3B): the exact failing prompt now fires `read_file` and diagnoses the file.
+
+### Fixed — truecolor palette muddy in non-truecolor terminals (e.g. macOS Terminal.app)
+- The agent emitted 24-bit `38;2;r;g;b` unconditionally; terminals without truecolor (Terminal.app is the common one) quantize that to a muddy/greenish 256 approximation, so the brand palette didn't match the editor (a GUI that renders exact RGB).
+- Now **detects truecolor** (`COLORTERM`/`TERM`, `HAKO_TRUECOLOR=1|0` override) and, when absent, **maps the palette to `38;5;N` itself** (`clRgbTo256` 6×6×6 cube + grayscale ramp) — a controlled mapping (gold→137, phosphor→101, bronze→173) beats the terminal's guess. Truecolor terminals are unchanged; the 16-color error chip passes through.
+
+### Added — arrow-key popup picker
+- A reusable in-REPL menu (`clPopupSelect`): themed box, `↑`/`↓` (or `k`/`j`) to move, enter to select, esc/`q`/`^C` to cancel, redraws in place and erases itself on exit. Optional per-row preview callback (nullable, ANSI-aware width).
+- **Bare `:theme`** opens it with **live color swatches** per row (each theme's accent/success/tool blocks in its own palette); **bare `:provider`** opens it over the provider list and reuses the existing swap path. `:theme <name>` / `:provider <name>` still apply directly.
+- Non-tty / `--no-color` falls back to a numbered text prompt. Reuses `clEnableRaw`/`clDisableRaw` (same raw mode as the line editor + the `[y]/[n]/[a]` gate) and `clCellWidth` for box sizing. Generic — `:model` can adopt it next.
+
 ### Fixed — display truth (the model looked dumber than it was)
 - **Underscores no longer eaten in non-fenced code.** The inline markdown renderer italicized `_x_`/`*x*` with no intraword guard → `set_mode` rendered `setmode`, `write_file` → `writefile`. Now uses the CommonMark intraword rule (a delimiter glued to alphanumerics is code, not emphasis). Much of the apparent "corruption" in tool-call echoes was this, not the model.
 - **Honest write chip.** `← N bytes` was the length of the result *message* string ("wrote 1456 bytes to <long path> …" ≈ 156 chars), so full writes looked like 156-byte stubs. Now echoes the real `wrote N bytes (M lines; replaced …)`.
 - **Spinner color** tracks the active theme accent (consistent per turn) unless a style is pinned in the rc.
+- **`mithraeum` theme matched to the brand.** The gold was too light/desaturated (`220,188,124`) → read as a dull yellow-green. Retuned to the canonical palette shared with the editor + website: gold `#b89656` (184,150,86), success-green to olive phosphor `#7a8a3a` (122,138,58), body text to bone `#c8c2b2` (editor fg). The agent now matches `hake` and the site.
+- **"oracle" → "model".** The spinner label `consulting the oracle` is now `consulting the model` — the local model is a model, not a deity.
 
 ### Added — Claude-Code-style tool permission prompts (every provider, every model)
 - **Per-tool-call approval** at the single `hkExecTool` dispatch chokepoint, so it covers every provider (Anthropic, ollama, local `mithraeum`) and every tool-call path (prose `<tool>`, Claude-Code `<invoke>`, OpenAI function-calling). Answers: **`[y]` once · `[n]` no · `[a]` always (this session)**.
@@ -52,8 +71,8 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - **Removed `write_file` staging** (`ai_autowrite=0` → `.hako-pending` preview). Approved writes land **immediately** on `[y]`. The `ai_autowrite` state key is renamed **`ai_auto_approve`** (old key ignored → safe default of prompting).
 
 ### Internal
-- New session allow-set (`hkAllowKind` / `hkAllowRule` + `hkAllowHas` / `hkAllowAdd`) and `hkToolApproval`, reusing `hkExtractJsonString` / `clStopAnim` / global `G_AI` / theme tokens. Prompt runs on the AI worker thread — safe: main is parked in `pthread_join`, and the raw-mode line editor restores cooked mode on every return before submit. ~7100 LOC (under the 8000 budget). Builds `-Wall -Wextra` + ASan clean.
-- **Not yet live-verified:** the interactive `y/n/a` prompt + deny→observation during a real provider turn. Verify before tagging a release.
+- New session allow-set (`hkAllowKind` / `hkAllowRule` + `hkAllowHas` / `hkAllowAdd`) and `hkToolApproval`, reusing `hkExtractJsonString` / `clStopAnim` / global `G_AI` / theme tokens. Prompt runs on the AI worker thread — safe: main is parked in `pthread_join`, and the raw-mode line editor restores cooked mode on every return before submit. Builds `-Wall` (plain) + `-Wall -Wextra` + ASan/UBSan clean. Splice/match/reindent helpers unit-tested under ASan/UBSan.
+- **Live-verified on the i3/8GB box (sho, 3B, `hakm` subprocess):** `edit_file` + `edit_lines` e2e (read → indent-tolerant edit → tab preserved → stop); the over-run re-dump guard; deny→observation through the permission gate. MCP `tools/call` verified live in the 06-11 stretch.
 
 ## [v0.1.8] — 2026-06-03
 

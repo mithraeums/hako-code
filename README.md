@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.1.9-b89656?style=flat-square&labelColor=14130f" alt="v0.1.9"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.0-b89656?style=flat-square&labelColor=14130f" alt="v0.2.0"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-c8c2b2?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -29,56 +29,23 @@
 
 <table align="center">
   <tr>
-    <td align="center" width="50%">
-      <!-- SCREENSHOT: hako-code/screenshot-splash.png — hako agent banner box at startup, koi auto-detected, mithraeum provider. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-splash.png?raw=true" alt="hako banner with koi defaulted" width="100%"/><br/>
-      <sub>auto-defaults to a local <b>hako</b> model via mithraeum</sub>
+    <td align="center" width="33%">
+      <!-- hako-code/vhs/splash.tape — startup banner, mithraeum/sho auto-default. -->
+      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-splash.png?raw=true" alt="hako startup banner" width="100%"/><br/>
+      <sub>local <b>hako</b> model by default, via mithraeum</sub>
     </td>
-    <td align="center" width="50%">
-      <!-- SCREENSHOT: hako-code/screenshot-models.png — `:models` output showing the catalog (mithraeum koi + cloud providers). -->
+    <td align="center" width="33%">
+      <!-- hako-code/vhs/models.tape — `:models` catalog. -->
       <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-models.png?raw=true" alt=":models output" width="100%"/><br/>
       <sub><code>:models</code> · local hako + 13 cloud providers</sub>
     </td>
-  </tr>
-  <tr>
-    <td align="center" width="50%">
-      <!-- REUSED from hako-edit — Rei pane shows the agent embedded in the editor, talking to koi. Same binary, different host. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-edit/screenshot-rei.png?raw=true" alt="hako inside hake editor" width="100%"/><br/>
-      <sub>also runs embedded inside <a href="https://github.com/mithraeums/hako-edit"><b>hake</b></a> (the editor)</sub>
-    </td>
-    <td align="center" width="50%">
-      <!-- REUSED from hako-edit themes capture — same palette tokens drive both editor + agent. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-edit/screenshot-themes.png?raw=true" alt="theme palette" width="100%"/><br/>
-      <sub>themes · mithraeum · claude · nord · mono</sub>
+    <td align="center" width="33%">
+      <!-- hako-code/vhs/theme-picker.tape — bare :theme popup with live color swatches. -->
+      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/theme-picker.gif?raw=true" alt="theme picker popup with live swatches" width="100%"/><br/>
+      <sub>arrow-key <code>:theme</code> picker · live swatches</sub>
     </td>
   </tr>
 </table>
-
-<br>
-
-<!-- KEEP: ASCII mockup of the in-terminal banner. Renders fine in monospace; do not replace with a screenshot. Mirrors the cleaned 13-row logo (no TABs, no mixed ASCII spaces) — keep this and `CL_LOGO_MEDIUM` in lockstep when either changes. -->
-
-```
-╭───────────────────────────────────────────╮
-│        ⠀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⠀⠀⠀⠀⠀⢀⣀⡀⠀⠀⠀⠀⠀⠀⠀         │
-│        ⠀⠀⠀⢀⣠⣶⣾⣿⣿⣿⣦⡀⠀⠀⢀⣴⣿⣿⣿⣷⣶⣄⡀⠀⠀⠀         │
-│        ⣠⣴⣾⣿⣿⣿⣿⣿⣿⠿⠛⠉⢠⡄⠉⠛⠿⣿⣿⣿⣿⣿⣿⣷⣦⣄         │
-│        ⠀⠻⣿⣿⣿⡿⠟⠋⠁⠀⠀⠀⢸⡇⠀⠀⠀⠈⠙⠻⢿⣿⣿⣿⠟⠁         │
-│        ⠀⠀⠈⠋⠁⠀⠀⠀⠀⠀⠀⠀⢸⡇⠀⠀⠀⠀⠀⠀⠀⠈⠙⠁⠀⠀         │
-│        ⠀⠀⣰⣷⣦⣄⡀⠀⠀⠀⠀⠀⢸⡇⠀⠀⠀⠀⠀⢀⣠⣴⣾⣆⠀⠀         │
-│        ⢠⣾⣿⣿⣿⣿⣿⣷⣦⣄⠀⠀⢸⡇⠀⠀⣠⣴⣾⣿⣿⣿⣿⣿⣷⡄         │
-│        ⠙⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠖⠀⠀⠲⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠋         │
-│        ⠀⠀⠀⠉⠛⠿⣿⣿⣿⠟⢁⣴⡇⢸⣦⡈⠻⣿⣿⣿⠿⠛⠉⠀⠀⠀         │
-│        ⠀⠀⠀⢸⣷⣦⣄⡉⢁⣴⣿⣿⡇⢸⣿⣿⣦⡈⢉⣠⣴⣾⡇⠀⠀⠀         │
-│        ⠀⠀⠀⠈⠙⠻⢿⣿⣿⣿⣿⣿⡇⢸⣿⣿⣿⣿⣿⡿⠟⠋⠁⠀⠀⠀         │
-│        ⠀⠀⠀⠀⠀⠀⠀⠈⠙⠻⢿⣿⡇⢸⣿⡿⠟⠋⠁⠀⠀⠀⠀⠀⠀⠀         │
-│        ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠈⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀         │
-│                                           │
-│ hako 0.1.9 · mithraeum · hako-sho         │
-│ trust on · session resumed                │
-│ :help :providers :models :login :theme    │
-╰───────────────────────────────────────────╯
-```
 
 
 <table>
@@ -108,7 +75,7 @@
   for non-hako models.)
 - **13 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. `:login <name>` walks you through OAuth or hands you to the provider's console for an API key.
 - **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
-- **Theme presets.** `:theme mithraeum|claude|nord|mono` swaps the full palette live (persisted in `~/.hakorc`). Truecolor where supported, 16-color fallback for error chip in tmux without `RGB` passthrough.
+- **Theme presets + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a popup you arrow through, each row showing that theme's colors as live swatches. Same picker on bare `:provider`. Persisted in `~/.hakorc`. Truecolor where supported, 16-color fallback for the error chip in tmux without `RGB` passthrough.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
 - **Trust-gated tools.** `read_file`, `list_dir`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (10s timeout), `read_skill`. Per-call `[y]/[n]/[a]` approval; untrusted dir = all tools refused. `:trust` once per project.
 - **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
@@ -159,8 +126,6 @@ make hakm                                              # installs the engine CLI
 # convert a Qwen2.5-Coder GGUF once → ~/.hako/models/hako-sho.mlf2
 #   (python3 ../hako/tools/gguf2mlf.py model.gguf ~/.hako/models/hako-sho.mlf2)
 hako                                                   # auto-detects the .mlf2, runs it via the hakm subprocess (mithraeum)
-> :trust                                                # grant tool access in this project
-> list files in this directory
 > :trust                                                # grant tool access in this project
 > list files in this directory
 ```
@@ -319,54 +284,17 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### v0.1.9 (Latest)<br>
-- **`edit_file` + `edit_lines` — change part of a file without rewriting it.** `edit_file(path, old, new)` is a str_replace matched in line space (trailing-whitespace/CRLF tolerant, must be unique); `edit_lines(path, start, end, new)` replaces an inclusive 1-indexed line range (use with traceback line numbers). Both trust+approval gated, preserve the file's final newline, and are steered ahead of `write_file` for small changes in every tool-list surface. Stops small models burning the whole context re-dumping an 80-line file to fix one line.
-- **Local-model tool reliability (harness, not model size).** Tool turns sample greedy (deterministic); `(name,args)` dedup across the whole turn stops re-run ping-pong; `</tool_call>`/`</write_file>` stop sequences end the turn cleanly; a raw `<write_file path="…">…body…</write_file>` channel lets tiny models write whole files without JSON-escaping; a 5th parser pass handles sho's bare `<tool>NAME</tool>{json}` dialect; truncated calls (no closing tag) get a "keep it short + complete" nudge; a fence that's shown-but-not-written is either nudged or, when a target is known, lifted and written by the harness (guarded: only a file-shaped fence, only if nothing was written that turn).
-- **Display truth.** Markdown no longer eats underscores in non-fenced code (CommonMark intraword rule — `set_mode` stays `set_mode`, not `setmode`); the write chip shows the real `wrote N bytes (M lines)` instead of the result-string length (full writes had looked like 156-byte stubs); spinner color tracks the active theme.
-- **Bigger local context.** `HAKO_CTX` env (default raised 4096→8192) — Qwen2.5-3B is GQA so the KV cache is small (~300MB f32 @ 4096); 16384 fits the 8GB box and ends the "context full — dropped oldest" spirals.
-- **MCP client** (stdio JSON-RPC, `~/.hako/mcp.json`, `mcp__server__tool`) — local models see MCP tools and fuzzy-resolve mangled names; `tools/call` verified live.
-- **Claude-Code-style tool permission prompts — every provider, every model.** Each tool call prompts `[y]` once / `[n]` no / `[a]` always (this session) at the single `hkExecTool` chokepoint, so Anthropic, ollama, and local `mithraeum` all get it. "Always" is scoped: read/write grant the project for the session; `run_shell` grants only the **exact command** (no blanket `git`/`npm`). Deny feeds the model an observation so it adapts. `:auto on|off` + `--yolo` bypass (default off). Replaces the old `write_file` staging — approved writes land immediately. `read_skill` stays prompt-free.
+### v0.2.0 (Latest)
 
-### v0.1.8<br>
-- **Local models now run via the `hakm` SUBPROCESS — in-process engine link REVERSED.** `hkMithraeumChat` spawns `hakm <model.mlf2> --chat-stdin` one-shot per turn and reads the reply off stdout. No ollama, no server, no daemon. **Why the reversal:** v0.1.7's in-process link was gated behind `-DHAKO_HAVE_HAKM`, so a plain `make`/`make install` shipped an engine-less `hako` → MITHRAEUM fell through to the ollama curl path → "empty response" (recurred twice). Subprocess = plain `make` always ships the path, can't be compiled out. `make hakm` now builds+installs the standalone engine CLI to `~/.hako/bin/hakm`; the agent finds it via `hkFindHakm()` (`~/.hako/bin` → PATH).
-- **Provision** — relocate misplaced weights into `~/.hako/models/`, `:pull <tier>` from HuggingFace (`mithraeum` acct), prompt-then-pull on a `:model` switch to an uninstalled tier.
+- **`edit_file` + `edit_lines`** — change part of a file without rewriting it; indentation-tolerant match + an over-run guard so a small model can't clobber its own edit.
+- **Local-model tool reliability** — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write/edit nudges, and brevity + anti-refusal prompt rules so small models actually use their tools.
+- **Arrow-key popup picker** — bare `:theme` (live color swatches) and `:provider`; numbered fallback when piped.
+- **256-color fallback** — detects truecolor and maps the brand palette to 256 itself on terminals without it (e.g. macOS Terminal.app), so colors stay on-brand.
+- **Per-call tool permission** — `[y]/[n]/[a]` at the single exec chokepoint, every provider; `:auto` / `--yolo` to bypass.
+- **MCP client** — stdio JSON-RPC (`~/.hako/mcp.json`, `mcp__server__tool`); local models see and fuzzy-resolve MCP tools.
+- **Context + display** — `HAKO_CTX` default 8192; honest write chips; CommonMark underscores; spinner tracks the active theme.
 
-### v0.1.7<br>
-- **`mithraeum` provider ran the native hako engine IN-PROCESS.** Linked `libhakm.a` and called `hkMithraeumChat` → `hakm_chat` in this process; build was `make hakm` (`-DHAKO_HAVE_HAKM`). *(Reversed in v0.1.8 — the gated link kept shipping engine-less binaries.)*
-- **Model resolution off the filesystem** — `~/.hako/models/<id>.mlf2`. `clDetectKoiDefault` + `:models` scan `~/.hako/models/*.mlf2` (no more `ollama list` / `/api/tags`). koi > koi-mini > sho; `-v*` over `-stock`.
-- **Graceful weight fallback** — missing configured weight → `hkMithraeumFirstAvailable` picks the first installed `.mlf2` (prefers sho), warns, self-heals per-project state. Fixes the stale `ai_model=hako-koi-*` "no such file" crash.
-- **`AI_PROVIDER_OLLAMA` kept as a separate optional provider** — only the hako-models path is ollama-free.
-- Engine: int8 dot path → ~2.25 tok/s on the 3B (Intel i3). See `mithraeums/hako`.
-
-### v0.1.6<br>
-- **Anthropic OAuth tool calls work.** System-as-array, CC fingerprint headers, prose-mode tool calls (Claude Code XML parser), JSON-unescape on `write_file` content. Verified live against Claude Pro/Max.
-- **Storage rewrite — CC-style.** Per-project state at `~/.hako/projects/<encoded-cwd>/{trust,state,sessions/<sid>.jsonl}`. `<cwd>/.hako/` only holds `HAKO.md` (project context, system-prompt-loaded). Old per-project files trigger startup warn.
-- **Theme system** — `:theme mithraeum|claude|nord|mono` swap + persist.
-- **Visual overhaul** — sigils (`›` user, `◆` AI, `!` err, `·` sys), box banner, first-run wizard, ghost-text autocomplete for slash/colon cmds.
-- **Tool resolution hardened** — 20+ tool-name aliases case-insensitive (`bash`, `create_file`, `str_replace_based_edit_tool`, etc), param-name aliases (`command`→cmd, `file_path`→path, `file_text`→content) so CC-trained Claude works first try.
-- **`run_shell` rewrite** — tmp-script execution + JSON-unescape. Heredocs and embedded quotes now work.
-- **OPENAI + OLLAMA wires now carry `system_prompt`** — was silently dropped; BASE_PROMPT / skills / HAKO.md now reach Copilot / GH Models / OpenRouter / Gemini / Ollama / koi.
-- **Pre-tool prose suppression** — matches Claude Code chip-first ordering; no more "Done!" before the tool runs.
-- **Cached env probe** in system prompt — model knows `python3` vs `python` etc on first try.
-- **Ollama perf knobs** — `keep_alive: 30m` + `num_predict` cap. Big win on local koi turns.
-- **Error chip** — bold 16-color bright red + `✗` glyph (was rendering as invisible reverse-video bar in tmux).
-- **Banner box auto-sizes** correctly (was undercounting multibyte `·`). Rows truncate with `…`.
-
-### v0.1.5<br>
-- **4 OAuth providers** — `:login anthropic` (Claude Pro/Max), `:login copilot` (Copilot Pro), `:login github-models` (free for any GH user), `:login openrouter` (PKCE auto-issue).
-- **Discovery** — `:providers` grouped catalog, `:models` live (Ollama) or curated suggestions (other providers), TAB completion.
-- **Workflow parity** — `:retry`, `:edit`, `:undo`, up-arrow recall.
-- **ReAct tool fallback** — `:toolmode react` for smaller / non-tool-tuned models (Mistral 7B, Phi-4, DeepSeek-R1 distills).
-- **Cost tracking** — per-provider USD/M-token price table, session `$` in status line, `:usage reset`.
-- **Rendering** — tool category glyphs, fenced code blocks with bronze gutter, last-turn latency in status line.
-- **Per-provider cred store** — `~/.hako/credentials` (XOR + base64, 0600). `:accounts`, `:logout`.
-- **Mid-chat provider swap** — `:provider X` flattens wire-format-specific bodies so conversation survives Anthropic↔OpenAI↔Ollama jumps.
-
-### v0.1.4<br>
-- **`--pipe` mode** for hako integration — JSONL I/O over stdin/stdout.
-- **Mithraeum palette by default** — gold / paper / rust / dim chalk truecolor.
-
-See [CHANGELOG.md](CHANGELOG.md) for full history.
+See [CHANGELOG.md](CHANGELOG.md) for the full history (v0.1.4 → present).
 
 <p align="center"><sub><b>—— VII ——</b></sub></p>
 
@@ -383,6 +311,7 @@ See [CHANGELOG.md](CHANGELOG.md) for full history.
 - [x] `edit_file` (str_replace) + `edit_lines` (line-range) tools
 - [x] local-model tool reliability — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write nudges + fence-autowrite, `HAKO_CTX`
 - [x] MCP client (stdio JSON-RPC, `mcp__server__tool`, local-model visibility + fuzzy resolve)
+- [x] arrow-key popup picker (`:theme` / `:provider`, live swatches) — reusable for `:model` next
 - [ ] MCP client mode with Dynamic Client Registration
 - [ ] Inline SHA-256 to drop openssl runtime dep
 - [ ] Vim-style error codes + Buddy BLE companion approval gateway — v0.2

@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define HAKO_VERSION "0.1.9"
+#define HAKO_VERSION "0.2.0"
 
 /* GitHub Copilot OAuth + API constants. Public client_id from VS Code Copilot extension.
    Defined here so hkBuildCurlCmd (earlier in file) can reference the Editor-* headers. */
@@ -150,13 +150,13 @@ static long hk_getline(char **lineptr, size_t *n, FILE *stream) {
 
 /* Theme color tokens — each token is a pointer into the active theme's strings.
    Render code references TH_* and gets the active theme. Swap via clThemeApply. */
-static const char *TH_USER   = "\x1b[38;2;212;177;104m";  /* warm gold */
-static const char *TH_AI     = "\x1b[38;2;234;227;212m";  /* paper */
+static const char *TH_USER   = "\x1b[38;2;184;150;86m";   /* gold #b89656 (website --gold) */
+static const char *TH_AI     = "\x1b[38;2;200;194;178m";  /* bone #c8c2b2 (editor fg) */
 static const char *TH_SYS    = "\x1b[38;2;130;121;108m";  /* chalk */
 static const char *TH_ERR    = "\x1b[1;91m";             /* bold bright red — 16-color for tmux/tty compat */
 static const char *TH_TOOL   = "\x1b[38;2;198;145;94m";   /* bronze */
-static const char *TH_OK     = "\x1b[38;2;148;172;120m";  /* sage — success */
-static const char *TH_ACCENT = "\x1b[38;2;220;188;124m";  /* bright gold accent */
+static const char *TH_OK     = "\x1b[38;2;122;138;58m";   /* phosphor #7a8a3a — success */
+static const char *TH_ACCENT = "\x1b[38;2;184;150;86m";   /* gold #b89656 (website --gold) */
 static const char *TH_META   = "\x1b[38;2;110;104;94m";   /* footnote dim */
 static const char *TH_GHOST  = "\x1b[38;2;90;84;76m";     /* darker dim — ghost text */
 
@@ -166,9 +166,9 @@ static const char *TH_GHOST  = "\x1b[38;2;90;84;76m";     /* darker dim — ghos
 typedef struct { const char *name; const char *c[9]; } clTheme;
 static const clTheme TH_PRESETS[] = {
 	{"mithraeum", {
-		"\x1b[38;2;212;177;104m", "\x1b[38;2;234;227;212m", "\x1b[38;2;150;141;128m",
-		"\x1b[1;91m",             "\x1b[38;2;198;145;94m",  "\x1b[38;2;148;172;120m",
-		"\x1b[38;2;220;188;124m", "\x1b[38;2;164;152;136m", "\x1b[38;2;108;100;88m"
+		"\x1b[38;2;184;150;86m",  "\x1b[38;2;200;194;178m", "\x1b[38;2;150;141;128m",
+		"\x1b[1;91m",             "\x1b[38;2;198;145;94m",  "\x1b[38;2;122;138;58m",
+		"\x1b[38;2;184;150;86m",  "\x1b[38;2;164;152;136m", "\x1b[38;2;108;100;88m"
 	}},
 	{"claude", {  /* warm mono + single amber accent */
 		"\x1b[38;2;217;164;87m",  "\x1b[38;2;230;230;226m", "\x1b[38;2;128;128;128m",
@@ -187,14 +187,63 @@ static const clTheme TH_PRESETS[] = {
 static const int TH_PRESET_COUNT = sizeof(TH_PRESETS) / sizeof(TH_PRESETS[0]);
 static char TH_ACTIVE[32] = "mithraeum";
 
+/* 24-bit color is emitted unconditionally; many terminals (notably macOS
+   Terminal.app) don't render `38;2;r;g;b` and quantize it to a muddy 256
+   approximation. We detect truecolor support and, when absent, convert the
+   palette to `38;5;N` ourselves (a controlled mapping beats the terminal's). */
+static int cl_truecolor = 1;
+
+static void clDetectTruecolor(void) {
+	const char *force = getenv("HAKO_TRUECOLOR");	/* manual override: 1/0 */
+	if (force) { cl_truecolor = atoi(force) ? 1 : 0; return; }
+	const char *ct = getenv("COLORTERM");
+	if (ct && (strstr(ct, "truecolor") || strstr(ct, "24bit"))) { cl_truecolor = 1; return; }
+	const char *term = getenv("TERM");
+	if (term && (strstr(term, "truecolor") || strstr(term, "direct"))) { cl_truecolor = 1; return; }
+	cl_truecolor = 0;	/* conservative: Terminal.app / unknown → use the 256 ramp */
+}
+
+/* Nearest xterm-256 index for an RGB triple (6x6x6 cube + grayscale ramp). */
+static int clRgbTo256(int r, int g, int b) {
+	static const int q[] = {0, 95, 135, 175, 215, 255};
+	int gray = (r - g < 8 && g - r < 8 && g - b < 8 && b - g < 8);
+	if (gray) {
+		int v = (r + g + b) / 3;
+		if (v < 8) return 16;
+		if (v > 248) return 231;
+		return 232 + (v - 8) * 24 / 240;
+	}
+	int ri = 0, gi = 0, bi = 0;
+	for (int i = 0; i < 6; i++) {
+		if (abs(r - q[i]) < abs(r - q[ri])) ri = i;
+		if (abs(g - q[i]) < abs(g - q[gi])) gi = i;
+		if (abs(b - q[i]) < abs(b - q[bi])) bi = i;
+	}
+	return 16 + 36 * ri + 6 * gi + bi;
+}
+
+/* Convert a truecolor `\x1b[38;2;R;G;Bm` token to `\x1b[38;5;Nm` when the
+   terminal lacks 24-bit support. Non-truecolor tokens (e.g. the 16-color err
+   `\x1b[1;91m`) and truecolor mode pass through unchanged. */
+static const char *clColorToken(const char *src) {
+	if (cl_truecolor || !src) return src;
+	int r, g, b;
+	if (sscanf(src, "\x1b[38;2;%d;%d;%dm", &r, &g, &b) != 3) return src;
+	static char buf[9][16];
+	static int slot = 0;
+	char *out = buf[slot]; slot = (slot + 1) % 9;
+	snprintf(out, sizeof(buf[0]), "\x1b[38;5;%dm", clRgbTo256(r, g, b));
+	return out;
+}
+
 static void clThemeApply(const char *name) {
 	for (int i = 0; i < TH_PRESET_COUNT; i++) {
 		if (!strcmp(TH_PRESETS[i].name, name)) {
-			TH_USER   = TH_PRESETS[i].c[0]; TH_AI    = TH_PRESETS[i].c[1];
-			TH_SYS    = TH_PRESETS[i].c[2]; TH_ERR   = TH_PRESETS[i].c[3];
-			TH_TOOL   = TH_PRESETS[i].c[4]; TH_OK    = TH_PRESETS[i].c[5];
-			TH_ACCENT = TH_PRESETS[i].c[6]; TH_META  = TH_PRESETS[i].c[7];
-			TH_GHOST  = TH_PRESETS[i].c[8];
+			TH_USER   = clColorToken(TH_PRESETS[i].c[0]); TH_AI    = clColorToken(TH_PRESETS[i].c[1]);
+			TH_SYS    = clColorToken(TH_PRESETS[i].c[2]); TH_ERR   = clColorToken(TH_PRESETS[i].c[3]);
+			TH_TOOL   = clColorToken(TH_PRESETS[i].c[4]); TH_OK    = clColorToken(TH_PRESETS[i].c[5]);
+			TH_ACCENT = clColorToken(TH_PRESETS[i].c[6]); TH_META  = clColorToken(TH_PRESETS[i].c[7]);
+			TH_GHOST  = clColorToken(TH_PRESETS[i].c[8]);
 			snprintf(TH_ACTIVE, sizeof(TH_ACTIVE), "%s", name);
 			return;
 		}
@@ -358,7 +407,7 @@ static const char *CL_LABELS[] = {
 	"musing",
 	"weaving",
 	"chewing on it",
-	"consulting the oracle",
+	"consulting the model",
 	"boxing it up",
 };
 static const int CL_LABEL_COUNT = sizeof(CL_LABELS) / sizeof(CL_LABELS[0]);
@@ -410,6 +459,9 @@ static int hkHandleSlash(aiData *data, const char *prompt);
 static char *hkBuildToolsSchema(int provider_format);
 static int clPromptYN(const char *q, int default_yes);
 static int hkToolApproval(const char *name, const char *input_json);
+typedef void (*clPopupPreview)(int idx, char *out, size_t cap);
+static int clPopupSelect(const char *title, const char **items, int n, int cur, clPopupPreview preview);
+static void clThemePreview(int idx, char *out, size_t cap);
 static const char *hkProviderName(enum aiProviderType t);
 static enum aiProviderType hkParseProvider(const char *s);
 static const char *hkProviderDefaultEndpoint(const char *s);
@@ -1811,7 +1863,7 @@ static int hkLoadSkills(aiData *data) {
 	static const char *BASE_PROMPT =
 		"You are hako-code, a terminal AI agent.\n"
 		"\n"
-		"RULE 1: Call a tool whenever the user wants you to read, list, write, or run something in the project — INCLUDING polite forms like \"can you create…\", \"could you read…\", \"would you make…\", \"please write…\". Those are requests to DO it, not questions. Only greetings and questions ABOUT concepts/code (\"what is recursion?\", \"how does X work?\") get a plain-text reply with no tool call.\n"
+		"RULE 1: Call a tool whenever the user wants you to read, list, write, or run something in the project — INCLUDING polite forms like \"can you create…\", \"could you read…\", \"would you make…\", \"please write…\". Those are requests to DO it, not questions. ALSO an action: any mention of a file by name, or asking why something isn't working / to debug / check / look at / find / search it — READ or LIST it first, don't ask the user about it. Only greetings and GENERAL concept questions with no project file involved (\"what is recursion?\", \"how does a hashmap work?\") get a plain-text reply with no tool call.\n"
 		"\n"
 		"RULE 2: All paths are RELATIVE to the current project. Use \".\" for the project root. NEVER use absolute paths like /home/..., /Users/..., /root/..., /tmp/.... Those paths do NOT exist here and every call will fail.\n"
 		"\n"
@@ -1821,12 +1873,19 @@ static int hkLoadSkills(aiData *data) {
 		"  user: \"create test.txt with hi\"     -> write_file(path=\"test.txt\", content=\"hi\\n\")\n"
 		"  user: \"can you create a pong game?\"  -> write_file(path=\"pong.py\", ...)\n"
 		"  user: \"could you make a hello.py?\"   -> write_file(path=\"hello.py\", ...)\n"
+		"  user: \"why isn't pong.py working?\"   -> read_file(path=\"pong.py\")\n"
+		"  user: \"it's in this directory\"       -> list_dir(path=\".\")\n"
+		"  user: \"search the directory / use ls\" -> list_dir(path=\".\")\n"
 		"\n"
 		"Examples — do NOT call tools:\n"
 		"  user: \"hello\"                     -> plain text reply\n"
 		"  user: \"who are you?\"              -> plain text reply\n"
 		"  user: \"explain recursion\"         -> plain text reply\n"
 		"  user: \"what is 2+2?\"              -> plain text reply\n"
+		"\n"
+		"RULE 3: Be brief. No preamble (\"Sure, I'll…\", \"Let me…\") and no narrating steps. Emit the tool call, and after it runs confirm in ONE short line — or just go straight to the next tool. Do NOT re-paste file contents or explain your work unless the user asks.\n"
+		"\n"
+		"RULE 4: You are a real agent with WORKING tools on THIS machine. NEVER ask the user to paste, provide, or share a file's contents — you have read_file, so read it yourself. NEVER say \"as an AI language model\", \"I don't have access to your files\", or \"I can't search\" — you CAN: call read_file / list_dir / run_shell. If you already tried to ask for contents and the user pushes back, stop apologizing and CALL THE TOOL.\n"
 		"\n"
 		"If a tool returns \"error: path outside project\", do NOT retry with another absolute path. Either use \".\" or stop and reply in text.\n";
 	/* Probe common interpreters / build tools once per process. Embed in system
@@ -2978,6 +3037,24 @@ static int hkLineEqTrim(const char *a, const char *b) {
 	return la == lb && strncmp(a, b, la) == 0;
 }
 
+/* Equal ignoring BOTH leading and trailing whitespace. Used for edit_file's
+   relaxed fallback: small models often quote `old` without its indentation. */
+static int hkLineEqLoose(const char *a, const char *b) {
+	size_t la = strlen(a), lb = strlen(b), sa = 0, sb = 0;
+	while (la && (a[la-1] == ' ' || a[la-1] == '\t' || a[la-1] == '\r')) la--;
+	while (lb && (b[lb-1] == ' ' || b[lb-1] == '\t' || b[lb-1] == '\r')) lb--;
+	while (sa < la && (a[sa] == ' ' || a[sa] == '\t')) sa++;
+	while (sb < lb && (b[sb] == ' ' || b[sb] == '\t')) sb++;
+	return (la - sa) == (lb - sb) && strncmp(a + sa, b + sb, la - sa) == 0;
+}
+
+/* Leading-whitespace prefix length of a line (spaces + tabs). */
+static size_t hkLeadWs(const char *s) {
+	size_t i = 0;
+	while (s[i] == ' ' || s[i] == '\t') i++;
+	return i;
+}
+
 /* split into lines over a malloc'd copy; sets *n + *bufcopy; caller frees both */
 static char **hkSplitLines(const char *s, int *n, char **bufcopy) {
 	*n = 0; *bufcopy = NULL;
@@ -3036,6 +3113,68 @@ static char *hkSpliceLines(const char *src, int a, int b, const char *rep, int *
 	out[o] = '\0';
 	if (removed) *removed = rm;
 	return out;
+}
+
+/* Re-indent `news` to match the matched file block when the model dropped the
+   leading whitespace. Each new line with no indent of its own inherits the
+   indent of the file line it lines up with (last file line for overflow). */
+static char *hkReindentLike(const char *news, char **flines, int at, int on) {
+	int nn = 0; char *nbuf = NULL;
+	char **nlines = hkSplitLines(news, &nn, &nbuf);
+	if (!nlines) return NULL;
+	size_t cap = strlen(news) + (size_t)nn * 8 + 16;
+	char *out = malloc(cap);
+	if (!out) { free(nlines); free(nbuf); return NULL; }
+	size_t o = 0;
+	for (int k = 0; k < nn; k++) {
+		if (nlines[k][0] && hkLeadWs(nlines[k]) == 0) {
+			const char *fl = flines[at + (k < on ? k : on - 1)];
+			size_t lw = hkLeadWs(fl);
+			if (o + lw + 2 >= cap) { cap = o + lw + 32; char *t = realloc(out, cap); if (!t) break; out = t; }
+			memcpy(out + o, fl, lw); o += lw;
+		}
+		size_t ll = strlen(nlines[k]);
+		if (o + ll + 2 >= cap) { cap = o + ll + 16; char *t = realloc(out, cap); if (!t) break; out = t; }
+		memcpy(out + o, nlines[k], ll); o += ll;
+		if (k + 1 < nn) out[o++] = '\n';
+	}
+	size_t nl = strlen(news);
+	if (nl && news[nl-1] == '\n') out[o++] = '\n';
+	out[o] = '\0';
+	free(nlines); free(nbuf);
+	return out;
+}
+
+/* Paths edited via edit_file/edit_lines in the current turn. A whole-file
+   write_file re-dump of one of these, differing only in whitespace, is the
+   small-model over-run (it re-emits the file it just edited, often reflowing
+   tabs to spaces) — suppress it so the edit survives. Reset per turn. */
+static char hk_turn_edited[16][1024];
+static int  hk_turn_edited_n = 0;
+
+static void hkMarkEdited(const char *rel) {
+	for (int i = 0; i < hk_turn_edited_n; i++)
+		if (strcmp(hk_turn_edited[i], rel) == 0) return;
+	if (hk_turn_edited_n < 16)
+		snprintf(hk_turn_edited[hk_turn_edited_n++], sizeof(hk_turn_edited[0]), "%s", rel);
+}
+static int hkWasEditedThisTurn(const char *rel) {
+	for (int i = 0; i < hk_turn_edited_n; i++)
+		if (strcmp(hk_turn_edited[i], rel) == 0) return 1;
+	return 0;
+}
+/* True when `content` equals the file at `full` line-for-line ignoring leading
+   and trailing whitespace (same code, possibly reflowed indentation). */
+static int hkContentLooseEqFile(const char *full, const char *content) {
+	char *cur = hkReadFileAll(full, 4 * 1024 * 1024);
+	if (!cur) return 0;
+	int an = 0, bn = 0; char *ab = NULL, *bb = NULL;
+	char **a = hkSplitLines(cur, &an, &ab);
+	char **b = hkSplitLines(content, &bn, &bb);
+	int eq = (a && b && an == bn);
+	for (int i = 0; eq && i < an; i++) if (!hkLineEqLoose(a[i], b[i])) eq = 0;
+	free(a); free(b); free(ab); free(bb); free(cur);
+	return eq;
 }
 
 /* write content to a resolved+approved path; returns a write_file-shape summary */
@@ -3222,6 +3361,17 @@ static char *hkExecTool(const char *name, const char *input_json) {
 			free(path); free(content);
 			return strdup("error: path outside trusted project");
 		}
+		/* Over-run guard: model already edited this file this turn and is now
+		   re-dumping the whole thing with only whitespace differences. Skip the
+		   write so the edit's indentation survives, and tell it the fix is done. */
+		if (hkWasEditedThisTurn(path) && hkContentLooseEqFile(full, content)) {
+			char *out = malloc(192);
+			if (out) snprintf(out, 192,
+				"no change: %s already has your edit (whole-file rewrite skipped). "
+				"The fix is applied — reply with a short confirmation, no more tools.", path);
+			free(path); free(content);
+			return out ? out : strdup("no change: already applied");
+		}
 		size_t clen = strlen(content);
 		int new_lines = 0;
 		for (size_t i = 0; i < clen; i++) if (content[i] == '\n') new_lines++;
@@ -3286,18 +3436,32 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		char **olines = hkSplitLines(olds, &on, &obuf);
 		char *result = NULL;
 		if (flines && olines && on > 0 && on <= fn) {
-			int found = 0, at = -1;
+			int found = 0, at = -1, loose = 0;
 			for (int i = 0; i + on <= fn; i++) {
 				int ok = 1;
 				for (int j = 0; j < on; j++)
 					if (!hkLineEqTrim(flines[i+j], olines[j])) { ok = 0; break; }
 				if (ok) { found++; at = i; }
 			}
+			/* Relaxed fallback: model dropped the indentation. Match ignoring
+			   leading ws; if unique, re-indent `new` to the file's own indent so
+			   significant whitespace (Python, Makefiles) survives. */
+			if (found == 0) {
+				for (int i = 0; i + on <= fn; i++) {
+					int ok = 1;
+					for (int j = 0; j < on; j++)
+						if (!hkLineEqLoose(flines[i+j], olines[j])) { ok = 0; break; }
+					if (ok) { found++; at = i; }
+				}
+				loose = 1;
+			}
 			if (found == 1) {
 				int rm = 0;
-				char *spliced = hkSpliceLines(buf, at + 1, at + on, news, &rm);
-				if (spliced) { result = hkWriteResolved(full, path, spliced); free(spliced); }
+				char *rep = loose ? hkReindentLike(news, flines, at, on) : NULL;
+				char *spliced = hkSpliceLines(buf, at + 1, at + on, rep ? rep : news, &rm);
+				if (spliced) { result = hkWriteResolved(full, path, spliced); free(spliced); hkMarkEdited(path); }
 				else result = strdup("error: splice failed");
+				free(rep);
 			} else if (found == 0) {
 				result = strdup("error: 'old' not found — copy it EXACTLY from the file, or use edit_lines with line numbers");
 			} else {
@@ -3346,6 +3510,7 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		char *spliced = hkSpliceLines(buf, a, b, news, &rm);
 		char *result = spliced ? hkWriteResolved(full, path, spliced)
 		                       : strdup("error: line range past end of file");
+		if (spliced) hkMarkEdited(path);
 		free(spliced); free(buf); free(news); free(path);
 		return result;
 	}
@@ -3393,7 +3558,8 @@ static void hkAnnounceToolResult(aiData *data, const char *result) {
 	int is_err = result && strncmp(result, "error:", 6) == 0;
 	/* write/edit returns its own "wrote N bytes …" summary — echo it; byte count is
 	   only meaningful for opaque blobs (read_file / shell output) */
-	int is_summary = result && strncmp(result, "wrote ", 6) == 0;
+	int is_summary = result && (strncmp(result, "wrote ", 6) == 0 ||
+	                            strncmp(result, "no change", 9) == 0);
 	if (E.pipe_mode) {
 		char display[256];
 		if (is_err || is_summary) snprintf(display, sizeof(display), "%s", result ? result : "error");
@@ -5102,6 +5268,7 @@ static void *aiWorkerThread(void *arg) {
 	int repaired = 0;	/* one write-repair nudge per turn */
 	char **xseen = NULL; int xseen_n = 0, xseen_cap = 0;	/* turn-scoped (name,args) dedup */
 	int loop_warned = 0;
+	hk_turn_edited_n = 0;	/* reset per-turn edited-path set (over-run guard) */
 
 	while (iter++ < max_iters) {
 		data->turn_index++;
@@ -6089,6 +6256,21 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "provider", cmdlen) == 0 && cmdlen == 8) {
+		char provpick[32];
+		if (!arg || !*arg) {
+			/* Bare → interactive picker. Cancel falls through to "show current". */
+			static const char *provs[] = {
+				"mithraeum", "anthropic", "openai", "gemini", "ollama", "groq",
+				"cerebras", "deepseek", "mistral", "together", "fireworks",
+				"openrouter", "xai", "custom"
+			};
+			int pn = (int)(sizeof(provs) / sizeof(provs[0]));
+			int cur = 0;
+			const char *active = hkProviderName(E.ai_provider_type);
+			for (int i = 0; i < pn; i++) if (!strcmp(provs[i], active)) { cur = i; break; }
+			int pick = clPopupSelect("provider", provs, pn, cur, NULL);
+			if (pick >= 0) { snprintf(provpick, sizeof provpick, "%s", provs[pick]); arg = provpick; }
+		}
 		if (arg && *arg) {
 			enum aiProviderType t = hkParseProvider(arg);
 			if (t == AI_PROVIDER_NONE) {
@@ -6261,11 +6443,19 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	}
 	if (strncmp(cmd, "theme", cmdlen) == 0 && cmdlen == 5) {
 		if (!arg || !*arg) {
-			char msg[256];
-			int o = snprintf(msg, sizeof(msg), "theme: %s — available:", TH_ACTIVE);
-			for (int i = 0; i < TH_PRESET_COUNT && o < (int)sizeof(msg) - 16; i++) {
-				o += snprintf(msg + o, sizeof(msg) - o, " %s", TH_PRESETS[i].name);
+			/* No arg → interactive picker (live swatches). Piped/no-color falls
+			   back to a numbered prompt inside clPopupSelect. */
+			const char *names[16];
+			int cur = 0;
+			for (int i = 0; i < TH_PRESET_COUNT && i < 16; i++) {
+				names[i] = TH_PRESETS[i].name;
+				if (!strcmp(TH_PRESETS[i].name, TH_ACTIVE)) cur = i;
 			}
+			int pick = clPopupSelect("theme", names, TH_PRESET_COUNT, cur, clThemePreview);
+			if (pick < 0) { aiAddHistory(data, "theme: unchanged"); return 1; }
+			clThemeApply(names[pick]);
+			hkSaveSession();
+			char msg[64]; snprintf(msg, sizeof(msg), "theme: %s (saved)", TH_ACTIVE);
 			aiAddHistory(data, msg);
 			return 1;
 		}
@@ -6520,6 +6710,8 @@ static void clLoadRc(void) {
 /*** init / cleanup ***/
 static void clInitConfig(void) {
 	memset(&E, 0, sizeof(E));
+	clDetectTruecolor();   /* before any clThemeApply so tokens convert if needed */
+	clThemeApply(TH_ACTIVE);   /* bake palette for the detected color mode (rc may re-apply) */
 	E.ai_provider_type = AI_PROVIDER_NONE;
 	E.ai_temperature = 70;
 	E.ai_max_tokens = 2048;
@@ -7919,6 +8111,133 @@ static int clCellWidth(const char *s) {
 	return n;
 }
 
+/* Reusable arrow-key popup picker. Themed box, ↑/↓ (or k/j) to move, enter to
+   select, esc / q / ^C to cancel. Returns the chosen index, or -1 cancelled.
+   Redraws in place and erases itself on exit (caller prints the outcome line).
+   No tty → numbered text prompt. `preview` (nullable) writes a short, optionally
+   ANSI-colored hint per row (e.g. a theme swatch). */
+static int clPopupSelect(const char *title, const char **items, int n,
+                         int cur, clPopupPreview preview) {
+	if (n <= 0) return -1;
+	if (cur < 0 || cur >= n) cur = 0;
+
+	if (!isatty(STDIN_FILENO) || !E.color_enabled || clEnableRaw() != 0) {
+		printf("%s:\n", title ? title : "select");
+		char pv[128];
+		for (int i = 0; i < n; i++) {
+			if (preview) { preview(i, pv, sizeof pv); printf("  %d) %-14s %s\n", i + 1, items[i], pv); }
+			else printf("  %d) %s\n", i + 1, items[i]);
+		}
+		char line[32];
+		printf("  pick [1-%d]: ", n); fflush(stdout);
+		if (!fgets(line, sizeof line, stdin)) return -1;
+		int pick = atoi(line);
+		return (pick >= 1 && pick <= n) ? pick - 1 : -1;
+	}
+
+	/* Inner width = widest of title and every "  › item  preview" row. */
+	char pv[128];
+	int inner = clCellWidth(title ? title : "") + 2;
+	for (int i = 0; i < n; i++) {
+		int w = 4 + (int)strlen(items[i]);
+		if (preview) { preview(i, pv, sizeof pv); w += 2 + clCellWidth(pv); }
+		if (w > inner) inner = w;
+	}
+	if (inner > 64) inner = 64;
+	if (inner < 18) inner = 18;
+
+	int drawn = 0, result = -1;
+	for (;;) {
+		/* Box is n+3 lines (top + n rows + bottom + hint); the hint has no trailing
+		   newline so the cursor rests ON the last line — rise n+2 to reach the top. */
+		if (drawn) { char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", n + 2); if (write(STDOUT_FILENO, up, k) < 0) {} }
+
+		/* Top border with embedded title: ╭─ title ──────╮ */
+		if (E.color_enabled) fputs(TH_ACCENT, stdout);
+		fputs("\r╭─ ", stdout);
+		if (E.color_enabled) fputs(ANSI_BOLD, stdout);
+		fputs(title ? title : "", stdout);
+		if (E.color_enabled) { fputs(ANSI_RESET, stdout); fputs(TH_ACCENT, stdout); }
+		fputc(' ', stdout);
+		for (int i = clCellWidth(title ? title : "") + 3; i < inner; i++) fputs("─", stdout);
+		fputs("╮\x1b[K\n", stdout);
+
+		/* Rows. */
+		for (int i = 0; i < n; i++) {
+			int sel = (i == cur);
+			if (E.color_enabled) fputs(TH_ACCENT, stdout);
+			fputs("\r│", stdout);
+			if (E.color_enabled) fputs(sel ? TH_ACCENT : ANSI_RESET, stdout);
+			fputs(sel ? " › " : "   ", stdout);
+			if (E.color_enabled) fputs(sel ? ANSI_BOLD : TH_AI, stdout);
+			fputs(items[i], stdout);
+			if (E.color_enabled) fputs(ANSI_RESET, stdout);
+			int used = 3 + (int)strlen(items[i]);
+			if (preview) {
+				preview(i, pv, sizeof pv);
+				int gap = inner - used - clCellWidth(pv) - 1;
+				for (int g = 0; g < gap; g++) putchar(' ');
+				putchar(' ');
+				fputs(pv, stdout);
+				if (E.color_enabled) fputs(ANSI_RESET, stdout);
+				used = inner - 1;
+			}
+			for (int p = used; p < inner; p++) putchar(' ');
+			if (E.color_enabled) fputs(TH_ACCENT, stdout);
+			fputs("│\x1b[K\n", stdout);
+		}
+
+		/* Bottom + hint. */
+		if (E.color_enabled) fputs(TH_ACCENT, stdout);
+		fputs("\r╰", stdout);
+		for (int i = 0; i < inner; i++) fputs("─", stdout);
+		fputs("╯\x1b[K\n", stdout);
+		if (E.color_enabled) fputs(TH_META, stdout);
+		fputs("\r  ↑/↓ move · enter select · esc cancel\x1b[K", stdout);
+		if (E.color_enabled) fputs(ANSI_RESET, stdout);
+		fflush(stdout);
+		drawn = 1;
+
+		char c;
+		if (read(STDIN_FILENO, &c, 1) != 1) { result = -1; break; }
+		if (c == '\r' || c == '\n') { result = cur; break; }
+		if (c == 3 || c == 'q') { result = -1; break; }   /* ^C / q */
+		if (c == 'k') { if (cur > 0) cur--; continue; }
+		if (c == 'j') { if (cur < n - 1) cur++; continue; }
+		if (c == '\x1b') {
+			char s1;
+			if (read(STDIN_FILENO, &s1, 1) != 1) { result = -1; break; }  /* bare esc */
+			if (s1 != '[' && s1 != 'O') { result = -1; break; }
+			char s2;
+			if (read(STDIN_FILENO, &s2, 1) != 1) { result = -1; break; }
+			if (s2 == 'A') { if (cur > 0) cur--; }
+			else if (s2 == 'B') { if (cur < n - 1) cur++; }
+			continue;
+		}
+	}
+
+	clDisableRaw();
+	/* Erase the box: rise n+2 to the top line, clear all n+3 lines, return to top. */
+	{ char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", n + 2); if (write(STDOUT_FILENO, up, k) < 0) {} }
+	for (int i = 0; i < n + 3; i++) { if (write(STDOUT_FILENO, "\x1b[2K\n", 5) < 0) {} }
+	{ char up[16]; int k = snprintf(up, sizeof up, "\x1b[%dA\r", n + 3); if (write(STDOUT_FILENO, up, k) < 0) {} }
+	return result;
+}
+
+/* Popup preview: three swatches (accent / success / tool) in each theme's own
+   palette, so the picker shows the colors live as you scroll. */
+static void clThemePreview(int idx, char *out, size_t cap) {
+	if (!cap) return;
+	if (idx < 0 || idx >= TH_PRESET_COUNT || !E.color_enabled) { out[0] = '\0'; return; }
+	/* Snapshot the converted tokens (clColorToken shares a rotating buffer, so copy
+	   before the next call overwrites the slot). */
+	char accent[16], ok[16], tool[16];
+	snprintf(accent, sizeof accent, "%s", clColorToken(TH_PRESETS[idx].c[6]));
+	snprintf(ok,     sizeof ok,     "%s", clColorToken(TH_PRESETS[idx].c[5]));
+	snprintf(tool,   sizeof tool,   "%s", clColorToken(TH_PRESETS[idx].c[4]));
+	snprintf(out, cap, "%s██%s%s██%s%s██%s", accent, ANSI_RESET, ok, ANSI_RESET, tool, ANSI_RESET);
+}
+
 /* Themed box helpers — accent border, theme color content. */
 static void clBoxTop(int inner) {
 	if (E.color_enabled) fputs(TH_ACCENT, stdout);
@@ -8556,6 +8875,7 @@ static void clUsage(void) {
 	printf("  --no-color      disable ANSI color/animation\n");
 	printf("  --pipe          JSONL I/O mode for hako editor integration\n");
 	printf("  --compact       slim banner only\n");
+	printf("  --yolo          auto-approve every tool call (skip permission prompts)\n");
 	printf("  --debug         dump raw API responses to stderr\n");
 	printf("  -h --help       this help\n");
 	printf("  -v --version    print version\n");

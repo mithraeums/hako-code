@@ -18,3 +18,7 @@ hakoCLAW.res
 .hakoc/
 *.hakoc-pending
 *.dSYM/
+*.log
+
+# vhs recordings — internal tooling, not shipped (outputs live in the website repo)
+vhs/
