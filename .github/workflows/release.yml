@@ -3,7 +3,7 @@ name: release
 on:
   push:
     tags:
-      - "v0.1*"
+      - "v0.*"
       - "v[1-9]*"
   workflow_dispatch:
     inputs:
