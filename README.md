@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.0-b89656?style=flat-square&labelColor=14130f" alt="v0.2.0"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.1-b89656?style=flat-square&labelColor=14130f" alt="v0.2.1"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-c8c2b2?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -75,7 +75,7 @@
   for non-hako models.)
 - **13 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. `:login <name>` walks you through OAuth or hands you to the provider's console for an API key.
 - **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
-- **Theme presets + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a popup you arrow through, each row showing that theme's colors as live swatches. Same picker on bare `:provider`. Persisted in `~/.hakorc`. Truecolor where supported, 16-color fallback for the error chip in tmux without `RGB` passthrough.
+- **Theme presets + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a popup you arrow through, each row showing that theme's colors as live swatches. Same picker on bare `:provider` and `:model`. Persisted in `~/.hakorc`. Truecolor where supported, 16-color fallback for the error chip in tmux without `RGB` passthrough.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
 - **Trust-gated tools.** `read_file`, `list_dir`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (10s timeout), `read_skill`. Per-call `[y]/[n]/[a]` approval; untrusted dir = all tools refused. `:trust` once per project.
 - **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
@@ -178,13 +178,15 @@ hako --update           # check + atomic-replace if newer
 
 ```
 :help     :clear     :retry     :edit     :undo     :usage     :q
-:providers          :models      :provider <name>      :model <id>
+:providers   :models   :provider [<name>]   :model [<id>]   :theme [<name>]   :pull <model>
 :login [<prov>]     :logout [<prov>]     :accounts
 :history [local|global]
 :skills [reload]    :skill install <url>     :skill uninstall <name>
-:tools on|off       :toolgate on|off     :toolmode native|react     :trust [revoke]
-:sessions           :resume <id>     :session [new]
+:tools on|off   :toolgate on|off   :toolmode native|prose   :auto on|off   :mcp [reload]   :trust [revoke]
+:sessions [clear [all]]   :resume <id>     :session [new]
 ```
+
+Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; give an argument to set directly.
 
 **TAB** completes commands and provider names after `:login` / `:provider` / `:logout`.
 
@@ -248,7 +250,7 @@ First run in any directory asks for trust. Untrusted = no tool access at all.
 Some smaller / non-tool-tuned models (Mistral 7B, Phi-4, DeepSeek-R1 distills, smaller Gemma / Llama variants) don't reliably emit OpenAI/Anthropic function-calling JSON. Toggle ReAct mode:
 
 ```sh
-:toolmode react        # model emits <tool name="X">{...}</tool> blocks in prose
+:toolmode prose        # model emits <tool name="X">{...}</tool> blocks in prose (aliases: react, xml)
 :toolmode native       # back to native function-calling (default)
 ```
 
@@ -284,7 +286,16 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### v0.2.0 (Latest)
+### v0.2.1 (Latest)
+
+- **Whole-file writes no longer truncate** — the output cap defaulted to 2048 tokens, so a `write_file` of a ~150+ line file was cut off mid-stream; nothing landed, the model re-read the old file, thought it "reverted", and looped into corruption (it strangled *capable* models, not just small ones). Tool turns now floor at 8192 (Anthropic) / 4096 (others); a stop sequence means the ceiling is never spent on a completed write, so it's pure upside.
+- **Function-call-paren tool dialect** — small models that emit `read_skill(skill="x", path="y")` inside the tags (instead of JSON) now parse and run instead of looping; `read_skill` is also clarified so a 3B stops reaching for it to *create* files (it's `write_file` for that).
+- **`:model` arrow-key picker** — bare `:model` opens the same popup as `:theme` / `:provider` (installed local weights, or the curated cloud list for the active provider); numbered fallback when piped.
+- **`~/.hakorc` wins over stale global state** — a provider/model/etc. set in `~/.hakorc` is no longer clobbered by a leftover `~/.hako/state` default, so a fresh project dir behaves as its rc says. An explicit per-project choice still overrides.
+- **More tool-name + param aliases** — `write_to_file` / `save_file` / `execute_command` / `read_text_file` / `insert_edit_into_file` and `contents` / `code` / `filepath` params, so models trained on other agents' tool names still land.
+- **Small-model harness (make a 3B actually useful)** — **auto-orient**: when a local model answers a project request with no tool (asks *you* to do it, or refuses "I can't see files"), the harness runs `list_dir(".")` itself and hands back the result, so it starts from ground truth (gated so greetings never trigger it). Plus a smaller local tool set (dropped `edit_lines`/`read_skill` — a 3B misused them), a renewable repair-nudge budget, `max_iters` 6→8 (`HAKO_MAX_ITERS`), and a shape-only tool-call example so tiny models copy the structure without parroting the prose.
+
+### v0.2.0
 
 - **`edit_file` + `edit_lines`** — change part of a file without rewriting it; indentation-tolerant match + an over-run guard so a small model can't clobber its own edit.
 - **Local-model tool reliability** — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write/edit nudges, and brevity + anti-refusal prompt rules so small models actually use their tools.
@@ -311,10 +322,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history (v0.1.4 → present).
 - [x] `edit_file` (str_replace) + `edit_lines` (line-range) tools
 - [x] local-model tool reliability — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write nudges + fence-autowrite, `HAKO_CTX`
 - [x] MCP client (stdio JSON-RPC, `mcp__server__tool`, local-model visibility + fuzzy resolve)
-- [x] arrow-key popup picker (`:theme` / `:provider`, live swatches) — reusable for `:model` next
+- [x] arrow-key popup picker (`:theme` / `:provider` / `:model`, live swatches)
 - [ ] MCP client mode with Dynamic Client Registration
 - [ ] Inline SHA-256 to drop openssl runtime dep
-- [ ] Vim-style error codes + Buddy BLE companion approval gateway — v0.2
+- [ ] Vim-style error codes + Buddy BLE companion approval gateway
 
 <p align="center"><sub><b>—— VIII ——</b></sub></p>
 

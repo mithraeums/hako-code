@@ -3,6 +3,46 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.1] — 2026-06-30
+
+Incremental polish on top of v0.2.0. No behavior change for existing configs unless noted.
+
+### Added — bare `:model` arrow-key picker
+- Bare **`:model`** now opens the reusable `clPopupSelect` popup (the same one `:theme` and `:provider` already use) instead of only printing the current model. For the **mithraeum** provider it lists the installed `~/.hako/models/*/<id>.mlf2` weights; for a cloud provider it lists that provider's curated models. `:model <id>` still sets directly; non-tty (piped) still prints the current model.
+- Reuse, not duplication: the curated per-provider model table was hoisted to a single file-scope source (`HK_MODEL_SUGG` + `hkCuratedModels`) now shared by both `:models` (list) and the `:model` picker (`hkGatherModels`). Ollama's live `/api/tags` path stays in `:models` (no network duplicated into the picker).
+
+### Fixed — `~/.hakorc` no longer clobbered by a stale global state
+- A provider/model/endpoint/api-key/etc. explicitly set in **`~/.hakorc`** was being overwritten by a leftover default in the **global** `~/.hako/state` (loaded after the rc), so a fresh project dir could silently come up on a stale provider. The rc now **pins** the keys it sets; the global state skips a pinned key. An explicit **per-project** state (`~/.hako/projects/<cwd>/state`) still overrides the rc — that's a deliberate choice, not staleness.
+
+### Added — more tool-name + param aliases (models trained on other agents)
+- Tool names: `write_to_file`, `save_file`, `insert_edit_into_file`, `read_text_file`, `execute_command` now alias to the native tools (join the existing `bash`/`str_replace`/… table).
+- `write_file` params: also accept `contents` / `code` for the body and `filepath` / `file` for the path. Purely additive — distinctive names, no collisions.
+
+### Fixed — output token cap truncated whole-file writes (all models, not just small ones)
+- The default output cap was **2048 tokens**. A whole-file `write_file` emits the model's preamble prose *then* the entire file, so on anything ~150+ lines the file **truncated mid-`<write_file>`** — nothing landed, the model re-read the file, saw the old content, hallucinated "it reverted", and looped rewriting → escalating corruption. Observed live: a fully-capable Claude Haiku burned **15 turns** on a ~170-line pong that it could have one-shot.
+- **Fix:** raise the ceiling on tool turns — Anthropic **8192**, other cloud / ollama **4096**, local `hakm` **3072** (default chat cap 2048 → 4096). A **stop sequence** (`</write_file>` / `</tool_call>`) ends the turn, so a high ceiling is *never spent* on a completed write — it only prevents truncation (the model's own higher `ai_max_tokens` is always kept). The local cap is kept lower than cloud's on purpose: a CPU-only 3B runs ~8 tok/s and its generation isn't streamed, so an over-large ceiling just freezes the spinner and pegs the fan; 3072 keeps a normal file whole without the grind (a local 3B rarely writes cloud-sized files).
+
+### Added — function-call-paren tool dialect + read_skill disambiguation
+- Small models sometimes emit a tool call as `name(k="v", k2="v2")` **inside** the tags — e.g. `<tool>read_skill(skill="tetris", path="tetris.py")</tool>` — instead of JSON. This parsed in **zero** passes, so it printed as prose and the model looped re-emitting it. New converter (`hkParenArgsToJson`) turns the paren form into `{"k":"v",...}` and runs it; wired into both the bare-`<tool>` and `<tool_call>` passes (values may be `"`/`'` quoted or bare; commas inside quotes handled; a body with no `key=value` falls through so prose can't false-trigger). Refactored the shared dedup+announce+exec+observation boilerplate into one `hkRunOneTool` helper.
+- **`read_skill` over-triggering:** a 3B asked to "create a tetris game" reached for `read_skill("tetris", …)` (pattern-matching *game* → *skill*). Its tool description + the local prompt now state plainly that `read_skill` only reads files inside an already-installed skill and **cannot create anything — use `write_file` for new files/programs.**
+
+### Added — `:sessions clear` + sharper autocomplete
+- **`:sessions clear`** wipes this project's session logs (`history.jsonl` + `sessions/<sid>.jsonl`) and drops you into a fresh session; **`:sessions clear all`** does it for every project. Credentials, provider/model state, and trust are never touched — only chat logs. (`hkClearSessions`.)
+- **Autocomplete** — the ghost-text prediction and TAB completion now read **one shared, complete command list** (`HK_COLON_CMDS`), so previously-missing commands (`:auto`, `:mcp`, `:exit`, `:q`) predict/complete too. The ghost now waits until you've typed **two** characters past the `:` (e.g. `:he`, not `:h`) so the suggestion is right more often and flickers less.
+
+### Added — auto-orient + smaller local tool surface (make a 3B useful, structurally)
+- **Auto-orient.** When a local model answers an actionable project request with **no tool call** — it asks *you* to do it, or refuses ("I can't see files on your system") — the harness now runs **`list_dir(".")` itself** and feeds the result back as an observation, so the model starts the next step from ground truth instead of a wrong premise. Once per turn, first-move only, trust required (the listing still passes the `[y]/[n]/[a]` gate). An intent gate (`hkLooksActionable`) fires on project work and *not* on greetings/concept questions — `"hey there"` can't false-trigger. The philosophy: don't beg a 3B to decide, hand it the observation.
+- **Smaller local tool surface.** Dropped `edit_lines` and `read_skill` from the **local** (Qwen) prompt — a 3B misused `edit_lines` (line ranges past EOF) and hallucinated `read_skill` to "create" files. Fewer choices, fewer derails; both tools still exist and run for capable/cloud models. Local set is now `read_file` · `list_dir` · `write_file` · `edit_file` · `run_shell`.
+- **Anti-refusal / "here" hardening (RULE 1 + 4).** "Work on / fix / improve / style / showcase **the website/site/project/app**" is now an explicit action → `list_dir(".")` first; "here / this folder / our website" always means the current directory (never ask its name or ask the user to list it); "I can't see or interact with files on your system" joined the banned-phrase list, and "when the user says you *can* see it, that's your cue to call the tool NOW."
+
+### Changed — small-model harness (get tiny models across the finish line)
+- **Renewable repair-nudge budget.** The one-repair-per-turn nudge now **renews after any successful tool call**, so a small model on a multi-step task (read → edit → run → confirm) that needed a nudge early can still get one at a *later* stall. It still can't loop: with no tool run between nudges, `repaired` stays set and the turn breaks after a single nudge.
+- **More tool round-trips per turn** — `max_iters` 6 → **8** (override `HAKO_MAX_ITERS`), since each step on a local model costs an observation round-trip.
+- **Concrete worked example in the local (Qwen) prompt** — a short two-step demonstration (`<tool_call>` read → observation → `<write_file>`) added to `QWEN_TOOL_PROMPT`. Small models copy patterns more reliably than they follow prose rules; the example is fenced as format-only ("never reuse these values") and lives in the system prompt (on-distribution for the Qwen SFT, separate from conversation history so it can't poison replies).
+
+### Chore — discoverability
+- `:help` now advertises that bare `:provider` / `:model` / `:theme` open the arrow-key picker, and lists `:theme` (previously omitted).
+
 ## [v0.2.0] — 2026-06-07 → 2026-06-20
 
 ### Added — `edit_file` + `edit_lines` (change part of a file, don't rewrite it)
@@ -24,6 +64,7 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - **History budget** — the redundant ``` fence is stripped from the *stored* assistant message when the same response also wrote the file (display unchanged), halving the file's token cost in context.
 - **Over-run / re-dump guard.** After a successful `edit_file`/`edit_lines`, a small model often keeps going and re-dumps the *whole* file via `write_file` (reflowing tabs→spaces, clobbering the edit, looping to the iteration cap). A turn-scoped set (`hkWasEditedThisTurn`) plus a whitespace-insensitive content compare (`hkContentLooseEqFile`) detects the redundant rewrite, **skips the write so the edit survives**, and returns a "fix applied — confirm and stop" observation. Live: edit lands, re-dump skipped, tab preserved, the model says "fixed" and stops.
 - **Brevity directive (RULE 3).** The local system prompt now tells the model to skip preamble ("Sure, I'll…") and step narration, confirm in one short line after a tool, and not re-paste file contents — trims the 3B's natural chattiness without touching tool behavior.
+- **Tool-call SHAPE demo (not a narrated example).** The local Qwen prompt shows the `<tool_call>` / `<write_file>` *structure* with placeholders (`RELATIVE/PATH.ext`, `…the complete file content…`) and no `user:`/`assistant:` narration. An earlier draft used a fully-narrated example (`create run.sh` → `assistant: Created run.sh.`); a 3B **parroted the prose**, printing "Created run.sh." and claiming a file it never wrote. Dropping the narration + an explicit "never say you created a file unless you emitted its tool call and saw its observation" line fixes the false-write hallucination.
 
 ### Added — bigger local context
 - **`HAKO_CTX` env**, default raised **4096 → 8192**. Qwen2.5-3B is GQA (`n_kv_heads=2`, `kv_dim=256`) so the KV cache is small (~300MB f32 @ 4096); **16384** fits the 8GB box and ends the recurring "context full — dropped oldest" spirals (which were also the source of the fan/heat — re-prefill thrash, not the model).

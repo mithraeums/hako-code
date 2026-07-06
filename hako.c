@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define HAKO_VERSION "0.2.0"
+#define HAKO_VERSION "0.2.1"
 
 /* GitHub Copilot OAuth + API constants. Public client_id from VS Code Copilot extension.
    Defined here so hkBuildCurlCmd (earlier in file) can reference the Editor-* headers. */
@@ -935,6 +935,54 @@ static void hkSessionLogPath(char *out, size_t n) {
 	snprintf(out, n, "%s/%s.jsonl", sess_dir, E.session_id);
 }
 
+/* Delete one project's session logs — history.jsonl + every sessions/<sid>.jsonl.
+   Leaves state / trust / credentials untouched. Returns files removed. */
+static int hkClearSessionsInDir(const char *pdir) {
+	int removed = 0;
+	char hp[PATH_MAX + 32];
+	snprintf(hp, sizeof(hp), "%s/history.jsonl", pdir);
+	if (unlink(hp) == 0) removed++;
+	char sdir[PATH_MAX + 32];
+	snprintf(sdir, sizeof(sdir), "%s/sessions", pdir);
+	DIR *d = opendir(sdir);
+	if (d) {
+		struct dirent *e;
+		while ((e = readdir(d))) {
+			if (e->d_name[0] == '.') continue;
+			char f[PATH_MAX + 64];
+			snprintf(f, sizeof(f), "%s/%s", sdir, e->d_name);
+			if (unlink(f) == 0) removed++;
+		}
+		closedir(d);
+	}
+	return removed;
+}
+
+/* Clear session logs for the current project, or every project when all!=0.
+   Never touches credentials / provider state. Returns total files removed. */
+static int hkClearSessions(int all) {
+	if (!all) {
+		char dir[PATH_MAX];
+		if (!hkProjectStateDir(dir, sizeof(dir))) return 0;
+		return hkClearSessionsInDir(dir);
+	}
+	const char *home = getenv("HOME"); if (!home) home = ".";
+	char base[PATH_MAX];
+	snprintf(base, sizeof(base), "%s/.hako/projects", home);
+	DIR *d = opendir(base);
+	if (!d) return 0;
+	int removed = 0;
+	struct dirent *e;
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.') continue;
+		char pdir[PATH_MAX + 64];
+		snprintf(pdir, sizeof(pdir), "%s/%s", base, e->d_name);
+		removed += hkClearSessionsInDir(pdir);
+	}
+	closedir(d);
+	return removed;
+}
+
 static int hkResolveInProject(const char *path, char *out_full, size_t out_cap) {
 	if (!path || !*path) return -1;
 	char cwd[PATH_MAX];
@@ -1461,6 +1509,16 @@ static void hkSaveSession(void) {
 	}
 }
 
+/* Keys the user pinned in ~/.hakorc. The GLOBAL ~/.hako/state (last-used
+   defaults) must not clobber these — otherwise a stale global ai_provider
+   surprises a fresh project dir whose .hakorc says otherwise. PROJECT state
+   (an explicit per-dir choice) still overrides. Set by clLoadRc, honored by
+   hkLoadSessionFile when allow_session_fields==0 (global). */
+static struct {
+	unsigned provider : 1, model : 1, endpoint : 1, api_key : 1,
+	         max_tokens : 1, tools : 1, stream : 1, auto_approve : 1;
+} hk_rc_pin;
+
 static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 	FILE *fp = fopen(path, "r");
 	if (!fp) return;
@@ -1471,16 +1529,22 @@ static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 		char *eq = strchr(line, '='); if (!eq) continue;
 		*eq = '\0';
 		char *key = line, *val = eq + 1;
+		/* Global state (allow_session_fields==0) must not stomp an rc pin. */
+		int rc_locked = !allow_session_fields;
 		if (strcmp(key, "ai_provider") == 0) {
+			if (rc_locked && hk_rc_pin.provider) continue;
 			enum aiProviderType t = hkParseProvider(val);
 			if (t != AI_PROVIDER_NONE) E.ai_provider_type = t;
 		} else if (strcmp(key, "ai_model") == 0) {
+			if (rc_locked && hk_rc_pin.model) continue;
 			free(E.ai_model);
 			E.ai_model = strdup(val);
 		} else if (strcmp(key, "ai_endpoint") == 0) {
+			if (rc_locked && hk_rc_pin.endpoint) continue;
 			free(E.ai_endpoint);
 			E.ai_endpoint = strdup(val);
 		} else if (strcmp(key, "ai_api_key") == 0) {
+			if (rc_locked && hk_rc_pin.api_key) continue;
 			free(E.ai_api_key);
 			E.ai_api_key = strdup(val);
 		} else if (strcmp(key, "ai_oauth_provider") == 0) {
@@ -1492,6 +1556,7 @@ static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 		} else if (strcmp(key, "ai_oauth_expires_at") == 0) {
 			E.ai_oauth_expires_at = atol(val);
 		} else if (strcmp(key, "ai_tools_enabled") == 0) {
+			if (rc_locked && hk_rc_pin.tools) continue;
 			E.ai_tools_enabled = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_tool_gate") == 0) {
 			E.ai_tool_gate = atoi(val) ? 1 : 0;
@@ -1500,10 +1565,13 @@ static void hkLoadSessionFile(const char *path, int allow_session_fields) {
 		} else if (strcmp(key, "theme") == 0) {
 			clThemeApply(val);
 		} else if (strcmp(key, "ai_stream") == 0) {
+			if (rc_locked && hk_rc_pin.stream) continue;
 			E.ai_stream = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_auto_approve") == 0) {
+			if (rc_locked && hk_rc_pin.auto_approve) continue;
 			E.ai_auto_approve = atoi(val) ? 1 : 0;
 		} else if (strcmp(key, "ai_max_tokens") == 0) {
+			if (rc_locked && hk_rc_pin.max_tokens) continue;
 			E.ai_max_tokens = atoi(val);
 		} else if (allow_session_fields && strcmp(key, "session_id") == 0) {
 			free(E.session_id);
@@ -1834,9 +1902,7 @@ static int hkLoadSkills(aiData *data) {
 		"{\"type\": \"function\", \"function\": {\"name\": \"list_dir\", \"description\": \"List directory entries; use \\\".\\\" for the project root\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}}, \"required\": [\"path\"]}}}\n"
 		"{\"type\": \"function\", \"function\": {\"name\": \"write_file\", \"description\": \"Create or overwrite a WHOLE file. For small changes to an existing file use edit_file instead\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, \"required\": [\"path\", \"content\"]}}}\n"
 		"{\"type\": \"function\", \"function\": {\"name\": \"edit_file\", \"description\": \"Change PART of an existing file: replace the exact unique snippet 'old' with 'new'. Use this for fixes instead of rewriting the whole file\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old\": {\"type\": \"string\"}, \"new\": {\"type\": \"string\"}}, \"required\": [\"path\", \"old\", \"new\"]}}}\n"
-		"{\"type\": \"function\", \"function\": {\"name\": \"edit_lines\", \"description\": \"Replace an inclusive 1-indexed line range [start,end] with 'new' text. Use when you know the line number, e.g. from a traceback\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"start\": {\"type\": \"integer\"}, \"end\": {\"type\": \"integer\"}, \"new\": {\"type\": \"string\"}}, \"required\": [\"path\", \"start\", \"new\"]}}}\n"
 		"{\"type\": \"function\", \"function\": {\"name\": \"run_shell\", \"description\": \"Run a non-interactive shell command in the project, 10 second timeout\", \"parameters\": {\"type\": \"object\", \"properties\": {\"cmd\": {\"type\": \"string\"}}, \"required\": [\"cmd\"]}}}\n"
-		"{\"type\": \"function\", \"function\": {\"name\": \"read_skill\", \"description\": \"Read a file inside an installed skill\", \"parameters\": {\"type\": \"object\", \"properties\": {\"skill\": {\"type\": \"string\"}, \"path\": {\"type\": \"string\"}}, \"required\": [\"skill\", \"path\"]}}}\n"
 		"</tools>\n"
 		"\n"
 		"For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
@@ -1848,13 +1914,26 @@ static int hkLoadSkills(aiData *data) {
 		"<write_file path=\"relative/path.ext\">\n"
 		"the complete file content, exactly as it belongs on disk, with real newlines and no escaping\n"
 		"</write_file>\n"
-		"Use <write_file> for EVERY whole-file write. read_file, list_dir, run_shell, edit_file, edit_lines still use <tool_call>.\n"
+		"Use <write_file> for EVERY whole-file write. read_file, list_dir, run_shell, edit_file still use <tool_call>.\n"
 		"\n"
-		"To CHANGE an existing file (e.g. fix one line after an error), do NOT rewrite the whole file — call edit_file with the exact 'old' snippet and the 'new' replacement, or edit_lines with the line number. Rewriting the whole file each time wastes space and loses your earlier work.\n"
+		"To CHANGE an existing file (e.g. fix one line after an error), do NOT rewrite the whole file — call edit_file with the exact 'old' snippet and the 'new' replacement. Rewriting the whole file each time wastes space and loses your earlier work.\n"
 		"\n"
 		"To write a file, reply with ONLY the <write_file> block and put the content inside it exactly once. The block itself is how you show the code — no need to also paste it in a separate ``` block.\n"
 		"\n"
+		"# Tool-call SHAPE (structure only — always act on the user's real request, never these placeholders):\n"
+		"# read a file or list a dir:\n"
+		"<tool_call>\n"
+		"{\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}\n"
+		"</tool_call>\n"
+		"# create/overwrite a file — the body goes RAW between the tags, no JSON escaping:\n"
+		"<write_file path=\"RELATIVE/PATH.ext\">\n"
+		"...the complete file content...\n"
+		"</write_file>\n"
+		"After a tool runs, the system sends back <observation tool=\"...\">RESULT</observation>; only THEN reply, in one short line. Do NOT write 'user:' or 'assistant:' lines yourself, do NOT invent a filename from the examples, and NEVER say you created or ran a file unless you actually emitted its tool call this turn and saw its observation.\n"
+		"\n"
 		"When the user asks you to create, read, list, run, or change something in their project, CALL the matching function — do NOT describe manual steps instead. Emit the tool call FIRST, then stop and wait for the result before saying anything else.\n"
+		"\n"
+		"To CREATE a program or file (a game, a script, anything new), use write_file with the actual code as its body. That is the only way to make a new file — do not invent any other tool for it.\n"
 		"\n";
 
 	/* Prepend tool-use guidance. Small models (llama3.2, qwen2.5-small) tend to
@@ -1863,7 +1942,7 @@ static int hkLoadSkills(aiData *data) {
 	static const char *BASE_PROMPT =
 		"You are hako-code, a terminal AI agent.\n"
 		"\n"
-		"RULE 1: Call a tool whenever the user wants you to read, list, write, or run something in the project — INCLUDING polite forms like \"can you create…\", \"could you read…\", \"would you make…\", \"please write…\". Those are requests to DO it, not questions. ALSO an action: any mention of a file by name, or asking why something isn't working / to debug / check / look at / find / search it — READ or LIST it first, don't ask the user about it. Only greetings and GENERAL concept questions with no project file involved (\"what is recursion?\", \"how does a hashmap work?\") get a plain-text reply with no tool call.\n"
+		"RULE 1: Call a tool whenever the user wants you to read, list, write, or run something in the project — INCLUDING polite forms like \"can you create…\", \"could you read…\", \"would you make…\", \"please write…\". Those are requests to DO it, not questions. ALSO an action: any mention of a file by name, or asking why something isn't working / to debug / check / look at / find / search it — READ or LIST it first, don't ask the user about it. Asking you to work on / fix / improve / set up / style / showcase / build out \"the website / site / project / app / code / this\" is ALSO an action: your FIRST move is list_dir(\".\") to see what's there. The words \"here\", \"this folder\", \"this directory\", \"this project\", \"our website\" ALWAYS mean the current directory — call list_dir(\".\"); NEVER ask the user its name, where it is, or to list it for you. Only greetings and GENERAL concept questions with no project file involved (\"what is recursion?\", \"how does a hashmap work?\") get a plain-text reply with no tool call.\n"
 		"\n"
 		"RULE 2: All paths are RELATIVE to the current project. Use \".\" for the project root. NEVER use absolute paths like /home/..., /Users/..., /root/..., /tmp/.... Those paths do NOT exist here and every call will fail.\n"
 		"\n"
@@ -1876,6 +1955,8 @@ static int hkLoadSkills(aiData *data) {
 		"  user: \"why isn't pong.py working?\"   -> read_file(path=\"pong.py\")\n"
 		"  user: \"it's in this directory\"       -> list_dir(path=\".\")\n"
 		"  user: \"search the directory / use ls\" -> list_dir(path=\".\")\n"
+		"  user: \"fix our website here\"          -> list_dir(path=\".\")\n"
+		"  user: \"you're able to see it yourself\" -> list_dir(path=\".\")\n"
 		"\n"
 		"Examples — do NOT call tools:\n"
 		"  user: \"hello\"                     -> plain text reply\n"
@@ -1885,7 +1966,7 @@ static int hkLoadSkills(aiData *data) {
 		"\n"
 		"RULE 3: Be brief. No preamble (\"Sure, I'll…\", \"Let me…\") and no narrating steps. Emit the tool call, and after it runs confirm in ONE short line — or just go straight to the next tool. Do NOT re-paste file contents or explain your work unless the user asks.\n"
 		"\n"
-		"RULE 4: You are a real agent with WORKING tools on THIS machine. NEVER ask the user to paste, provide, or share a file's contents — you have read_file, so read it yourself. NEVER say \"as an AI language model\", \"I don't have access to your files\", or \"I can't search\" — you CAN: call read_file / list_dir / run_shell. If you already tried to ask for contents and the user pushes back, stop apologizing and CALL THE TOOL.\n"
+		"RULE 4: You are a real agent with WORKING tools on THIS machine. NEVER ask the user to paste, provide, or share a file's contents — you have read_file, so read it yourself. NEVER say \"as an AI language model\", \"I don't have access to your files\", \"I can't see or interact with files on your system\", or \"I can't search\" — every one of those is FALSE here: you CAN, by calling read_file / list_dir / run_shell. When the user says you CAN see it / you're able to look yourself, they are right — that is your cue to call list_dir(\".\") or read_file NOW, not to deny it. If you already asked for contents and the user pushes back, stop apologizing and CALL THE TOOL.\n"
 		"\n"
 		"If a tool returns \"error: path outside project\", do NOT retry with another absolute path. Either use \".\" or stop and reply in text.\n";
 	/* Probe common interpreters / build tools once per process. Embed in system
@@ -3200,7 +3281,10 @@ static char *hkExecTool(const char *name, const char *input_json) {
 	struct { const char *from; const char *to; } aliases[] = {
 		{"create_file",  "write_file"},
 		{"writefile",    "write_file"},
+		{"write_to_file","write_file"},
+		{"save_file",    "write_file"},
 		{"write",        "write_file"},
+		{"insert_edit_into_file", "edit_file"},
 		{"edit",         "edit_file"},
 		{"editfile",     "edit_file"},
 		{"replace",      "edit_file"},
@@ -3213,6 +3297,7 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		{"editlines",    "edit_lines"},
 		{"replace_lines","edit_lines"},
 		{"readfile",     "read_file"},
+		{"read_text_file","read_file"},
 		{"read",         "read_file"},
 		{"view",         "read_file"},
 		{"cat",          "read_file"},
@@ -3229,6 +3314,7 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		{"exec",         "run_shell"},
 		{"run",          "run_shell"},
 		{"run_command",  "run_shell"},
+		{"execute_command", "run_shell"},
 		{NULL, NULL}
 	};
 	for (int i = 0; aliases[i].from; i++) {
@@ -3343,11 +3429,15 @@ static char *hkExecTool(const char *name, const char *input_json) {
 		char *path = hkExtractJsonString(input_json, "path");
 		if (!path) path = hkExtractJsonString(input_json, "file_path");
 		if (!path) path = hkExtractJsonString(input_json, "filename");
+		if (!path) path = hkExtractJsonString(input_json, "filepath");
+		if (!path) path = hkExtractJsonString(input_json, "file");
 		char *content_raw = hkExtractJsonString(input_json, "content");
+		if (!content_raw) content_raw = hkExtractJsonString(input_json, "contents");
 		if (!content_raw) content_raw = hkExtractJsonString(input_json, "file_text");
 		if (!content_raw) content_raw = hkExtractJsonString(input_json, "new_str");
 		if (!content_raw) content_raw = hkExtractJsonString(input_json, "text");
 		if (!content_raw) content_raw = hkExtractJsonString(input_json, "body");
+		if (!content_raw) content_raw = hkExtractJsonString(input_json, "code");
 		if (!content_raw) content_raw = hkExtractJsonString(input_json, "data");
 		if (!path && !content_raw) return strdup("error: write_file needs both 'path' (or file_path) and 'content' params (got neither)");
 		if (!path) { free(content_raw); return strdup("error: write_file missing 'path' param"); }
@@ -3588,11 +3678,21 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 	const char *endpoint = E.ai_endpoint;
 	const char *model = E.ai_model;
 	const char *api_key = E.ai_api_key;
-	int max_tokens = E.ai_max_tokens > 0 ? E.ai_max_tokens : 2048;
-	/* Tool calls (prose XML or native) need room to finish — a tiny cap (e.g. a
-	   speed knob set for local chat) truncates them mid-call → unparseable +
-	   suppressed → looks like an empty response. Floor it when tools are on. */
-	if (E.ai_tools_enabled && max_tokens < 1024) max_tokens = 1024;
+	int max_tokens = E.ai_max_tokens > 0 ? E.ai_max_tokens : 4096;
+	/* Tool calls (prose XML or native) need real output room or they truncate
+	   mid-<write_file> — the model emits preamble prose THEN the whole file, so a
+	   low cap eats the budget before the file even starts, and the retry truncates
+	   at the same wall (observed: a 2048 cap turned a fully-capable Claude into a
+	   15-turn "cut off / revert / corrupt" loop rewriting a ~170-line file).
+	   Because a stop sequence (</write_file> / </tool_call>) ends the turn, a high
+	   ceiling is NEVER spent on a completed write — it only prevents truncation, so
+	   floor it generously on tool turns. Anthropic supports 8k+ output; keep other
+	   providers at a safe 4k (some cap there and 400 on a larger request). User's
+	   own higher ai_max_tokens is always kept. */
+	if (E.ai_tools_enabled) {
+		int floor = (type == AI_PROVIDER_ANTHROPIC) ? 8192 : 4096;
+		if (max_tokens < floor) max_tokens = floor;
+	}
 
 	const char *sys = (data->system_prompt && *data->system_prompt) ? data->system_prompt : "";
 	char *sys_esc = NULL;
@@ -3687,7 +3787,7 @@ static char *aiBuildCurlCommand(aiData *data, enum aiProviderType type) {
 		   num_predict: cap generation so a runaway model doesn't burn minutes
 		   on a single turn. num_ctx kept at server default (model-dependent). */
 		int npred = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
-		if (tools_on && npred < 2048) npred = 2048;   /* writes need room before </write_file>; stop seq means surplus is never spent */
+		if (tools_on && npred < 4096) npred = 4096;   /* whole file must fit before </write_file>; 2048 truncated real files. stop seq means surplus is never spent, so this is a ceiling not a target */
 		if (tools_on) {
 			snprintf(body, bodycap,
 				"{\"model\":\"%s\",\"messages\":%s,\"stream\":false,\"keep_alive\":\"30m\",\"options\":{\"num_predict\":%d},\"tools\":%s}",
@@ -4146,6 +4246,99 @@ static void hkPushDupNotice(aiData *data, const char *name) {
 	pthread_mutex_unlock(&data->lock);
 }
 
+/* Dedup + announce + exec one (name,args) call and push its <observation>.
+   Returns 1 if it ran, 0 if squashed as a cross-turn repeat. Shared by the
+   parser passes so each new dialect doesn't re-copy the boilerplate. */
+static int hkRunOneTool(aiData *data, const char *name, const char *args,
+	char ***seenp, int *seen_np, int *seen_capp, int *dups) {
+	if (hkDupCall(seenp, seen_np, seen_capp, name, args)) {
+		hkPushDupNotice(data, name); if (dups) (*dups)++;
+		return 0;
+	}
+	hkAnnounceTool(data, name, args);
+	char *result = hkExecTool(name, args);
+	hkAnnounceToolResult(data, result);
+	size_t rlen = result ? strlen(result) : 0;
+	size_t nl = strlen(name);
+	char *obs = malloc(rlen + nl + 64);
+	if (obs) {
+		snprintf(obs, rlen + nl + 64, "<observation tool=\"%s\">%s</observation>",
+			name, result ? result : "");
+		pthread_mutex_lock(&data->lock);
+		aiPushMessage(data, "user", obs);
+		pthread_mutex_unlock(&data->lock);
+		free(obs);
+	}
+	free(result);
+	return 1;
+}
+
+/* Function-call-paren tool form small models emit instead of JSON:
+   `read_skill(skill="tetris", path="tetris.py")`. Fills nameout with the function
+   name and returns a malloc'd JSON args object `{"skill":"tetris",...}`, or NULL
+   if `s` has no `(...)`. Values may be "double"/'single' quoted or a bareword;
+   all emitted as JSON strings (the tool layer already tolerates quoted numbers). */
+static char *hkParenArgsToJson(const char *s, char *nameout, size_t namecap) {
+	const char *lp = strchr(s, '(');
+	if (!lp) return NULL;
+	const char *rp = strrchr(lp, ')');
+	if (!rp || rp <= lp) return NULL;
+	const char *ne = lp; while (ne > s && (ne[-1]==' '||ne[-1]=='\t')) ne--;
+	const char *ns = s;  while (ns < ne && (*ns==' '||*ns=='\t'||*ns=='\n'||*ns=='\r')) ns++;
+	size_t nlen = (size_t)(ne - ns);
+	if (nlen == 0 || nlen >= namecap) return NULL;
+	memcpy(nameout, ns, nlen); nameout[nlen] = '\0';
+
+	size_t inlen = (size_t)(rp - lp - 1);
+	size_t cap = inlen * 6 + 16;
+	char *json = malloc(cap);
+	if (!json) return NULL;
+	size_t jl = 0;
+	json[jl++] = '{';
+	const char *p = lp + 1;
+	int first = 1;
+	while (p < rp) {
+		while (p < rp && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p==',')) p++;
+		if (p >= rp) break;
+		const char *ks = p;
+		while (p < rp && *p != '=' && *p != ',') p++;
+		if (p >= rp || *p != '=') break;                 /* not key=value → stop */
+		const char *ke = p; while (ke > ks && (ke[-1]==' '||ke[-1]=='\t')) ke--;
+		p++;                                             /* skip '=' */
+		while (p < rp && (*p==' '||*p=='\t')) p++;
+		const char *vs, *ve;
+		if (p < rp && (*p=='"' || *p=='\'')) {
+			char q = *p; p++; vs = p;
+			while (p < rp && *p != q) { if (*p=='\\' && p+1 < rp) p++; p++; }
+			ve = p; if (p < rp) p++;                      /* skip closing quote */
+		} else {
+			vs = p;
+			while (p < rp && *p != ',') p++;
+			ve = p; while (ve > vs && (ve[-1]==' '||ve[-1]=='\t')) ve--;
+		}
+		if (ke == ks) continue;
+		if (!first && jl < cap-1) json[jl++] = ',';
+		first = 0;
+		if (jl < cap-1) json[jl++] = '"';
+		for (const char *k=ks; k<ke && jl<cap-2; k++) { char c=*k; if (c=='"'||c=='\\') json[jl++]='\\'; json[jl++]=c; }
+		if (jl < cap-3) { json[jl++]='"'; json[jl++]=':'; }
+		if (jl < cap-1) json[jl++] = '"';
+		for (const char *v=vs; v<ve && jl<cap-8; v++) {
+			char c=*v;
+			if (c=='"'||c=='\\') { json[jl++]='\\'; json[jl++]=c; }
+			else if (c=='\n') { json[jl++]='\\'; json[jl++]='n'; }
+			else if (c=='\r') { json[jl++]='\\'; json[jl++]='r'; }
+			else if (c=='\t') { json[jl++]='\\'; json[jl++]='t'; }
+			else json[jl++]=c;
+		}
+		if (jl < cap-1) json[jl++] = '"';
+	}
+	if (jl < cap-1) json[jl++] = '}';
+	json[jl] = '\0';
+	if (first) { free(json); return NULL; }              /* no key=value pairs found */
+	return json;
+}
+
 /* Parse + execute every tool/write block in a ReAct response, pushing an
    <observation> per call. Returns NEW execs (0 = final answer or pure repeat).
    xseen = turn-scoped (name,args) dedup set (caller-owned). *dups = cross-turn
@@ -4221,6 +4414,19 @@ static int hkReactToolExecAll(aiData *data, const char *content,
 		char *te = ts + strlen(ts);
 		while (te > ts && (te[-1]==' '||te[-1]=='\n'||te[-1]=='\r'||te[-1]=='\t')) te--;
 		*te = '\0';
+
+		/* Function-call-paren form inside the tag: <tool>name(k="v", ...)</tool>
+		   (no separate {json}). Common small-model output; parses in no other pass. */
+		if (strchr(ts, '(')) {
+			char pname[80];
+			char *pargs = hkParenArgsToJson(ts, pname, sizeof pname);
+			if (pargs) {
+				if (hkRunOneTool(data, pname, pargs, &seen, &seen_n, &seen_cap, dups)) count++;
+				free(pargs);
+				cursor = name_end + 7;
+				continue;
+			}
+		}
 
 		const char *p = name_end + 7;
 		while (*p && *p != '{' && *p != '<') p++;
@@ -4377,6 +4583,14 @@ static int hkReactToolExecAll(aiData *data, const char *content,
 				}
 				free(result);
 				count++;
+			}
+		} else if ((!tname || !*tname) && strchr(blk, '(')) {
+			/* <tool_call>name(k="v", ...)</tool_call> — paren form, not JSON. */
+			char pname[80];
+			char *pargs = hkParenArgsToJson(blk, pname, sizeof pname);
+			if (pargs) {
+				if (hkRunOneTool(data, pname, pargs, &seen, &seen_n, &seen_cap, dups)) count++;
+				free(pargs);
 			}
 		}
 		free(tname); free(targs); free(blk);
@@ -4663,6 +4877,79 @@ static char *hkMithraeumFirstAvailable(void) {
 	}
 	closedir(d);
 	return found;
+}
+
+/* Curated per-provider model starting points. Single source: :models list AND
+   the bare :model picker read this (hoisted from the old :models-local table). */
+static const struct { const char *prov, *models; } HK_MODEL_SUGG[] = {
+	{ "anthropic",      "claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5-20251001, claude-opus-4-0, claude-sonnet-4-0" },
+	{ "openai",         "gpt-4o, gpt-4o-mini, gpt-5, o1, o1-mini, gpt-4.1" },
+	{ "gemini",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro, gemini-1.5-flash" },
+	{ "google",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro" },
+	{ "groq",           "llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768" },
+	{ "cerebras",       "llama3.1-70b, llama3.1-8b, llama-3.3-70b" },
+	{ "deepseek",       "deepseek-chat, deepseek-reasoner" },
+	{ "mistral",        "mistral-large-latest, mistral-small-latest, codestral-latest" },
+	{ "together",       "meta-llama/Llama-3.3-70B-Instruct-Turbo, Qwen/Qwen2.5-72B-Instruct-Turbo" },
+	{ "fireworks",      "accounts/fireworks/models/llama-v3p1-70b-instruct, accounts/fireworks/models/qwen2p5-72b-instruct" },
+	{ "openrouter",     "anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.3-70b-instruct:free, deepseek/deepseek-chat:free" },
+	{ "xai",            "grok-2, grok-2-mini, grok-beta" },
+	{ "grok",           "grok-2, grok-2-mini, grok-beta" },
+};
+
+/* Resolve the curated model list for the active provider (honors copilot /
+   github-models OAuth aliases). Returns NULL when there's no curated list. */
+static const char *hkCuratedModels(void) {
+	const char *match = hkProviderName(E.ai_provider_type);
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) match = "copilot";
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) match = "github-models";
+	if (!strcmp(match, "copilot"))       return "gpt-4o, gpt-4o-mini, o1-mini, claude-3.5-sonnet, claude-3.7-sonnet";
+	if (!strcmp(match, "github-models")) return "gpt-4o, gpt-4o-mini, meta-llama-3-70b-instruct, mistral-large, microsoft/phi-3.5-mini";
+	for (size_t i = 0; i < sizeof(HK_MODEL_SUGG) / sizeof(HK_MODEL_SUGG[0]); i++)
+		if (!strcmp(HK_MODEL_SUGG[i].prov, match)) return HK_MODEL_SUGG[i].models;
+	return NULL;
+}
+
+/* Fill `out` with selectable model names for the active provider: installed
+   .mlf2 weights (mithraeum) or the curated list (cloud). Returns the count.
+   Powers the bare `:model` popup picker. Ollama's live /api/tags stays in
+   :models (no picker) to avoid duplicating the network path. */
+static int hkGatherModels(char out[][96], int max) {
+	int n = 0;
+	if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) {
+		const char *home = getenv("HOME"); if (!home) home = ".";
+		char mdir[1024];
+		snprintf(mdir, sizeof(mdir), "%s/.hako/models", home);
+		DIR *d = opendir(mdir);
+		if (d) {
+			struct dirent *de;
+			while ((de = readdir(d)) != NULL && n < max) {
+				if (de->d_name[0] == '.') continue;
+				char w[1300]; struct stat ws;
+				snprintf(w, sizeof(w), "%s/%s/%s.mlf2", mdir, de->d_name, de->d_name);
+				if (stat(w, &ws) != 0) continue;
+				snprintf(out[n], 96, "%s", de->d_name);
+				n++;
+			}
+			closedir(d);
+		}
+		return n;
+	}
+	const char *models = hkCuratedModels();
+	if (!models) return 0;
+	const char *p = models;
+	while (*p && n < max) {
+		while (*p == ' ') p++;
+		const char *e = strchr(p, ',');
+		if (!e) e = p + strlen(p);
+		int len = (int)(e - p);
+		if (len > 95) len = 95;
+		while (len > 0 && p[len - 1] == ' ') len--;
+		if (len > 0) { snprintf(out[n], 96, "%.*s", len, p); n++; }
+		if (!*e) break;
+		p = e + 1;
+	}
+	return n;
 }
 
 /* A model's weights may exist on disk but not where we look (~/.hako/models).
@@ -5084,7 +5371,14 @@ static char *hkMithraeumChat(aiData *data, char **err) {
 	   engine's KV cache holds it after the first turn. */
 	const char *sys = (data->system_prompt && *data->system_prompt) ? data->system_prompt : NULL;
 	int ntok = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
-	if (E.ai_tools_enabled && ntok < 2048) ntok = 2048;   /* writes need room: a whole file must fit before </write_file> (the stop means surplus is never wasted) */
+	/* Local ceiling is deliberately LOWER than cloud's (8192). On a CPU-only box a
+	   3B runs ~8 tok/s and generation is NOT streamed, so the spinner sits frozen
+	   for the whole turn — 4096 could grind ~8 min and peg the fan. The truncation
+	   that justified a big cap was a CLOUD model writing a 170-line file; a local 3B
+	   rarely writes anything that long, so 3072 keeps normal files whole while
+	   halving worst-case latency. A stop seq (</write_file>) ends well-behaved turns
+	   early regardless; set ai_max_tokens in ~/.hakorc to go lower/snappier. */
+	if (E.ai_tools_enabled && ntok < 3072) ntok = 3072;
 
 #ifndef _WIN32
 	size_t fl = 0;
@@ -5251,6 +5545,37 @@ static int hkClaimedWriteNoAct(const char *content, const char *ask) {
 	    || strstr(low, "not work") || strstr(low, "fail") || strstr(low, "wrong");
 }
 
+/* True when the user's message is project work (so a LOCAL model that replied
+   with NO tool call — asked the user to do it, or refused "I can't see files" —
+   gets auto-oriented: the harness runs list_dir(".") itself and feeds the result
+   back, so a 3B never has to *decide* to look). Broad on the act side but
+   excludes greetings and general concept questions, and uses " here" (with a
+   leading space) so "hey there" can't false-match. */
+static int hkLooksActionable(const char *ask) {
+	if (!ask || !*ask) return 0;
+	char low[1024]; size_t n = 0;
+	for (const char *p = ask; *p && n < sizeof(low) - 1; p++) {
+		char c = *p; low[n++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+	}
+	low[n] = '\0';
+	if (strstr(low, "what is") || strstr(low, "what are") || strstr(low, "how does")
+	    || strstr(low, "how do ") || strstr(low, "explain") || strstr(low, "difference between"))
+		return 0;
+	return strstr(low, "file") || strstr(low, "director") || strstr(low, "folder")
+	    || strstr(low, "project") || strstr(low, "website") || strstr(low, "site")
+	    || strstr(low, " code") || strstr(low, " app") || strstr(low, "readme")
+	    || strstr(low, "script") || strstr(low, " here") || strstr(low, "this dir")
+	    || strstr(low, "this folder") || strstr(low, "fix") || strstr(low, "creat")
+	    || strstr(low, "make ") || strstr(low, "build") || strstr(low, "add ")
+	    || strstr(low, "list") || strstr(low, " run") || strstr(low, "edit")
+	    || strstr(low, "update") || strstr(low, "change") || strstr(low, "show")
+	    || strstr(low, "look") || strstr(low, "check") || strstr(low, "read ")
+	    || strstr(low, "open ") || strstr(low, "debug") || strstr(low, "improve")
+	    || strstr(low, "style") || strstr(low, "showcase") || strstr(low, ".py")
+	    || strstr(low, ".js") || strstr(low, ".html") || strstr(low, ".md")
+	    || strstr(low, ".sh") || strstr(low, ".css") || strstr(low, ".c");
+}
+
 static void *aiWorkerThread(void *arg) {
 	aiData *data = (aiData *)arg;
 
@@ -5262,10 +5587,15 @@ static void *aiWorkerThread(void *arg) {
 	pthread_mutex_unlock(&data->lock);
 	free(prompt);
 
-	int max_iters = 6;
+	/* Tool round-trips per turn. Small models take more steps (read → edit → run →
+	   confirm) with an observation round-trip between each, so give headroom.
+	   Override with HAKO_MAX_ITERS for dogfooding. */
+	int max_iters = 8;
+	{ const char *mi = getenv("HAKO_MAX_ITERS"); if (mi && *mi) { int v = atoi(mi); if (v >= 1 && v <= 40) max_iters = v; } }
 	int iter = 0;
 	int used_tool = 0;
-	int repaired = 0;	/* one write-repair nudge per turn */
+	int repaired = 0;	/* nudge budget; renews on tool progress (see below) */
+	int oriented = 0;	/* auto-orient (harness list_dir) fired at most once per turn */
 	char **xseen = NULL; int xseen_n = 0, xseen_cap = 0;	/* turn-scoped (name,args) dedup */
 	int loop_warned = 0;
 	hk_turn_edited_n = 0;	/* reset per-turn edited-path set (over-run guard) */
@@ -5351,6 +5681,12 @@ static void *aiWorkerThread(void *arg) {
 					break;      /* already repaired — treat as final answer */
 				}
 				used_tool = 1;
+				/* Forward progress renews the one-nudge budget: a multi-step task
+				   (read → edit → run) that needed a repair early can still get one
+				   more at a LATER stall. A model that keeps stalling with no tool
+				   between nudges still breaks (repaired stays set until a tool runs),
+				   so this can't loop. */
+				repaired = 0;
 				continue;
 			}
 
@@ -5420,6 +5756,24 @@ static void *aiWorkerThread(void *arg) {
 				pthread_mutex_unlock(&data->lock);
 				free(content);
 				continue;
+			}
+
+			/* Auto-orient. The model answered with NO tool on an actionable project
+			   request — it asked us to do it, or refused ("I can't see files"). Rather
+			   than nudge a 3B into deciding, the harness lists the project ITSELF and
+			   feeds the result back, so the model starts the next iteration with ground
+			   truth instead of a wrong premise. Once per turn, first-move only, trust
+			   required (list_dir still hits the [y/n/a] gate). This is the deterministic
+			   lever that makes a 3B useful: don't beg it to look — hand it the listing. */
+			if (!oriented && !used_tool && *content && hkProjectTrusted()
+			    && hkLooksActionable(data->current_prompt)) {
+				oriented = 1;
+				if (hkRunOneTool(data, "list_dir", "{\"path\":\".\"}",
+				                 &xseen, &xseen_n, &xseen_cap, NULL)) {
+					used_tool = 1;
+					free(content);
+					continue;
+				}
 			}
 			free(content);
 			break;
@@ -5800,13 +6154,14 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 
 	if (strncmp(cmd, "help", cmdlen) == 0 && cmdlen == 4) {
 		aiAddHistory(data, ":help  :clear  :retry  :edit  :undo  :usage  :q");
-		aiAddHistory(data, ":providers  :models  :provider <name>  :model <id>  :pull <model>");
+		aiAddHistory(data, ":providers  :models  :provider  :model  :theme  (bare = arrow-key picker)");
+		aiAddHistory(data, ":provider <name>  :model <id>  :theme <name>  :pull <model>  (direct)");
 		aiAddHistory(data, ":login [<provider>]  :logout [<provider>]  :accounts");
 		aiAddHistory(data, ":history [local|global]  :skills [reload]");
 		aiAddHistory(data, ":skill install <url>  :skill uninstall <name>");
 		aiAddHistory(data, ":tools on|off  :toolgate on|off  :toolmode native|prose  :trust [revoke]");
 		aiAddHistory(data, ":auto on|off  (skip per-tool permission prompts)  :mcp [reload]");
-		aiAddHistory(data, ":sessions  :resume <id>  :session [new]");
+		aiAddHistory(data, ":sessions [clear [all]]  :resume <id>  :session [new]");
 		aiAddHistory(data, "(`/` still works as alias for muscle memory)");
 		return 1;
 	}
@@ -5990,6 +6345,25 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "model", cmdlen) == 0 && cmdlen == 5) {
+		char modelpick[96];
+		if ((!arg || !*arg) && isatty(STDIN_FILENO)) {
+			/* Bare :model → arrow-key picker (mirrors bare :provider/:theme).
+			   Cancel falls through to "show current". */
+			char names[64][96];
+			int mn = hkGatherModels(names, 64);
+			if (mn > 0) {
+				const char *items[64];
+				int cur = 0;
+				for (int i = 0; i < mn; i++) {
+					items[i] = names[i];
+					if (E.ai_model && !strcmp(E.ai_model, names[i])) cur = i;
+				}
+				int pick = clPopupSelect("model", items, mn, cur, NULL);
+				if (pick >= 0) { snprintf(modelpick, sizeof modelpick, "%s", names[pick]); arg = modelpick; }
+			} else if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) {
+				aiAddHistory(data, "no local models installed. :pull hako-sho to add one.");
+			}
+		}
 		if (arg && *arg) {
 			/* Guard rails for hako tiers not yet shipped. Picking them sets the model
 			   but inference would 404; warn instead so the user knows it's queued. */
@@ -6136,37 +6510,12 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			free(buf);
 			return 1;
 		}
-		/* Curated suggestions per provider. Not exhaustive; meant as starting points. */
-		struct { const char *prov; const char *models; } sugg[] = {
-			{ "anthropic",      "claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5-20251001, claude-opus-4-0, claude-sonnet-4-0" },
-			{ "openai",         "gpt-4o, gpt-4o-mini, gpt-5, o1, o1-mini, gpt-4.1" },
-			{ "gemini",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro, gemini-1.5-flash" },
-			{ "google",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro" },
-			{ "groq",           "llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768" },
-			{ "cerebras",       "llama3.1-70b, llama3.1-8b, llama-3.3-70b" },
-			{ "deepseek",       "deepseek-chat, deepseek-reasoner" },
-			{ "mistral",        "mistral-large-latest, mistral-small-latest, codestral-latest" },
-			{ "together",       "meta-llama/Llama-3.3-70B-Instruct-Turbo, Qwen/Qwen2.5-72B-Instruct-Turbo" },
-			{ "fireworks",      "accounts/fireworks/models/llama-v3p1-70b-instruct, accounts/fireworks/models/qwen2p5-72b-instruct" },
-			{ "openrouter",     "anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.3-70b-instruct:free, deepseek/deepseek-chat:free" },
-			{ "xai",            "grok-2, grok-2-mini, grok-beta" },
-			{ "grok",           "grok-2, grok-2-mini, grok-beta" },
-		};
-		const char *models = NULL;
+		/* Curated suggestions per provider (single source: HK_MODEL_SUGG via
+		   hkCuratedModels — shared with the bare :model picker). */
 		const char *match_against = prov;
 		if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) match_against = "copilot";
 		if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) match_against = "github-models";
-		/* Special-case OAuth providers: */
-		if (!strcmp(match_against, "copilot")) {
-			models = "gpt-4o, gpt-4o-mini, o1-mini, claude-3.5-sonnet, claude-3.7-sonnet";
-		} else if (!strcmp(match_against, "github-models")) {
-			models = "gpt-4o, gpt-4o-mini, meta-llama-3-70b-instruct, mistral-large, microsoft/phi-3.5-mini";
-		}
-		if (!models) {
-			for (size_t i = 0; i < sizeof(sugg) / sizeof(sugg[0]); i++) {
-				if (!strcmp(sugg[i].prov, match_against)) { models = sugg[i].models; break; }
-			}
-		}
+		const char *models = hkCuratedModels();
 		char hdr[128];
 		snprintf(hdr, sizeof(hdr), "suggested models for %s%s:",
 			match_against,
@@ -6559,6 +6908,26 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "sessions", cmdlen) == 0 && cmdlen == 8) {
+		if (arg && strncmp(arg, "clear", 5) == 0) {
+			int all = strstr(arg, "all") != NULL;
+			int removed = hkClearSessions(all);
+			/* Don't leave the live session pointing at a wiped log — start fresh
+			   (same reset as :session new). Credentials / provider are untouched. */
+			for (int i = 0; i < data->history_count; i++) free(data->history[i]);
+			memset(data->history_role, 0, AI_HISTORY_MAX);
+			data->history_count = 0;
+			aiFreeMessages(data);
+			E.session_started = (long)time(NULL);
+			E.session_turn_count = 0;
+			E.session_resumed = 0;
+			hkGenSessionId();
+			hkSaveSession();
+			char msg[160];
+			snprintf(msg, sizeof(msg), "cleared %d session log(s) %s — fresh session %s",
+				removed, all ? "across ALL projects" : "in this project", E.session_id);
+			aiAddHistory(data, msg);
+			return 1;
+		}
 		char path[512];
 		hkHistoryPath(path, sizeof(path));
 		FILE *fp = fopen(path, "r");
@@ -6619,7 +6988,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			snprintf(msg, sizeof(msg), "%s%s %ld%c %dt %.40s", cur, ids[i], val, unit, counts[i], firsts[i]);
 			aiAddHistory(data, msg);
 		}
-		aiAddHistory(data, "(/resume <id> to switch)");
+		aiAddHistory(data, "(:resume <id> to switch · :sessions clear [all] to wipe logs — keeps logins)");
 		return 1;
 	}
 	if (strncmp(cmd, "resume", cmdlen) == 0 && cmdlen == 6) {
@@ -6688,14 +7057,14 @@ static void clLoadRc(void) {
 		char *eq = strchr(line, '='); if (!eq) continue;
 		*eq = '\0';
 		char *key = line, *val = eq + 1;
-		if (strcmp(key, "ai_provider") == 0) hkApplyProviderAlias(val);
-		else if (strcmp(key, "ai_api_key") == 0) { free(E.ai_api_key); E.ai_api_key = strdup(val); }
-		else if (strcmp(key, "ai_endpoint") == 0) { free(E.ai_endpoint); E.ai_endpoint = strdup(val); }
-		else if (strcmp(key, "ai_model") == 0) { free(E.ai_model); E.ai_model = strdup(val); }
-		else if (strcmp(key, "ai_max_tokens") == 0) E.ai_max_tokens = atoi(val);
-		else if (strcmp(key, "ai_tools_enabled") == 0) E.ai_tools_enabled = atoi(val) ? 1 : 0;
-		else if (strcmp(key, "ai_stream") == 0) E.ai_stream = atoi(val) ? 1 : 0;
-		else if (strcmp(key, "ai_auto_approve") == 0) E.ai_auto_approve = atoi(val) ? 1 : 0;
+		if (strcmp(key, "ai_provider") == 0) { hkApplyProviderAlias(val); hk_rc_pin.provider = 1; }
+		else if (strcmp(key, "ai_api_key") == 0) { free(E.ai_api_key); E.ai_api_key = strdup(val); hk_rc_pin.api_key = 1; }
+		else if (strcmp(key, "ai_endpoint") == 0) { free(E.ai_endpoint); E.ai_endpoint = strdup(val); hk_rc_pin.endpoint = 1; }
+		else if (strcmp(key, "ai_model") == 0) { free(E.ai_model); E.ai_model = strdup(val); hk_rc_pin.model = 1; }
+		else if (strcmp(key, "ai_max_tokens") == 0) { E.ai_max_tokens = atoi(val); hk_rc_pin.max_tokens = 1; }
+		else if (strcmp(key, "ai_tools_enabled") == 0) { E.ai_tools_enabled = atoi(val) ? 1 : 0; hk_rc_pin.tools = 1; }
+		else if (strcmp(key, "ai_stream") == 0) { E.ai_stream = atoi(val) ? 1 : 0; hk_rc_pin.stream = 1; }
+		else if (strcmp(key, "ai_auto_approve") == 0) { E.ai_auto_approve = atoi(val) ? 1 : 0; hk_rc_pin.auto_approve = 1; }
 		else if (strcmp(key, "anim_style") == 0) {
 			E.anim_force_style = -1;
 			for (int i = 0; i < CL_ANIM_COUNT; i++) {
@@ -6888,25 +7257,29 @@ static void clAppend(char *ab, int *n, int cap, const char *s, int slen) {
 	*n += slen;
 }
 
-/* Ghost-text: prefix-match input history (newest first) + slash/colon command
-   list. Returns malloc'd suffix to display past cursor, or NULL.  Caller frees. */
+/* Every `:`/`/` command name, incl. aliases (q = quit, exit). Single source for
+   the ghost-text prediction AND TAB completion — keep it complete so both agree. */
+static const char *HK_COLON_CMDS[] = {
+	"accounts","auto","clear","edit","exit","help","history","login","logout","mcp",
+	"model","models","provider","providers","pull","q","quit","resume","retry","session",
+	"sessions","skill","skills","theme","toolgate","toolmode","tools","trust","undo","usage", NULL
+};
+
+/* Ghost-text: prefix-match the colon-command list, show the unique completion as
+   dim text past the cursor. Returns malloc'd suffix, or NULL. Caller frees. */
 static char *clGhostSuffix(const char *buf, int len) {
-	/* Only suggest for slash/colon commands. Regular prose: no ghost. Avoids
-	   flicker on every keystroke during normal chat. */
-	if (len < 2) return NULL;
+	/* Predict only after the user has typed at least TWO characters past the ':'
+	   (e.g. ":he", not ":h") — a longer prefix is far more likely to be the one
+	   they mean, so the ghost is right more often and flickers less. */
+	if (len < 3) return NULL;
 	if (buf[0] != ':' && buf[0] != '/') return NULL;
-	static const char *cmds[] = {
-		"accounts","clear","edit","help","history","login","logout","model","models",
-		"provider","providers","pull","quit","resume","retry","session","sessions","skill","skills",
-		"theme","tools","toolgate","toolmode","trust","undo","usage", NULL
-	};
 	const char *p = buf + 1;
 	int pl = len - 1;
 	/* Only one matching command? Show ghost. Multiple matches → ambiguous, no ghost. */
 	const char *only = NULL; int matches = 0;
-	for (int i = 0; cmds[i]; i++) {
-		int cl = (int)strlen(cmds[i]);
-		if (cl > pl && memcmp(cmds[i], p, pl) == 0) { only = cmds[i]; matches++; }
+	for (int i = 0; HK_COLON_CMDS[i]; i++) {
+		int cl = (int)strlen(HK_COLON_CMDS[i]);
+		if (cl > pl && memcmp(HK_COLON_CMDS[i], p, pl) == 0) { only = HK_COLON_CMDS[i]; matches++; }
 	}
 	if (matches == 1) return strdup(only + pl);
 	return NULL;
@@ -7110,11 +7483,7 @@ static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
 			}
 			/* TAB completion: commands + provider names after :login / :provider / :logout. */
 			if ((buf[0] != '/' && buf[0] != ':') || cur != len) continue;
-			static const char *slash_cmds[] = {
-				"accounts", "clear", "edit", "help", "history", "login", "logout",
-				"model", "models", "provider", "providers", "pull", "quit", "resume", "retry", "session",
-				"sessions", "skill", "skills", "theme", "tools", "toolgate", "toolmode", "trust", "undo", "usage", NULL
-			};
+			const char **slash_cmds = HK_COLON_CMDS;   /* shared vocab (see clGhostSuffix) */
 			static const char *provs[] = {
 				"anthropic", "anthropic-api", "claude", "claude-api", "openai",
 				"github-copilot", "copilot", "github-models", "ghmodels",
