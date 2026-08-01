@@ -3,6 +3,59 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.2] — 2026-07-30
+
+Model lists stop being a hand-maintained table.
+
+### Added — live provider model catalogs (cached)
+- `:models` and the bare `:model` picker now read the **provider's own listing endpoint** instead of a compiled-in table: Anthropic `/v1/models`, any openai-compat host `/v1/models` (OpenAI, OpenRouter, Groq, DeepSeek, Mistral, Together, Fireworks, Cerebras, xAI), Gemini `/v1beta/models`, Copilot / GitHub Models `/models`, and ollama's `/api/tags` (which was previously the *only* live one). Auth headers are the same ones the chat POST already proved out.
+- Cached per provider **and endpoint** in `~/.hako/cache/models-<provider>-<hash>.list`, refetched when older than **24h**. `:models refresh` (or `-r`) forces it. Fallback chain is **fresh cache → stale cache → curated `HK_MODEL_SUGG` table**, so an offline box, a missing key, or a provider with no listing route still gets a populated picker.
+- Non-chat entries (embeddings, whisper/tts, image, rerank, moderation, guard) are filtered out, duplicates dropped, and the list is sorted **newest-first** where the provider reports `created`.
+
+### Added — `/` filter + scrolling in the popup picker
+- `clPopupSelect` now scrolls a **12-row window** and takes `/` to filter (backspace edits, enter commits, esc clears then cancels); the title shows `model (30/353)` as it narrows. Needed once a picker can hold OpenRouter's ~350 models — and `:theme` / `:provider` inherit it for free. Over-long ids are ellipsized instead of pushing the border. Piped/no-tty output caps at 40 numbered rows.
+
+### Fixed — model auto-pick on provider switch
+- The "prior model not valid" reset only ran when the provider **enum** changed, so groq → openrouter (both `AI_PROVIDER_OPENAI`) kept a foreign model id; and the enum check can't see gateway naming anyway — `gpt-4o-mini` "fits" openai but OpenRouter only answers to `vendor/model`. The check now runs on **every** `:provider` and, when the host publishes a catalog, uses **membership in that catalog** as the test. It keeps the compiled-in default when the host offers it, else takes the newest thing it does.
+
+### Fixed — openai-compat hosts were all called "openai"
+- `hkProviderLabel()` names a provider from its endpoint, so headers and messages say `openrouter` / `groq` / `deepseek` instead of `openai`. This also un-breaks the curated table: the `openrouter`, `groq`, `deepseek`, `mistral`, `together`, `fireworks`, `cerebras` and `xai` rows in `HK_MODEL_SUGG` were **unreachable** before, since the lookup only ever asked for the enum's name.
+
+### Fixed — dead local model id persisted and was advertised
+- A `mithraeum` model whose weights aren't installed (e.g. `hako-sho-stock`, from the naming scheme dropped in 2026-06) survived in `~/.hako/state` *and* `~/.hakorc`, printed in the banner, and silently fell back on every turn. Startup now relinks a merely-misplaced weight, else switches to an installed model and rewrites state, saying so once.
+
+### Added — `--debug` visibility on the listing fetch
+- `[models]` lines report the URL, byte count, and response head — or "no listing route" when a provider has no key/endpoint for it.
+
+### Added — bare `:models` / `:providers` open the pickers too
+- The singular/plural split was a memory tax: `:model` opened a picker, `:models` printed a list, and nothing said which was which. Bare **`:models`** and **`:providers`** now open the same pickers as their singular forms at a tty; **cancelling falls through to the text catalog** they always printed, and `:models list` / `:models refresh` force the text path.
+
+### Added — shell-style TAB completion
+- TAB used to fire only when **exactly one** candidate matched, so in the common case it did nothing. It now behaves like a shell: extend to the **longest common prefix**, and when that adds nothing, **list the candidates in columns** and redraw the prompt.
+- Context-aware: colon commands; provider names after `:provider`/`:providers`/`:login`/`:logout`; theme names after `:theme`; model ids after `:model`/`:models`/`:pull` (from the live catalog); `on`/`off` after `:tools`/`:toolgate`/`:auto`; `native`/`prose` after `:toolmode`; plus `:skill`, `:skills`, `:mcp`, `:history`, `:trust`, `:sessions` vocabularies.
+- **Path completion anywhere in a line** — `read src/ma<TAB>` completes against the filesystem mid-sentence, `~` expands, directories come back with a trailing `/` so a second TAB descends. Ghost-text acceptance on TAB is unchanged and still takes precedence.
+
+### Added — press-any-key splash (`show_splash`, `--no-splash`)
+- Full-screen splash before the REPL, matching hako-edit: the **HAKO wordmark** (the same block-letter art `hake`'s splash uses, byte-identical), the braille crate below it, `CODE`, version, tagline, and a **blinking "Press any key to start"** (SGR 5, same as the editor).
+- **Sizes itself to the terminal** so a phone-sized window doesn't get a wall of art it can't fit: wordmark + crate at ≥26 rows; wordmark alone at ≥15 rows / ≥36 cols (block glyphs are the safe choice on terminals that mis-measure braille); crate alone when too narrow for the wordmark; and a single `箱 HAKO CODE v0.2.2` line below that. iPad-sized windows land in the wordmark tier or better.
+- The banner that follows now prints the **wordmark above its box** rather than art inside it.
+- This also **fixes the skewed banner border**: the art is braille (U+28xx), which terminals disagree about the width of — iSh on iPad renders it double-width, so the box's right edge got pushed off. The splash draws the art **borderless**, where a width guess can only shift centering, never break a frame.
+- Interactive tty only; skipped under `--pipe`, `--no-color`, and non-tty. Off via `show_splash=0` in `~/.hakorc` (same key hako-edit uses) or `--no-splash`. Raw-mode failure never hangs the wait — it just proceeds.
+
+### Added — `:help` opens in the popup box
+- `:help` now renders in the same box the pickers use (as hako-edit does), so it scrolls, `/` filters it, and `esc` closes. Piped/non-tty still prints the flat list.
+
+### Fixed — picker border skew on rows with a preview
+- `:theme`'s swatch rows were one cell wider than the border: the row padded to `inner-1` and the trailing loop then added one more. Rows also measured their text with `strlen`, so any line containing a multibyte character (`·`) padded short and walked the right border left. Both now measure in **cells** (`clCellWidth` / new `clClipToCells`), and ellipsis truncation is cell-aware so a glyph is never cut in half.
+
+### Fixed — picker on a phone-sized terminal (iSh, portrait)
+- The footer hint (`↑/↓ move · / filter · enter select · esc cancel`, 45 cells) **wrapped** on a ~32-column screen. A wrapped hint is two rows while the in-place redraw assumes one, so every keypress repainted a row low and **stacked a fresh title bar** — the box appeared to respawn and smear as you scrolled. The hint now has a short form and is clipped by cells (never mid-glyph), so it always occupies exactly one row.
+- Box width is clamped to the window and its height to `rows - 5`, and the box's lines are **reserved up front** so any scrolling happens once, before the redraw loop starts doing relative cursor math.
+- **A lone `esc` now cancels immediately.** The follow-up byte read (which distinguishes `esc` from an arrow sequence `\x1b[A`) was blocking, so pressing esc did nothing until some other key was pressed. It now times out after 40ms.
+
+### Added — `--debug` says why a picker fell back to text
+- `[popup] text fallback: stdin_tty=… stdout_tty=… raw=…` — the numbered fallback has three possible causes and they're indistinguishable otherwise (emulated terminals like iSh can fail `tcsetattr`).
+
 ## [v0.2.1] — 2026-06-30
 
 Incremental polish on top of v0.2.0. No behavior change for existing configs unless noted.
