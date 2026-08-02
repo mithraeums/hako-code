@@ -24,7 +24,7 @@
  */
 
 /*** includes ***/
-#define HAKO_VERSION "0.2.1"
+#define HAKO_VERSION "0.2.2"
 
 /* GitHub Copilot OAuth + API constants. Public client_id from VS Code Copilot extension.
    Defined here so hkBuildCurlCmd (earlier in file) can reference the Editor-* headers. */
@@ -355,6 +355,7 @@ struct clConfig {
 	int debug;
 	int compact;           /* --compact: skip figlet + framed box on banner */
 	int pipe_mode;         /* --pipe: JSONL I/O with hako editor (no REPL UI) */
+	int show_splash;       /* full-screen press-any-key splash before the REPL */
 	unsigned char last_role_shown; /* tracks last role rendered for turn separator */
 
 	/* OAuth (device-flow). When ai_oauth_refresh non-NULL, ai_api_key holds access_token. */
@@ -413,6 +414,19 @@ static const char *CL_LABELS[] = {
 static const int CL_LABEL_COUNT = sizeof(CL_LABELS) / sizeof(CL_LABELS[0]);
 
 /* Medium logo — outline silhouette. 10 rows × 28 cols. */
+/* HAKO wordmark — same block-letter art hako-edit's splash uses (hake.c), kept
+   byte-identical so the two splashes read as one product. Box-drawing blocks are
+   single-width everywhere, unlike the braille crate below it. */
+static const char *CL_LOGO_WORD[] = {
+	"██╗  ██╗ █████╗ ██╗  ██╗ ██████╗",
+	"██║  ██║██╔══██╗██║ ██╔╝██╔═══██╗",
+	"███████║███████║█████╔╝ ██║   ██║",
+	"██╔══██║██╔══██║██╔═██╗ ██║   ██║",
+	"██║  ██║██║  ██║██║  ██╗╚██████╔╝",
+	"╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝",
+	NULL
+};
+
 /* CL_LOGO_MEDIUM — 13 rows × 26 cells. Pure braille blanks (U+2800) for spacing;
    no ASCII spaces, no TABs. Mixing in a literal TAB previously bust the right
    border of the box because clCellWidth counts TAB as 1 cell but the terminal
@@ -488,6 +502,7 @@ static int clOAuthCopilotExchange(aiData *data);
 static int clOAuthGithubModels(aiData *data);
 static int clOAuthOpenRouter(aiData *data);
 static int clOAuthRefresh(aiData *data);
+static void clOAuthEnsureFresh(aiData *data);
 static void clOAuthEnsureFresh(aiData *data);
 static char *clOAuthRandomVerifier(void);
 #ifndef _WIN32
@@ -4897,12 +4912,38 @@ static const struct { const char *prov, *models; } HK_MODEL_SUGG[] = {
 	{ "grok",           "grok-2, grok-2-mini, grok-beta" },
 };
 
+/* What to call the active provider. The OPENAI enum fronts a dozen
+   openai-compat hosts, so the endpoint is what actually names them — without
+   this the openrouter / groq / deepseek rows in HK_MODEL_SUGG were unreachable
+   (hkProviderName only ever said "openai") and every header misreported. */
+static const char *hkProviderLabel(void) {
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) return "copilot";
+	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) return "github-models";
+	const char *ep = E.ai_endpoint;
+	if (ep && *ep && E.ai_provider_type == AI_PROVIDER_OPENAI) {
+		static const struct { const char *host, *name; } M[] = {
+			{ "openrouter",                   "openrouter"    },
+			{ "groq",                         "groq"          },
+			{ "deepseek",                     "deepseek"      },
+			{ "mistral",                      "mistral"       },
+			{ "together",                     "together"      },
+			{ "fireworks",                    "fireworks"     },
+			{ "cerebras",                     "cerebras"      },
+			{ "x.ai",                         "xai"           },
+			{ "generativelanguage",           "gemini"        },
+			{ "models.inference.ai.azure.com","github-models" },
+			{ "githubcopilot",                "copilot"       },
+		};
+		for (size_t i = 0; i < sizeof(M) / sizeof(M[0]); i++)
+			if (strstr(ep, M[i].host)) return M[i].name;
+	}
+	return hkProviderName(E.ai_provider_type);
+}
+
 /* Resolve the curated model list for the active provider (honors copilot /
    github-models OAuth aliases). Returns NULL when there's no curated list. */
 static const char *hkCuratedModels(void) {
-	const char *match = hkProviderName(E.ai_provider_type);
-	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) match = "copilot";
-	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) match = "github-models";
+	const char *match = hkProviderLabel();
 	if (!strcmp(match, "copilot"))       return "gpt-4o, gpt-4o-mini, o1-mini, claude-3.5-sonnet, claude-3.7-sonnet";
 	if (!strcmp(match, "github-models")) return "gpt-4o, gpt-4o-mini, meta-llama-3-70b-instruct, mistral-large, microsoft/phi-3.5-mini";
 	for (size_t i = 0; i < sizeof(HK_MODEL_SUGG) / sizeof(HK_MODEL_SUGG[0]); i++)
@@ -4910,10 +4951,263 @@ static const char *hkCuratedModels(void) {
 	return NULL;
 }
 
+/* ── live provider model lists ──────────────────────────────────────────────
+   Every cloud provider we speak exposes a listing endpoint; only ollama's was
+   ever wired, so every other picker ate the curated table and went stale. Fetch
+   once a day into ~/.hako/cache, then fall back stale-cache → HK_MODEL_SUGG so
+   an offline box still gets a populated picker. */
+#define HK_MODELS_TTL   (24 * 60 * 60)
+#define HK_MODELS_MAX   512
+
+/* Listing endpoints return the whole catalog — embeddings, speech, image and
+   rerank entries are not chat models and only bury the ones that are. */
+static const char *HK_MODEL_SKIP[] = {
+	"embed", "whisper", "tts", "dall-e", "moderation", "rerank", "audio",
+	"image", "stable-diffusion", "sora", "clip", "guard", "bge-", "nomic", NULL
+};
+
+static int hkModelIsChat(const char *id) {
+	char low[128];
+	size_t i = 0;
+	for (; id[i] && i < sizeof(low) - 1; i++) low[i] = (char)tolower((unsigned char)id[i]);
+	low[i] = '\0';
+	for (int k = 0; HK_MODEL_SKIP[k]; k++)
+		if (strstr(low, HK_MODEL_SKIP[k])) return 0;
+	return 1;
+}
+
+/* One cache file per provider+endpoint — the OPENAI enum fronts groq, deepseek,
+   mistral, xai and every other openai-compat host, so the endpoint has to be
+   part of the key or they'd share (and clobber) one list. */
+static void hkModelsCachePath(char *buf, size_t n) {
+	const char *home = getenv("HOME"); if (!home) home = ".";
+	const char *ep = E.ai_endpoint ? E.ai_endpoint : "";
+	unsigned long long h = 0xcbf29ce484222325ULL;
+	for (int i = 0; ep[i]; i++) { h ^= (unsigned char)ep[i]; h *= 0x100000001b3ULL; }
+	snprintf(buf, n, "%s/.hako/cache/models-%s-%08lx.list", home,
+		hkProviderName(E.ai_provider_type), (unsigned long)(h & 0xffffffffULL));
+}
+
+/* GET for the active provider's listing endpoint, mirroring the auth headers
+   aiBuildCurlCommand already proved out for the chat POST. NULL = no listing
+   path for this provider (or no key yet). */
+static char *hkModelListCmd(void) {
+	const char *endpoint = E.ai_endpoint;
+	const char *api_key = E.ai_api_key;
+	if (!endpoint || !*endpoint) return NULL;
+	char *cmd = malloc(2048);
+	if (!cmd) return NULL;
+	switch (E.ai_provider_type) {
+	case AI_PROVIDER_OLLAMA:
+		if (api_key && *api_key)
+			snprintf(cmd, 2048, "curl -s --max-time 8 -H 'Authorization: Bearer %s' %s/api/tags 2>/dev/null",
+				api_key, endpoint);
+		else
+			snprintf(cmd, 2048, "curl -s --max-time 8 %s/api/tags 2>/dev/null", endpoint);
+		break;
+	case AI_PROVIDER_ANTHROPIC: {
+		if (!api_key || !*api_key) { free(cmd); return NULL; }
+		int oauth = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
+		snprintf(cmd, 2048, oauth
+			? "curl -s --max-time 8 -H 'Authorization: Bearer %s' "
+			  "-H 'anthropic-beta: oauth-2025-04-20' "
+			  "-H 'User-Agent: claude-cli/1.0.40 (external, cli)' -H 'x-app: cli' "
+			  "-H 'anthropic-version: 2023-06-01' '%s/v1/models?limit=200' 2>/dev/null"
+			: "curl -s --max-time 8 -H 'x-api-key: %s' "
+			  "-H 'anthropic-version: 2023-06-01' '%s/v1/models?limit=200' 2>/dev/null",
+			api_key, endpoint);
+		break;
+	}
+	case AI_PROVIDER_OPENAI: {
+		/* OpenRouter publishes its catalog unauthenticated — useful before login. */
+		if ((!api_key || !*api_key) && strstr(endpoint, "openrouter")) {
+			snprintf(cmd, 2048, "curl -s --max-time 8 %s/v1/models 2>/dev/null", endpoint);
+			break;
+		}
+		if (!api_key || !*api_key) { free(cmd); return NULL; }
+		if (strstr(endpoint, "generativelanguage")) {
+			snprintf(cmd, 2048,
+				"curl -s --max-time 8 '%s/v1beta/models?pageSize=200&key=%s' 2>/dev/null",
+				endpoint, api_key);
+			break;
+		}
+		int copilot = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot");
+		int ghmodels = strstr(endpoint, "models.inference.ai.azure.com") != NULL;
+		const char *path = (copilot || ghmodels) ? "/models" : "/v1/models";
+		const char *copilot_hdrs = copilot
+			? "-H 'Editor-Version: " HAKO_COPILOT_EDITOR_VER "' "
+			  "-H 'Copilot-Integration-Id: vscode-chat' "
+			: "";
+		snprintf(cmd, 2048,
+			"curl -s --max-time 8 -H 'Authorization: Bearer %s' %s%s%s 2>/dev/null",
+			api_key, copilot_hdrs, endpoint, path);
+		break;
+	}
+	default: free(cmd); return NULL;
+	}
+	return cmd;
+}
+
+/* Pull ids out of a listing response. openai-compat uses "id", gemini and
+   ollama use "name"; a "created" epoch next to an id (openai, openrouter) sorts
+   newest-first, and providers that omit it keep API order (anthropic already
+   returns newest-first). Returns the count written to `out`. */
+static int hkParseModelList(const char *json, char out[][96], int max) {
+	if (!json || !*json || max <= 0) return 0;
+	long long *when = calloc((size_t)max, sizeof(long long));
+	if (!when) return 0;
+	int n = 0;
+
+	for (int pass = 0; pass < 2 && n == 0; pass++) {
+		const char *key = pass == 0 ? "\"id\":\"" : "\"name\":\"";
+		size_t klen = strlen(key);
+		const char *p = json;
+		while (n < max && (p = strstr(p, key)) != NULL) {
+			p += klen;
+			const char *e = p;
+			while (*e && *e != '"') e++;
+			if (!*e) break;
+			int len = (int)(e - p);
+			if (len > 0 && len < 96) {
+				char id[96];
+				snprintf(id, sizeof(id), "%.*s", len, p);
+				/* gemini returns "models/gemini-2.5-pro" */
+				const char *bare = strncmp(id, "models/", 7) == 0 ? id + 7 : id;
+				if (hkModelIsChat(bare)) {
+					int dup = 0;
+					for (int i = 0; i < n; i++) if (!strcmp(out[i], bare)) { dup = 1; break; }
+					if (!dup) {
+						snprintf(out[n], 96, "%s", bare);
+						const char *nxt = strstr(e, key);
+						const char *cr = strstr(e, "\"created\":");
+						if (cr && (!nxt || cr < nxt)) when[n] = atoll(cr + 10);
+						n++;
+					}
+				}
+			}
+			p = e;
+		}
+	}
+
+	/* Stable insertion sort, newest first; unknown timestamps keep API order. */
+	for (int i = 1; i < n; i++) {
+		char id[96]; long long w = when[i];
+		snprintf(id, sizeof(id), "%s", out[i]);
+		int j = i - 1;
+		while (j >= 0 && when[j] < w) {
+			snprintf(out[j + 1], 96, "%s", out[j]);
+			when[j + 1] = when[j];
+			j--;
+		}
+		snprintf(out[j + 1], 96, "%s", id);
+		when[j + 1] = w;
+	}
+	free(when);
+	return n;
+}
+
+/* Read the whole of a command's stdout. Shared by the model-list fetch and
+   :models' ollama branch. Caller frees. */
+static char *hkPopenCapture(const char *cmd, size_t cap_max) {
+	FILE *fp = popen(cmd, "r");
+	if (!fp) return NULL;
+	size_t cap = 8192, len = 0;
+	char *buf = malloc(cap);
+	if (!buf) { pclose(fp); return NULL; }
+	size_t got;
+	while ((got = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
+		len += got;
+		if (len + 1 >= cap) {
+			if (cap >= cap_max) break;
+			cap *= 2;
+			char *nb = realloc(buf, cap);
+			if (!nb) break;
+			buf = nb;
+		}
+	}
+	buf[len] = '\0';
+	pclose(fp);
+	if (len == 0) { free(buf); return NULL; }
+	return buf;
+}
+
+/* Live list for the active provider, cached. `force` refetches regardless of
+   age; `*stale_secs`, when given, reports the cache age actually used (0 =
+   just fetched, <0 = no cache at all). Returns count, 0 if nothing available. */
+static int hkModelsLive(char out[][96], int max, int force, long *age) {
+	if (age) *age = -1;
+	char path[1024];
+	hkModelsCachePath(path, sizeof(path));
+
+	struct stat st;
+	int have_cache = (stat(path, &st) == 0);
+	long old = have_cache ? (long)(time(NULL) - st.st_mtime) : -1;
+	if (have_cache && !force && old < HK_MODELS_TTL) {
+		char *txt = hkReadFileAll(path, 256 * 1024);
+		if (txt) {
+			int n = 0;
+			char *save = NULL, *line = strtok_r(txt, "\n", &save);
+			while (line && n < max) {
+				if (*line) { snprintf(out[n], 96, "%s", line); n++; }
+				line = strtok_r(NULL, "\n", &save);
+			}
+			free(txt);
+			if (n > 0) { if (age) *age = old; return n; }
+		}
+	}
+
+	int n = 0;
+	char *cmd = hkModelListCmd();
+	if (!cmd && E.debug)
+		fprintf(stderr, "[models] no listing route for %s (no key?)\n", hkProviderLabel());
+	if (cmd) {
+		char *resp = hkPopenCapture(cmd, 1u << 22);
+		if (E.debug) {
+			fprintf(stderr, "[models] GET %s\n", strstr(cmd, "http") ? strstr(cmd, "http") : cmd);
+			fprintf(stderr, "[models] %zu bytes back: %.200s\n",
+				resp ? strlen(resp) : (size_t)0, resp ? resp : "(nothing)");
+		}
+		free(cmd);
+		if (resp) {
+			n = hkParseModelList(resp, out, max);
+			free(resp);
+		}
+	}
+	if (n > 0) {
+		const char *home = getenv("HOME"); if (home) {
+			char dir[1024];
+			snprintf(dir, sizeof(dir), "%s/.hako/cache", home);
+			mkdir(dir, 0755);
+		}
+		FILE *fp = fopen(path, "w");
+		if (fp) {
+			for (int i = 0; i < n; i++) fprintf(fp, "%s\n", out[i]);
+			fclose(fp);
+		}
+		if (age) *age = 0;
+		return n;
+	}
+
+	/* Fetch failed (offline, bad key, provider without a listing route) — a
+	   stale cache still beats the frozen curated table. */
+	if (have_cache) {
+		char *txt = hkReadFileAll(path, 256 * 1024);
+		if (txt) {
+			char *save = NULL, *line = strtok_r(txt, "\n", &save);
+			while (line && n < max) {
+				if (*line) { snprintf(out[n], 96, "%s", line); n++; }
+				line = strtok_r(NULL, "\n", &save);
+			}
+			free(txt);
+			if (n > 0 && age) *age = old;
+		}
+	}
+	return n;
+}
+
 /* Fill `out` with selectable model names for the active provider: installed
-   .mlf2 weights (mithraeum) or the curated list (cloud). Returns the count.
-   Powers the bare `:model` popup picker. Ollama's live /api/tags stays in
-   :models (no picker) to avoid duplicating the network path. */
+   .mlf2 weights (mithraeum), else the provider's live list, else the curated
+   fallback. Returns the count. Powers the bare `:model` popup picker. */
 static int hkGatherModels(char out[][96], int max) {
 	int n = 0;
 	if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) {
@@ -4935,6 +5229,9 @@ static int hkGatherModels(char out[][96], int max) {
 		}
 		return n;
 	}
+	n = hkModelsLive(out, max, 0, NULL);
+	if (n > 0) return n;
+
 	const char *models = hkCuratedModels();
 	if (!models) return 0;
 	const char *p = models;
@@ -4991,6 +5288,33 @@ static int hkMithraeumRelocate(const char *model) {
 		if (stat(canon, &st) == 0) return 1;
 	}
 	return 0;
+}
+
+/* A configured local model whose weights aren't installed is a dead id: the
+   banner advertises it, every turn falls back silently, and it survives in both
+   ~/.hako/state and ~/.hakorc (e.g. "hako-sho-stock" from the pre-2026-06-05
+   naming). Heal it once at startup — relink if the file is merely misplaced,
+   else swap to whatever IS installed and rewrite state. Returns 1 if changed. */
+static int hkHealLocalModel(void) {
+	if (E.ai_provider_type != AI_PROVIDER_MITHRAEUM || !E.ai_model || !*E.ai_model) return 0;
+	char *p = hkMithraeumModelPath(E.ai_model);
+	if (!p) return 0;
+	struct stat st;
+	if (stat(p, &st) == 0) { free(p); return 0; }
+	if (hkMithraeumRelocate(E.ai_model)) { free(p); return 0; }
+	free(p);
+
+	char *avail = hkMithraeumFirstAvailable();
+	if (!avail) return 0;
+	if (isatty(STDOUT_FILENO)) {
+		const char *R = E.color_enabled ? ANSI_RESET : "";
+		const char *M = E.color_enabled ? TH_META : "";
+		printf("  %s'%s' is not installed — switched to %s.%s\n", M, E.ai_model, avail, R);
+	}
+	free(E.ai_model);
+	E.ai_model = avail;
+	hkSaveSession();
+	return 1;
 }
 
 /* Download a tier's weights from HuggingFace into ~/.hako/models. Convention:
@@ -5787,7 +6111,7 @@ static void *aiWorkerThread(void *arg) {
 			clStopAnim(data);
 			pthread_mutex_lock(&data->lock);
 			char msg[384];
-			const char *pname = hkProviderName(E.ai_provider_type);
+			const char *pname = hkProviderLabel();
 			if (E.ai_provider_type == AI_PROVIDER_NONE) {
 				snprintf(msg, sizeof(msg), "Error: no provider set. Run /provider <name> or /login <name>.");
 			} else if (!E.ai_api_key && !HK_IS_OLLAMA_WIRE(E.ai_provider_type)) {
@@ -6143,6 +6467,45 @@ static void aiWorkerSend(aiData *data) {
 	}
 }
 
+/* Bare :model and bare :models both open this; same for :provider/:providers.
+   The singular/plural split was a memory tax — the picker is the discoverable
+   path either way. Returns 1 with the pick in `out`, 0 = cancelled/nothing. */
+static int hkPickModel(aiData *data, char *out, size_t cap) {
+	static char names[HK_MODELS_MAX][96];
+	static const char *items[HK_MODELS_MAX];
+	int mn = hkGatherModels(names, HK_MODELS_MAX);
+	if (mn <= 0) {
+		if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM)
+			aiAddHistory(data, "no local models installed. :pull hako-sho to add one.");
+		return 0;
+	}
+	int cur = 0;
+	for (int i = 0; i < mn; i++) {
+		items[i] = names[i];
+		if (E.ai_model && !strcmp(E.ai_model, names[i])) cur = i;
+	}
+	int pick = clPopupSelect("model", items, mn, cur, NULL);
+	if (pick < 0) return 0;
+	snprintf(out, cap, "%s", names[pick]);
+	return 1;
+}
+
+static int hkPickProvider(char *out, size_t cap) {
+	static const char *provs[] = {
+		"mithraeum", "anthropic", "openai", "gemini", "ollama", "groq",
+		"cerebras", "deepseek", "mistral", "together", "fireworks",
+		"openrouter", "xai", "custom"
+	};
+	int pn = (int)(sizeof(provs) / sizeof(provs[0]));
+	int cur = 0;
+	const char *active = hkProviderName(E.ai_provider_type);
+	for (int i = 0; i < pn; i++) if (!strcmp(provs[i], active)) { cur = i; break; }
+	int pick = clPopupSelect("provider", provs, pn, cur, NULL);
+	if (pick < 0) return 0;
+	snprintf(out, cap, "%s", provs[pick]);
+	return 1;
+}
+
 /*** slash commands ***/
 static int hkHandleSlash(aiData *data, const char *prompt) {
 	/* Accept both `:` (primary, vim/hako style) and `/` (legacy alias). */
@@ -6152,17 +6515,51 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	int cmdlen = arg ? (arg - cmd) : (int)strlen(cmd);
 	if (arg) { while (*arg == ' ') arg++; }
 
+	/* Bare plural = bare singular at a tty: :models opens the model picker,
+	   :providers the provider picker. Cancelling falls through to the text
+	   catalog the plural has always printed (`:models list` forces it). */
+	static char plural_pick[96];
+	if ((!arg || !*arg) && isatty(STDIN_FILENO)) {
+		if (cmdlen == 6 && !strncmp(cmd, "models", 6)) {
+			if (hkPickModel(data, plural_pick, sizeof plural_pick)) {
+				cmd = "model"; cmdlen = 5; arg = plural_pick;
+			}
+		} else if (cmdlen == 9 && !strncmp(cmd, "providers", 9)) {
+			if (hkPickProvider(plural_pick, sizeof plural_pick)) {
+				cmd = "provider"; cmdlen = 8; arg = plural_pick;
+			}
+		}
+	}
+
 	if (strncmp(cmd, "help", cmdlen) == 0 && cmdlen == 4) {
-		aiAddHistory(data, ":help  :clear  :retry  :edit  :undo  :usage  :q");
-		aiAddHistory(data, ":providers  :models  :provider  :model  :theme  (bare = arrow-key picker)");
-		aiAddHistory(data, ":provider <name>  :model <id>  :theme <name>  :pull <model>  (direct)");
-		aiAddHistory(data, ":login [<provider>]  :logout [<provider>]  :accounts");
-		aiAddHistory(data, ":history [local|global]  :skills [reload]");
-		aiAddHistory(data, ":skill install <url>  :skill uninstall <name>");
-		aiAddHistory(data, ":tools on|off  :toolgate on|off  :toolmode native|prose  :trust [revoke]");
-		aiAddHistory(data, ":auto on|off  (skip per-tool permission prompts)  :mcp [reload]");
-		aiAddHistory(data, ":sessions [clear [all]]  :resume <id>  :session [new]");
-		aiAddHistory(data, "(`/` still works as alias for muscle memory)");
+		/* Same box the pickers use (hako-edit shows its help this way too), so
+		   help scrolls and `/` filters it. Selection is meaningless here — any
+		   of enter/esc/q just closes. Non-tty falls back to the flat list. */
+		static const char *HELP[] = {
+			":help   this box · / filters · esc closes",
+			":clear  :retry  :edit  :undo  :usage  :q",
+			"",
+			":model   :models [refresh]   bare = picker",
+			":provider  :providers        bare = picker",
+			":theme [<name>]              bare = picker",
+			":pull <model>                fetch local weights",
+			"",
+			":login [<provider>]  :logout [<provider>]  :accounts",
+			":history [local|global]      :skills [reload]",
+			":skill install <url>         :skill uninstall <name>",
+			"",
+			":tools on|off                :toolgate on|off",
+			":toolmode native|prose       :trust [revoke]",
+			":auto on|off                 skip permission prompts",
+			":mcp [reload]",
+			"",
+			":sessions [clear [all]]  :resume <id>  :session [new]",
+			"",
+			"TAB completes · `/` works as a command prefix too",
+		};
+		int hn = (int)(sizeof(HELP) / sizeof(HELP[0]));
+		if (isatty(STDIN_FILENO)) { clPopupSelect("help", HELP, hn, 0, NULL); return 1; }
+		for (int i = 0; i < hn; i++) aiAddHistory(data, HELP[i]);
 		return 1;
 	}
 	if (strncmp(cmd, "retry", cmdlen) == 0 && cmdlen == 5) {
@@ -6346,24 +6743,9 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	}
 	if (strncmp(cmd, "model", cmdlen) == 0 && cmdlen == 5) {
 		char modelpick[96];
-		if ((!arg || !*arg) && isatty(STDIN_FILENO)) {
-			/* Bare :model → arrow-key picker (mirrors bare :provider/:theme).
-			   Cancel falls through to "show current". */
-			char names[64][96];
-			int mn = hkGatherModels(names, 64);
-			if (mn > 0) {
-				const char *items[64];
-				int cur = 0;
-				for (int i = 0; i < mn; i++) {
-					items[i] = names[i];
-					if (E.ai_model && !strcmp(E.ai_model, names[i])) cur = i;
-				}
-				int pick = clPopupSelect("model", items, mn, cur, NULL);
-				if (pick >= 0) { snprintf(modelpick, sizeof modelpick, "%s", names[pick]); arg = modelpick; }
-			} else if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) {
-				aiAddHistory(data, "no local models installed. :pull hako-sho to add one.");
-			}
-		}
+		/* Bare :model → picker (mirrors :provider/:theme); cancel shows current. */
+		if ((!arg || !*arg) && isatty(STDIN_FILENO)
+			&& hkPickModel(data, modelpick, sizeof modelpick)) arg = modelpick;
 		if (arg && *arg) {
 			/* Guard rails for hako tiers not yet shipped. Picking them sets the model
 			   but inference would 404; warn instead so the user knows it's queued. */
@@ -6413,7 +6795,6 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "models", cmdlen) == 0 && cmdlen == 6) {
-		const char *prov = hkProviderName(E.ai_provider_type);
 		const char *endpoint = E.ai_endpoint;
 		/* Mithraeum: list locally-installed .mlf2 weights under ~/.hako/models.
 		   No network, no ollama — the `hakm` subprocess runs these. */
@@ -6450,71 +6831,50 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			}
 			return 1;
 		}
-		/* Ollama: live query against /api/tags. Otherwise: curated suggestions. */
-		int is_ollama = (E.ai_provider_type == AI_PROVIDER_OLLAMA);
-		if (is_ollama) {
-			if (!endpoint || !*endpoint) endpoint = "http://localhost:11434";
-			char curlcmd[512];
-			snprintf(curlcmd, sizeof(curlcmd),
-				"curl -s --max-time 3 %s/api/tags 2>/dev/null", endpoint);
-			FILE *fp = popen(curlcmd, "r");
-			if (!fp) { aiAddHistory(data, "/models: popen failed"); return 1; }
-			size_t cap = 8192, len = 0;
-			char *buf = malloc(cap);
-			if (!buf) { pclose(fp); return 1; }
-			size_t got;
-			while ((got = fread(buf + len, 1, cap - len - 1, fp)) > 0) {
-				len += got;
-				if (len + 1 >= cap) {
-					if (cap >= (1u << 22)) break;
-					cap *= 2;
-					char *nb = realloc(buf, cap);
-					if (!nb) break;
-					buf = nb;
-				}
-			}
-			buf[len] = '\0';
-			pclose(fp);
-			if (len == 0) {
-				char msg[256];
-				snprintf(msg, sizeof(msg), "/models: no response from %s (is `ollama serve` running?)", endpoint);
-				aiAddHistory(data, msg);
-				free(buf); return 1;
-			}
-			int count = 0;
-			const char *p = buf;
-			char hdr[128];
-			snprintf(hdr, sizeof(hdr), "installed locally on %s:", endpoint);
+		/* Cloud + ollama: the provider's own catalog, cached 24h (ollama's
+		   /api/tags is just one more listing endpoint now). `:models refresh`
+		   forces a refetch; anything that fails falls through to the curated
+		   table below so an offline box still sees something. */
+		const char *match_against = hkProviderLabel();
+		if (E.ai_provider_type == AI_PROVIDER_OLLAMA && (!endpoint || !*endpoint))
+			endpoint = "http://localhost:11434";
+
+		int force = arg && *arg && (!strcmp(arg, "refresh") || !strcmp(arg, "-r"));
+		clOAuthEnsureFresh(data);	/* an expired token = no catalog */
+		static char live[HK_MODELS_MAX][96];
+		long age = -1;
+		int ln = hkModelsLive(live, HK_MODELS_MAX, force, &age);
+		if (ln > 0) {
+			char hdr[192];
+			if (age <= 0)
+				snprintf(hdr, sizeof(hdr), "%d model(s) from %s (live):", ln, match_against);
+			else
+				snprintf(hdr, sizeof(hdr), "%d model(s) from %s (cached %ldh — :models refresh):",
+					ln, match_against, age / 3600);
 			aiAddHistory(data, hdr);
-			while ((p = strstr(p, "\"name\":\"")) != NULL) {
-				p += 8;
-				const char *e = p;
-				while (*e && *e != '"') e++;
-				if (!*e) break;
-				int n = (int)(e - p);
-				if (n > 200) n = 200;
-				int active = E.ai_model && (int)strlen(E.ai_model) == n && !strncmp(E.ai_model, p, n);
-				char line[256];
-				snprintf(line, sizeof(line), "    %s %.*s", active ? "◎" : " ", n, p);
+			int shown = ln > 40 ? 40 : ln;
+			for (int i = 0; i < shown; i++) {
+				int active = E.ai_model && !strcmp(E.ai_model, live[i]);
+				char line[128];
+				snprintf(line, sizeof(line), "  %s %s", active ? "◎" : " ", live[i]);
 				aiAddHistory(data, line);
-				count++;
-				p = e;
 			}
-			if (count == 0) {
-				aiAddHistory(data, "  (none — `ollama pull <model>` to add one)");
-			} else {
-				char msg[64];
-				snprintf(msg, sizeof(msg), "%d local model(s). /model <name> to select.", count);
-				aiAddHistory(data, msg);
+			if (ln > shown) {
+				char more[96];
+				snprintf(more, sizeof(more), "  … %d more — :model to browse/filter them all", ln - shown);
+				aiAddHistory(data, more);
 			}
-			free(buf);
+			aiAddHistory(data, ":model to pick from a list.  :providers to see all providers.");
 			return 1;
 		}
-		/* Curated suggestions per provider (single source: HK_MODEL_SUGG via
-		   hkCuratedModels — shared with the bare :model picker). */
-		const char *match_against = prov;
-		if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) match_against = "copilot";
-		if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) match_against = "github-models";
+		if (E.ai_provider_type == AI_PROVIDER_OLLAMA) {
+			char msg[256];
+			snprintf(msg, sizeof(msg), ":models: no response from %s (is `ollama serve` running?)", endpoint);
+			aiAddHistory(data, msg);
+			return 1;
+		}
+		/* Curated fallback (single source: HK_MODEL_SUGG via hkCuratedModels —
+		   shared with the bare :model picker). */
 		const char *models = hkCuratedModels();
 		char hdr[128];
 		snprintf(hdr, sizeof(hdr), "suggested models for %s%s:",
@@ -6606,20 +6966,8 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	}
 	if (strncmp(cmd, "provider", cmdlen) == 0 && cmdlen == 8) {
 		char provpick[32];
-		if (!arg || !*arg) {
-			/* Bare → interactive picker. Cancel falls through to "show current". */
-			static const char *provs[] = {
-				"mithraeum", "anthropic", "openai", "gemini", "ollama", "groq",
-				"cerebras", "deepseek", "mistral", "together", "fireworks",
-				"openrouter", "xai", "custom"
-			};
-			int pn = (int)(sizeof(provs) / sizeof(provs[0]));
-			int cur = 0;
-			const char *active = hkProviderName(E.ai_provider_type);
-			for (int i = 0; i < pn; i++) if (!strcmp(provs[i], active)) { cur = i; break; }
-			int pick = clPopupSelect("provider", provs, pn, cur, NULL);
-			if (pick >= 0) { snprintf(provpick, sizeof provpick, "%s", provs[pick]); arg = provpick; }
-		}
+		/* Bare → picker. Cancel falls through to "show current". */
+		if ((!arg || !*arg) && hkPickProvider(provpick, sizeof provpick)) arg = provpick;
 		if (arg && *arg) {
 			enum aiProviderType t = hkParseProvider(arg);
 			if (t == AI_PROVIDER_NONE) {
@@ -6651,17 +6999,37 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 						snprintf(fmsg, sizeof(fmsg), "(flattened %d tool turn(s) for swap)", before - after);
 						aiAddHistory(data, fmsg);
 					}
-					/* Carried-over model may belong to the old provider — a foreign
-					   id 404s the new one (empty stream). Reset to a sane default. */
-					if (!hkModelFitsProvider(E.ai_provider_type, E.ai_model)) {
-						const char *dm = hkProviderDefaultModel(E.ai_provider_type);
-						if (dm) {
+				}
+				/* Carried-over model may belong to the old provider — a foreign id
+				   404s the new one (empty stream). Runs on EVERY :provider, not just
+				   an enum change: groq → openrouter is the same AI_PROVIDER_OPENAI,
+				   and the enum-level fit check can't see gateway naming either
+				   ("gpt-4o-mini" passes for openai; openrouter only answers to
+				   vendor/model ids). When the host publishes a catalog, membership
+				   in it is the real test. Cached, so this is usually free. */
+				{
+					static char live1[HK_MODELS_MAX][96];
+					clOAuthEnsureFresh(data);	/* an expired token = no catalog */
+					int lv = hkModelsLive(live1, HK_MODELS_MAX, 0, NULL);
+					int known = 0;
+					for (int i = 0; i < lv && E.ai_model; i++)
+						if (!strcmp(E.ai_model, live1[i])) { known = 1; break; }
+					if (!hkModelFitsProvider(E.ai_provider_type, E.ai_model) || (lv > 0 && !known)) {
+						/* Keep the compiled-in default when the host actually offers
+						   it; otherwise take the newest thing it does offer. */
+						const char *pref = hkProviderDefaultModel(E.ai_provider_type);
+						const char *dm = NULL;
+						for (int i = 0; i < lv && pref; i++)
+							if (!strcmp(pref, live1[i])) { dm = live1[i]; break; }
+						if (!dm && lv > 0) dm = live1[0];
+						if (!dm) dm = pref;
+						if (dm && (!E.ai_model || strcmp(dm, E.ai_model))) {
 							free(E.ai_model); E.ai_model = strdup(dm);
 							char mm[192];
 							snprintf(mm, sizeof(mm), "model \xE2\x86\x92 %s (prior model not valid for %s; :model to change, :models to list)",
-								dm, hkProviderName(E.ai_provider_type));
+								dm, hkProviderLabel());
 							aiAddHistory(data, mm);
-						} else {
+						} else if (!dm) {
 							aiAddHistory(data, "note: pick a model for this provider — :model <id> (:models to list)");
 						}
 					}
@@ -6670,7 +7038,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				hkSaveSession();
 				char msg[256];
 				snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
-					hkProviderName(t),
+					hkProviderLabel(),
 					hkProviderDefaultEndpoint(arg) ? " endpoint=" : "",
 					hkProviderDefaultEndpoint(arg) ? hkProviderDefaultEndpoint(arg) : "");
 				aiAddHistory(data, msg);
@@ -7064,6 +7432,7 @@ static void clLoadRc(void) {
 		else if (strcmp(key, "ai_max_tokens") == 0) { E.ai_max_tokens = atoi(val); hk_rc_pin.max_tokens = 1; }
 		else if (strcmp(key, "ai_tools_enabled") == 0) { E.ai_tools_enabled = atoi(val) ? 1 : 0; hk_rc_pin.tools = 1; }
 		else if (strcmp(key, "ai_stream") == 0) { E.ai_stream = atoi(val) ? 1 : 0; hk_rc_pin.stream = 1; }
+		else if (strcmp(key, "show_splash") == 0) { E.show_splash = atoi(val) ? 1 : 0; }
 		else if (strcmp(key, "ai_auto_approve") == 0) { E.ai_auto_approve = atoi(val) ? 1 : 0; hk_rc_pin.auto_approve = 1; }
 		else if (strcmp(key, "anim_style") == 0) {
 			E.anim_force_style = -1;
@@ -7093,6 +7462,7 @@ static void clInitConfig(void) {
 	E.anim_force_style = -1;
 #ifndef _WIN32
 	E.color_enabled = isatty(STDOUT_FILENO) ? 1 : 0;
+	E.show_splash = 1;
 #endif
 }
 
@@ -7245,6 +7615,14 @@ static int clTermCols(void) {
 	return 80;
 }
 
+static int clTermRows(void) {
+#ifndef _WIN32
+	struct winsize ws;
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) != -1 && ws.ws_row > 0) return ws.ws_row;
+#endif
+	return 24;
+}
+
 /* Multi-row aware redraw (linenoise-style). Tracks rows used + cursor row across calls. */
 static int cl_redraw_oldrows = 0;
 static int cl_redraw_oldrpos = 0;
@@ -7283,6 +7661,183 @@ static char *clGhostSuffix(const char *buf, int len) {
 	}
 	if (matches == 1) return strdup(only + pl);
 	return NULL;
+}
+
+/* ── bash-style completion ──────────────────────────────────────────────────
+   The old TAB only fired when exactly ONE candidate matched, which meant it did
+   nothing in the common case. This gathers candidates for whatever word the
+   cursor is in, extends to the longest common prefix, and lists the rest in
+   columns like a shell does. Contexts: colon commands, the argument vocabulary
+   of the command being typed, and otherwise the filesystem. */
+#define CL_COMP_MAX 512
+
+static const char *HK_PROVIDER_WORDS[] = {
+	"mithraeum", "anthropic", "anthropic-api", "claude", "claude-api", "openai",
+	"github-copilot", "copilot", "github-models", "ghmodels",
+	"ollama", "ollamacloud", "ocloud", "local", "koi",
+	"gemini", "google", "groq", "cerebras", "deepseek", "mistral",
+	"together", "fireworks", "openrouter", "openrouter-api",
+	"xai", "grok", "github", "custom", NULL
+};
+
+static int clCompAdd(char out[][160], int n, const char *word, const char *pfx, size_t plen) {
+	if (n >= CL_COMP_MAX) return n;
+	if (plen && strncmp(word, pfx, plen) != 0) return n;
+	for (int i = 0; i < n; i++) if (!strcmp(out[i], word)) return n;
+	snprintf(out[n], 160, "%s", word);
+	return n + 1;
+}
+
+/* Complete a filesystem path: split the word at its last '/', list that dir,
+   match the tail. Directories come back with a trailing '/' so a second TAB
+   descends instead of stopping. */
+static int clCompPaths(const char *word, char out[][160], int max) {
+	char dirpart[PATH_MAX] = ".", base[256] = "";
+	const char *slash = strrchr(word, '/');
+	if (slash) {
+		size_t dl = (size_t)(slash - word);
+		if (dl == 0) { dirpart[0] = '/'; dirpart[1] = '\0'; }
+		else if (dl < sizeof(dirpart)) { memcpy(dirpart, word, dl); dirpart[dl] = '\0'; }
+		snprintf(base, sizeof(base), "%s", slash + 1);
+	} else {
+		snprintf(base, sizeof(base), "%s", word);
+	}
+	char expanded[PATH_MAX];
+	if (dirpart[0] == '~') {
+		const char *home = getenv("HOME");
+		snprintf(expanded, sizeof(expanded), "%s%s", home ? home : "", dirpart + 1);
+	} else {
+		snprintf(expanded, sizeof(expanded), "%s", dirpart);
+	}
+	DIR *d = opendir(expanded);
+	if (!d) return 0;
+	size_t blen = strlen(base);
+	int n = 0;
+	struct dirent *de;
+	while ((de = readdir(d)) != NULL && n < max) {
+		if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+		if (blen == 0 && de->d_name[0] == '.') continue;   /* hidden only on request */
+		if (blen && strncmp(de->d_name, base, blen) != 0) continue;
+		char full[PATH_MAX + 300], cand[160];
+		snprintf(full, sizeof(full), "%s/%s", expanded, de->d_name);
+		struct stat st;
+		int isdir = (stat(full, &st) == 0 && S_ISDIR(st.st_mode));
+		if (slash) snprintf(cand, sizeof(cand), "%.*s/%s%s", (int)(slash - word), word, de->d_name, isdir ? "/" : "");
+		else snprintf(cand, sizeof(cand), "%s%s", de->d_name, isdir ? "/" : "");
+		snprintf(out[n], 160, "%s", cand);
+		n++;
+	}
+	closedir(d);
+	return n;
+}
+
+/* Candidates for the word ending at the cursor. *wstart = where that word
+   begins in buf; *is_path tells the caller not to append a space after a '/'. */
+static int clCompletions(const char *buf, int len, int *wstart,
+                         int *is_path, char out[][160], int max) {
+	(void)max;
+	int ws = len;
+	while (ws > 0 && buf[ws - 1] != ' ') ws--;
+	*wstart = ws;
+	*is_path = 0;
+	const char *word = buf + ws;
+	size_t wlen = (size_t)(len - ws);
+	int n = 0;
+
+	/* `:cmd` itself — the word starts right after the : or / sigil. */
+	if ((buf[0] == ':' || buf[0] == '/') && ws == 0) {
+		*wstart = 1;
+		const char *pfx = buf + 1;
+		size_t plen = (size_t)(len - 1);
+		for (int i = 0; HK_COLON_CMDS[i]; i++) n = clCompAdd(out, n, HK_COLON_CMDS[i], pfx, plen);
+		return n;
+	}
+
+	/* Argument vocabularies, keyed off the command word. */
+	if (buf[0] == ':' || buf[0] == '/') {
+		char cmd[32] = "";
+		int ci = 0;
+		for (int i = 1; i < len && buf[i] != ' ' && ci < (int)sizeof(cmd) - 1; i++) cmd[ci++] = buf[i];
+		cmd[ci] = '\0';
+		if (!strcmp(cmd, "provider") || !strcmp(cmd, "providers") || !strcmp(cmd, "login") || !strcmp(cmd, "logout")) {
+			for (int i = 0; HK_PROVIDER_WORDS[i]; i++) n = clCompAdd(out, n, HK_PROVIDER_WORDS[i], word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "theme")) {
+			for (int i = 0; i < TH_PRESET_COUNT; i++) n = clCompAdd(out, n, TH_PRESETS[i].name, word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "model") || !strcmp(cmd, "models") || !strcmp(cmd, "pull")) {
+			static char names[HK_MODELS_MAX][96];
+			int mn = hkGatherModels(names, HK_MODELS_MAX);
+			for (int i = 0; i < mn; i++) n = clCompAdd(out, n, names[i], word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "tools") || !strcmp(cmd, "toolgate") || !strcmp(cmd, "auto")) {
+			n = clCompAdd(out, n, "on", word, wlen);
+			n = clCompAdd(out, n, "off", word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "toolmode")) {
+			n = clCompAdd(out, n, "native", word, wlen);
+			n = clCompAdd(out, n, "prose", word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "sessions")) {
+			n = clCompAdd(out, n, "clear", word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "skills") || !strcmp(cmd, "mcp")) {
+			n = clCompAdd(out, n, "reload", word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "skill")) {
+			n = clCompAdd(out, n, "install", word, wlen);
+			n = clCompAdd(out, n, "uninstall", word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "history")) {
+			n = clCompAdd(out, n, "local", word, wlen);
+			n = clCompAdd(out, n, "global", word, wlen);
+			return n;
+		}
+		if (!strcmp(cmd, "trust")) {
+			n = clCompAdd(out, n, "revoke", word, wlen);
+			return n;
+		}
+	}
+
+	/* Anything else: the filesystem, so "read src/ma<TAB>" works mid-sentence. */
+	*is_path = 1;
+	return clCompPaths(word, out, CL_COMP_MAX);
+}
+
+/* Longest prefix shared by every candidate. */
+static int clCompCommon(char cand[][160], int n) {
+	if (n <= 0) return 0;
+	int i = 0;
+	for (;; i++) {
+		char c = cand[0][i];
+		if (!c) return i;
+		for (int k = 1; k < n; k++) if (cand[k][i] != c) return i;
+	}
+}
+
+/* Shell-style column dump above the prompt. */
+static void clCompList(char cand[][160], int n) {
+	int cols = clTermCols();
+	int w = 0;
+	for (int i = 0; i < n; i++) { int l = (int)strlen(cand[i]); if (l > w) w = l; }
+	w += 2;
+	int percol = w > 0 ? cols / w : 1;
+	if (percol < 1) percol = 1;
+	putchar('\n');
+	for (int i = 0; i < n; i++) {
+		printf("%s%-*s%s", TH_META, w, cand[i], ANSI_RESET);
+		if ((i + 1) % percol == 0) putchar('\n');
+	}
+	if (n % percol) putchar('\n');
+	fflush(stdout);
 }
 
 /* Most recent ghost so the TAB handler can accept it without recomputing. */
@@ -7481,55 +8036,33 @@ static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
 				}
 				continue;
 			}
-			/* TAB completion: commands + provider names after :login / :provider / :logout. */
-			if ((buf[0] != '/' && buf[0] != ':') || cur != len) continue;
-			const char **slash_cmds = HK_COLON_CMDS;   /* shared vocab (see clGhostSuffix) */
-			static const char *provs[] = {
-				"anthropic", "anthropic-api", "claude", "claude-api", "openai",
-				"github-copilot", "copilot", "github-models", "ghmodels",
-				"ollama", "ollamacloud", "ocloud", "local", "koi",
-				"gemini", "google", "groq", "cerebras", "deepseek", "mistral",
-				"together", "fireworks", "openrouter", "openrouter-api",
-				"xai", "grok", "github", "custom", NULL
-			};
-			char prefix_char = buf[0];  /* preserve `:` or `/` user typed */
-			const char *sp = strchr(buf, ' ');
-			if (!sp) {
-				const char *partial = buf + 1;
-				size_t plen2 = strlen(partial);
-				const char *only = NULL; int nm = 0;
-				for (int i = 0; slash_cmds[i]; i++) {
-					if (strncmp(slash_cmds[i], partial, plen2) == 0) { only = slash_cmds[i]; nm++; }
-				}
-				if (nm == 1) {
-					size_t mlen = strlen(only);
-					if (1 + mlen + 1 < sizeof(buf)) {
-						buf[0] = prefix_char; memcpy(buf + 1, only, mlen);
-						buf[1 + mlen] = ' '; buf[1 + mlen + 1] = '\0';
-						len = cur = (int)(1 + mlen + 1);
-					}
-				}
-			} else {
-				int wants = !strncmp(buf + 1, "login ", 6) || !strncmp(buf + 1, "provider ", 9) || !strncmp(buf + 1, "logout ", 7);
-				if (wants) {
-					const char *arg2 = sp + 1; while (*arg2 == ' ') arg2++;
-					size_t alen = strlen(arg2);
-					const char *only = NULL; int nm = 0;
-					for (int i = 0; provs[i]; i++) {
-						if (strncmp(provs[i], arg2, alen) == 0) { only = provs[i]; nm++; }
-					}
-					if (nm == 1) {
-						int prefix_len = (int)(arg2 - buf);
-						size_t mlen = strlen(only);
-						if (prefix_len + mlen + 1 < (int)sizeof(buf)) {
-							memcpy(buf + prefix_len, only, mlen);
-							buf[prefix_len + mlen] = '\0';
-							len = cur = prefix_len + (int)mlen;
+			/* Shell-style: extend to the longest common prefix, and if that adds
+			   nothing, list the candidates in columns. Works for colon commands,
+			   their argument vocabularies, and paths anywhere in a line. */
+			if (cur != len) continue;
+			{
+				static char cand[CL_COMP_MAX][160];
+				int wstart = 0, is_path = 0;
+				int nc = clCompletions(buf, len, &wstart, &is_path, cand, CL_COMP_MAX);
+				if (nc <= 0) continue;
+				int common = clCompCommon(cand, nc);
+				int wordlen = len - wstart;
+				if (common > wordlen) {
+					/* Grow the word to the shared prefix. */
+					if (wstart + common < (int)sizeof(buf) - 2) {
+						memcpy(buf + wstart, cand[0], (size_t)common);
+						len = cur = wstart + common;
+						buf[len] = '\0';
+						if (nc == 1) {
+							int isdir = len > 0 && buf[len - 1] == '/';
+							if (!isdir && len + 1 < (int)sizeof(buf)) { buf[len++] = ' '; buf[len] = '\0'; cur = len; }
 						}
 					}
+				} else if (nc > 1) {
+					clCompList(cand, nc);
+					clRedrawReset();
 				}
-			}
-			clRedrawLine(prompt, buf, len, cur);
+			}			clRedrawLine(prompt, buf, len, cur);
 			continue;
 		}
 		if (c == 12) {
@@ -8480,75 +9013,224 @@ static int clCellWidth(const char *s) {
 	return n;
 }
 
-/* Reusable arrow-key popup picker. Themed box, ↑/↓ (or k/j) to move, enter to
-   select, esc / q / ^C to cancel. Returns the chosen index, or -1 cancelled.
+/* Truncate in place to `cells` visible cells, never splitting a multibyte
+   glyph. Row padding and the picker hint both need this — strlen counts bytes,
+   so a row full of "·" pads short and the right border walks left. */
+static void clClipToCells(char *buf, int cells) {
+	if (cells < 0) cells = 0;
+	int n = 0;
+	unsigned char *q = (unsigned char *)buf;
+	while (*q) {
+		int adv = 1;
+		while (q[adv] && (q[adv] & 0xc0) == 0x80) adv++;
+		if (n + 1 > cells) { *q = '\0'; return; }
+		n++; q += adv;
+	}
+}
+
+/* Case-insensitive substring — the picker's filter and nothing else so far.
+   (strcasestr is a GNU/BSD extension; not portable to the MinGW build.) */
+static const char *clStrCaseStr(const char *hay, const char *needle) {
+	if (!needle || !*needle) return hay;
+	for (; *hay; hay++) {
+		const char *h = hay, *n = needle;
+		while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) { h++; n++; }
+		if (!*n) return hay;
+	}
+	return NULL;
+}
+
+/* Reusable arrow-key popup picker. Themed box, ↑/↓ (or k/j) to move, `/` to
+   filter, enter to select, esc / q / ^C to cancel. Rows scroll in a window of
+   CL_POPUP_VIS so a 300-model provider catalog stays a box, not a wall.
+   Returns the chosen index, or -1 cancelled.
    Redraws in place and erases itself on exit (caller prints the outcome line).
    No tty → numbered text prompt. `preview` (nullable) writes a short, optionally
    ANSI-colored hint per row (e.g. a theme swatch). */
+/* Read one byte, giving up after `ms`. An escape sequence (\x1b[A) arrives as
+   one burst, so a byte that does NOT follow within a few ms means the user
+   pressed Esc by itself — without this the picker blocks on a bare Esc until
+   some other key is pressed, which reads as "Esc did nothing". */
+static int clReadByteTimeout(char *c, int ms) {
+#ifndef _WIN32
+	fd_set fds;
+	FD_ZERO(&fds);
+	FD_SET(STDIN_FILENO, &fds);
+	struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
+	int r = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+	if (r <= 0) return 0;
+#else
+	(void)ms;
+#endif
+	return read(STDIN_FILENO, c, 1) == 1;
+}
+
+#define CL_POPUP_VIS       12
+#define CL_POPUP_TEXT_MAX  40
 static int clPopupSelect(const char *title, const char **items, int n,
                          int cur, clPopupPreview preview) {
 	if (n <= 0) return -1;
 	if (cur < 0 || cur >= n) cur = 0;
 
-	if (!isatty(STDIN_FILENO) || !E.color_enabled || clEnableRaw() != 0) {
+	/* Which gate sent us to the numbered fallback is invisible otherwise, and the
+	   answer differs per terminal (iSh emulates termios; tcsetattr can fail). */
+	int no_stdin = !isatty(STDIN_FILENO);
+	int no_color = !E.color_enabled;
+	int no_raw   = (no_stdin || no_color) ? 0 : (clEnableRaw() != 0);
+	if (no_stdin || no_color || no_raw) {
+		if (E.debug)
+			fprintf(stderr, "[popup] text fallback: stdin_tty=%d stdout_tty=%d raw=%s\n",
+				!no_stdin, isatty(STDOUT_FILENO), no_raw ? "failed" : "not tried");
 		printf("%s:\n", title ? title : "select");
 		char pv[128];
-		for (int i = 0; i < n; i++) {
+		int shown = n > CL_POPUP_TEXT_MAX ? CL_POPUP_TEXT_MAX : n;
+		for (int i = 0; i < shown; i++) {
 			if (preview) { preview(i, pv, sizeof pv); printf("  %d) %-14s %s\n", i + 1, items[i], pv); }
 			else printf("  %d) %s\n", i + 1, items[i]);
 		}
+		if (n > shown) printf("  … %d more\n", n - shown);
 		char line[32];
-		printf("  pick [1-%d]: ", n); fflush(stdout);
+		printf("  pick [1-%d]: ", shown); fflush(stdout);
 		if (!fgets(line, sizeof line, stdin)) return -1;
 		int pick = atoi(line);
-		return (pick >= 1 && pick <= n) ? pick - 1 : -1;
+		return (pick >= 1 && pick <= shown) ? pick - 1 : -1;
 	}
 
-	/* Inner width = widest of title and every "  › item  preview" row. */
+	/* Filter view: vis[] holds the items[] indices currently matching `flt`.
+	   A provider catalog runs to hundreds of entries, so the box scrolls a
+	   window of CL_POPUP_VIS rows and `/` narrows the set instead of asking
+	   the user to arrow through 300 models. */
+	int *vis = malloc(sizeof(int) * (size_t)n);
+	if (!vis) return -1;
+	char flt[64] = "";
+	int flen = 0, filtering = 0;
+	int nv = n, vpos = cur, top = 0;
+	for (int i = 0; i < n; i++) vis[i] = i;
+
+	/* Inner width = widest of title and every "  › item  preview" row, clamped to
+	   the window. A phone held vertically is ~30 columns; without the clamp the
+	   border wraps and every redraw leaves debris. */
+	int term_cols = clTermCols(), term_rows = clTermRows();
 	char pv[128];
 	int inner = clCellWidth(title ? title : "") + 2;
 	for (int i = 0; i < n; i++) {
-		int w = 4 + (int)strlen(items[i]);
+		int w = 4 + clCellWidth(items[i]);
 		if (preview) { preview(i, pv, sizeof pv); w += 2 + clCellWidth(pv); }
 		if (w > inner) inner = w;
 	}
 	if (inner > 64) inner = 64;
-	if (inner < 18) inner = 18;
+	if (inner > term_cols - 2) inner = term_cols - 2;
+	if (inner < 12) inner = 12;
 
-	int drawn = 0, result = -1;
+	/* Rows the box may use. The whole box has to FIT: if it is taller than the
+	   window the terminal scrolls under us, and the cursor-relative redraw
+	   (\x1b[nA) then lands a line off — which is what makes the title reprint
+	   itself and the box smear as you scroll on a small screen. */
+	int maxvis = term_rows - 5;
+	if (maxvis > CL_POPUP_VIS) maxvis = CL_POPUP_VIS;
+	if (maxvis < 3) maxvis = 3;
+
+	/* Reserve the box's height up front: emit its lines, then climb back. Any
+	   scrolling the window needs happens here, once, before the redraw loop
+	   starts doing relative cursor math. */
+	{
+		int reserve = (n < maxvis ? n : maxvis) + 3;
+		for (int i = 0; i < reserve; i++) { if (write(STDOUT_FILENO, "\n", 1) < 0) {} }
+		char up[16];
+		int k = snprintf(up, sizeof up, "\x1b[%dA\r", reserve);
+		if (write(STDOUT_FILENO, up, k) < 0) {}
+	}
+
+	int prev_rows = 0, result = -1, refilter = 0;
 	for (;;) {
-		/* Box is n+3 lines (top + n rows + bottom + hint); the hint has no trailing
-		   newline so the cursor rests ON the last line — rise n+2 to reach the top. */
-		if (drawn) { char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", n + 2); if (write(STDOUT_FILENO, up, k) < 0) {} }
+		if (refilter) {
+			/* Keep the highlight on the same item when it survives the filter. */
+			int keep = (nv > 0 && vpos < nv) ? vis[vpos] : -1;
+			nv = 0;
+			for (int i = 0; i < n; i++) {
+				if (!flen || clStrCaseStr(items[i], flt)) vis[nv++] = i;
+			}
+			vpos = 0;
+			for (int i = 0; i < nv; i++) if (vis[i] == keep) { vpos = i; break; }
+			top = 0;
+			refilter = 0;
+		}
+		int rows = nv < maxvis ? nv : maxvis;
+		if (rows < 1) rows = 1;                       /* "(no match)" row */
+		if (vpos < top) top = vpos;
+		if (vpos >= top + rows) top = vpos - rows + 1;
+		if (top < 0) top = 0;
 
-		/* Top border with embedded title: ╭─ title ──────╮ */
+		/* Box is rows+3 lines (top + rows + bottom + hint); the hint has no trailing
+		   newline so the cursor rests ON the last line — rise prev_rows+2 to the top. */
+		if (prev_rows) {
+			char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", prev_rows + 2);
+			if (write(STDOUT_FILENO, up, k) < 0) {}
+			/* A narrowing filter leaves old rows below the new box — wipe them. */
+			if (prev_rows > rows) {
+				for (int i = 0; i < prev_rows + 3; i++) { if (write(STDOUT_FILENO, "\x1b[2K\n", 5) < 0) {} }
+				char back[16]; int b = snprintf(back, sizeof back, "\x1b[%dA\r", prev_rows + 3);
+				if (write(STDOUT_FILENO, back, b) < 0) {}
+			}
+		}
+
+		/* Top border with embedded title: ╭─ title (n) ──────╮ */
+		char head[96];
+		if (nv != n) snprintf(head, sizeof head, "%s (%d/%d)", title ? title : "", nv, n);
+		else snprintf(head, sizeof head, "%s", title ? title : "");
 		if (E.color_enabled) fputs(TH_ACCENT, stdout);
 		fputs("\r╭─ ", stdout);
 		if (E.color_enabled) fputs(ANSI_BOLD, stdout);
-		fputs(title ? title : "", stdout);
+		fputs(head, stdout);
 		if (E.color_enabled) { fputs(ANSI_RESET, stdout); fputs(TH_ACCENT, stdout); }
 		fputc(' ', stdout);
-		for (int i = clCellWidth(title ? title : "") + 3; i < inner; i++) fputs("─", stdout);
+		for (int i = clCellWidth(head) + 3; i < inner; i++) fputs("─", stdout);
 		fputs("╮\x1b[K\n", stdout);
 
-		/* Rows. */
-		for (int i = 0; i < n; i++) {
-			int sel = (i == cur);
+		/* Rows (windowed). */
+		if (nv == 0) {
+			if (E.color_enabled) fputs(TH_ACCENT, stdout);
+			fputs("\r│", stdout);
+			if (E.color_enabled) fputs(TH_META, stdout);
+			fputs("   (no match)", stdout);
+			if (E.color_enabled) fputs(ANSI_RESET, stdout);
+			for (int p = 13; p < inner; p++) putchar(' ');
+			if (E.color_enabled) fputs(TH_ACCENT, stdout);
+			fputs("│\x1b[K\n", stdout);
+		}
+		for (int r = 0; r < rows && nv > 0; r++) {
+			int vi = top + r;
+			if (vi >= nv) break;
+			int i = vis[vi];
+			int sel = (vi == vpos);
 			if (E.color_enabled) fputs(TH_ACCENT, stdout);
 			fputs("\r│", stdout);
 			if (E.color_enabled) fputs(sel ? TH_ACCENT : ANSI_RESET, stdout);
 			fputs(sel ? " › " : "   ", stdout);
 			if (E.color_enabled) fputs(sel ? ANSI_BOLD : TH_AI, stdout);
-			fputs(items[i], stdout);
+			/* Long ids (openrouter's "vendor/model:free") would push the border.
+			   Measured in CELLS — a row of "·" separators is longer in bytes. */
+			int room = inner - 3 - (preview ? 0 : 1);
+			int ilen = clCellWidth(items[i]);
+			if (ilen > room) {
+				char clip[192];
+				snprintf(clip, sizeof clip, "%s", items[i]);
+				clClipToCells(clip, room - 1);
+				printf("%s…", clip);
+				ilen = room;
+			} else fputs(items[i], stdout);
 			if (E.color_enabled) fputs(ANSI_RESET, stdout);
-			int used = 3 + (int)strlen(items[i]);
+			int used = 3 + ilen;
 			if (preview) {
 				preview(i, pv, sizeof pv);
-				int gap = inner - used - clCellWidth(pv) - 1;
+				int gap = inner - used - clCellWidth(pv) - 2;   /* -2 leaves an inset before the border */
 				for (int g = 0; g < gap; g++) putchar(' ');
 				putchar(' ');
 				fputs(pv, stdout);
 				if (E.color_enabled) fputs(ANSI_RESET, stdout);
+				/* gap + ' ' + preview + the trailing pad fill the row exactly.
+				   Claiming inner here (or inner-1 with the old -1 gap) let the
+				   pad add a cell and skewed the right border on :theme rows. */
 				used = inner - 1;
 			}
 			for (int p = used; p < inner; p++) putchar(' ');
@@ -8562,34 +9244,70 @@ static int clPopupSelect(const char *title, const char **items, int n,
 		for (int i = 0; i < inner; i++) fputs("─", stdout);
 		fputs("╯\x1b[K\n", stdout);
 		if (E.color_enabled) fputs(TH_META, stdout);
-		fputs("\r  ↑/↓ move · enter select · esc cancel\x1b[K", stdout);
+		/* The hint must never WRAP: a wrapped line is two rows, the redraw math
+		   assumes one, and every repaint then lands a row low — which stacks a
+		   fresh title bar on each keypress (seen on a 32-column phone). Short
+		   form when the long one would not fit. */
+		{
+			char hint[128];
+			if (filtering)       snprintf(hint, sizeof hint, "  /%s", flt);
+			else if (flen)       snprintf(hint, sizeof hint, "  /%s · ↑/↓ · enter select · esc clear", flt);
+			else                 snprintf(hint, sizeof hint, "  ↑/↓ move · / filter · enter select · esc cancel");
+			if (clCellWidth(hint) > term_cols - 1) {
+				if (filtering)   snprintf(hint, sizeof hint, "  /%s", flt);
+				else if (flen)   snprintf(hint, sizeof hint, "  /%s · esc clear", flt);
+				else             snprintf(hint, sizeof hint, "  ↑/↓ · / filter · ⏎ · esc");
+			}
+			/* Still too wide (a very narrow window, or a long filter): clip. */
+			if (clCellWidth(hint) > term_cols - 1) clClipToCells(hint, term_cols - 1);
+			printf("\r%s\x1b[K", hint);
+		}
 		if (E.color_enabled) fputs(ANSI_RESET, stdout);
 		fflush(stdout);
-		drawn = 1;
+		prev_rows = rows;
 
 		char c;
 		if (read(STDIN_FILENO, &c, 1) != 1) { result = -1; break; }
-		if (c == '\r' || c == '\n') { result = cur; break; }
-		if (c == 3 || c == 'q') { result = -1; break; }   /* ^C / q */
-		if (c == 'k') { if (cur > 0) cur--; continue; }
-		if (c == 'j') { if (cur < n - 1) cur++; continue; }
+		if (c == 3) { result = -1; break; }                              /* ^C */
+		if (c == '\r' || c == '\n') {
+			if (filtering) { filtering = 0; continue; }                  /* commit filter */
+			result = (nv > 0) ? vis[vpos] : -1;
+			break;
+		}
 		if (c == '\x1b') {
 			char s1;
-			if (read(STDIN_FILENO, &s1, 1) != 1) { result = -1; break; }  /* bare esc */
-			if (s1 != '[' && s1 != 'O') { result = -1; break; }
+			if (!clReadByteTimeout(&s1, 40) || (s1 != '[' && s1 != 'O')) {   /* bare esc */
+				if (filtering || flen) { flt[0] = '\0'; flen = 0; filtering = 0; refilter = 1; continue; }
+				result = -1; break;
+			}
 			char s2;
-			if (read(STDIN_FILENO, &s2, 1) != 1) { result = -1; break; }
-			if (s2 == 'A') { if (cur > 0) cur--; }
-			else if (s2 == 'B') { if (cur < n - 1) cur++; }
+			if (!clReadByteTimeout(&s2, 40)) { result = -1; break; }
+			if (s2 == 'A') { if (vpos > 0) vpos--; }
+			else if (s2 == 'B') { if (vpos < nv - 1) vpos++; }
 			continue;
 		}
+		if (filtering) {
+			if (c == 127 || c == 8) {
+				if (flen > 0) flt[--flen] = '\0'; else filtering = 0;
+				refilter = 1;
+			} else if ((unsigned char)c >= 32 && flen < (int)sizeof(flt) - 1) {
+				flt[flen++] = c; flt[flen] = '\0';
+				refilter = 1;
+			}
+			continue;
+		}
+		if (c == '/') { filtering = 1; continue; }
+		if (c == 'q') { result = -1; break; }
+		if (c == 'k') { if (vpos > 0) vpos--; continue; }
+		if (c == 'j') { if (vpos < nv - 1) vpos++; continue; }
 	}
 
+	free(vis);
 	clDisableRaw();
-	/* Erase the box: rise n+2 to the top line, clear all n+3 lines, return to top. */
-	{ char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", n + 2); if (write(STDOUT_FILENO, up, k) < 0) {} }
-	for (int i = 0; i < n + 3; i++) { if (write(STDOUT_FILENO, "\x1b[2K\n", 5) < 0) {} }
-	{ char up[16]; int k = snprintf(up, sizeof up, "\x1b[%dA\r", n + 3); if (write(STDOUT_FILENO, up, k) < 0) {} }
+	/* Erase the box: rise prev_rows+2 to the top line, clear all of it, return. */
+	{ char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", prev_rows + 2); if (write(STDOUT_FILENO, up, k) < 0) {} }
+	for (int i = 0; i < prev_rows + 3; i++) { if (write(STDOUT_FILENO, "\x1b[2K\n", 5) < 0) {} }
+	{ char up[16]; int k = snprintf(up, sizeof up, "\x1b[%dA\r", prev_rows + 3); if (write(STDOUT_FILENO, up, k) < 0) {} }
 	return result;
 }
 
@@ -8664,6 +9382,82 @@ static void clBoxRow(int inner, const char *content, const char *content_color) 
 	fputc('\n', stdout);
 }
 
+/* Full-screen splash, hako-edit style: wordmark, crate, version, then a blinking
+   "Press any key to start" (same SGR 5 the editor uses). Deliberately
+   BORDERLESS — the crate is braille (U+28xx) and terminals disagree about its
+   width (iSh/iPad renders it double-width), so a box around it gets its right
+   edge pushed off. Centering can drift; a border cannot.
+
+   Three sizes, picked from the actual terminal: a phone-sized window gets one
+   line rather than a wall of art it can't fit. Skipped when not interactive;
+   `show_splash=0` / --no-splash turn it off. */
+static void clSplash(void) {
+	if (!E.show_splash || E.pipe_mode || !E.color_enabled) return;
+	if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return;
+
+	int cols = clTermCols(), rows = clTermRows();
+	char version[64];
+	snprintf(version, sizeof(version), "v%s", HAKO_VERSION);
+	const char *tagline = "standalone llm agent";
+	const char *press = "Press any key to start";
+
+	/* full: wordmark + crate (needs ~25 rows of art). mid: wordmark alone —
+	   it matches hake's splash and, being block glyphs, is the safe choice on
+	   the emulated terminals that mis-measure braille. small: crate alone when
+	   the window is too narrow for the wordmark. phone: one line. */
+	int want_word  = (rows >= 15 && cols >= 36);
+	int want_crate = (rows >= 15 && cols >= 30) && (rows >= 26 || !want_word);
+
+	printf("\x1b[?25l\x1b[2J\x1b[H");   /* cursor parked under the art looks like a glitch */
+
+	if (!want_word && !want_crate) {
+		int top = (rows - 3) / 2; if (top < 0) top = 0;
+		for (int i = 0; i < top; i++) putchar('\n');
+		char line[96];
+		snprintf(line, sizeof(line), "\xe7\xae\xb1 HAKO CODE %s", version);
+		int pad = (cols - clCellWidth(line)) / 2; if (pad < 0) pad = 0;
+		printf("%*s%s%s%s\n\n", pad, "", TH_ACCENT, line, ANSI_RESET);
+		pad = (cols - (int)strlen(press)) / 2; if (pad < 0) pad = 0;
+		printf("%*s%s\x1b[5m%s\x1b[25m%s", pad, "", TH_META, press, ANSI_RESET);
+	} else {
+		const char **crate = (cols >= 42) ? CL_LOGO_MEDIUM : CL_LOGO_TINY;
+		int crate_rows = 0;
+		if (want_crate) for (int i = 0; crate[i]; i++) crate_rows++;
+		int word_rows = 0;
+		if (want_word) for (int i = 0; CL_LOGO_WORD[i]; i++) word_rows++;
+
+		int block = word_rows + crate_rows + 6;
+		int top = (rows - block) / 2; if (top < 0) top = 0;
+		for (int i = 0; i < top; i++) putchar('\n');
+
+		for (int i = 0; want_word && CL_LOGO_WORD[i]; i++) {
+			int pad = (cols - clCellWidth(CL_LOGO_WORD[i])) / 2; if (pad < 0) pad = 0;
+			printf("%*s%s%s%s\n", pad, "", TH_ACCENT, CL_LOGO_WORD[i], ANSI_RESET);
+		}
+		if (want_word && want_crate) putchar('\n');
+		for (int i = 0; want_crate && crate[i]; i++) {
+			int pad = (cols - clCellWidth(crate[i])) / 2; if (pad < 0) pad = 0;
+			printf("%*s%s%s%s\n", pad, "", TH_AI, crate[i], ANSI_RESET);
+		}
+		printf("\n%*s%s%sCODE%s\n", (cols - 4) / 2, "", TH_ACCENT, ANSI_BOLD, ANSI_RESET);
+		printf("%*s%s%s%s\n", (cols - (int)strlen(version)) / 2, "", TH_META, version, ANSI_RESET);
+		printf("%*s%s%s%s\n\n", (cols - (int)strlen(tagline)) / 2, "", TH_META, tagline, ANSI_RESET);
+		int pad = (cols - (int)strlen(press)) / 2; if (pad < 0) pad = 0;
+		printf("%*s%s\x1b[5m%s\x1b[25m%s", pad, "", TH_META, press, ANSI_RESET);
+	}
+	fflush(stdout);
+
+	/* Raw mode can fail on emulated terminals; never hang waiting for a key we
+	   can't read unbuffered — just move on. */
+	if (clEnableRaw() == 0) {
+		char c;
+		if (read(STDIN_FILENO, &c, 1) < 0) {}
+		clDisableRaw();
+	}
+	printf("\x1b[?25h\x1b[2J\x1b[H");
+	fflush(stdout);
+}
+
 static void clBanner(aiData *data) {
 	int cols = clTermCols();
 	int sk = hkLoadSkills(data);
@@ -8695,7 +9489,7 @@ static void clBanner(aiData *data) {
 	int row_a = clCellWidth(row_a_buf);
 	int row_b = clCellWidth(row_b_buf);
 	int row_c = clCellWidth(row_c_buf);
-	int max_row = logo_w;
+	int max_row = E.show_splash ? 0 : logo_w;   /* splash already showed the art */
 	if (row_a > max_row) max_row = row_a;
 	if (row_b > max_row) max_row = row_b;
 	if (row_c > max_row) max_row = row_c;
@@ -8711,17 +9505,30 @@ static void clBanner(aiData *data) {
 	}
 
 	putchar('\n');
+	/* Wordmark ABOVE the box, never inside it. Block-drawing glyphs are
+	   single-width in every terminal, so unlike the braille crate this can't
+	   push the border off; and art outside a frame can only mis-center. */
+	if (cols >= 36) {
+		for (int i = 0; CL_LOGO_WORD[i]; i++) {
+			int pad = (inner + 2 - clCellWidth(CL_LOGO_WORD[i])) / 2; if (pad < 0) pad = 0;
+			printf("%*s%s%s%s\n", pad, "", E.color_enabled ? TH_ACCENT : "",
+				CL_LOGO_WORD[i], E.color_enabled ? ANSI_RESET : "");
+		}
+		putchar('\n');
+	}
 	clBoxTop(inner);
-	/* Logo rows — centered, AI color. */
+	/* Logo rows — centered, AI color. Skipped when the splash just showed the
+	   art: repeating it is noise, and braille inside a box is exactly what
+	   skews the right border on terminals that render it double-width. */
 	char rowbuf[256];
-	for (int i = 0; logo[i]; i++) {
+	for (int i = 0; logo[i] && !E.show_splash; i++) {
 		int w = clCellWidth(logo[i]);
 		int lpad = (inner - w) / 2; if (lpad < 0) lpad = 0;
 		snprintf(rowbuf, sizeof(rowbuf), "%*s%s", lpad, "", logo[i]);
 		clBoxRow(inner, rowbuf, TH_AI);
 	}
-	/* Spacer + status rows. */
-	clBoxRow(inner, "", NULL);
+	/* Spacer (only under the art) + status rows. */
+	if (!E.show_splash) clBoxRow(inner, "", NULL);
 	clBoxRow(inner, row_a_buf, TH_ACCENT);
 	clBoxRow(inner, row_b_buf, TH_META);
 	clBoxRow(inner, row_c_buf, TH_META);
@@ -9140,6 +9947,8 @@ static void clFirstRunWizard(aiData *data) {
 }
 
 static int clRepl(aiData *data) {
+	hkHealLocalModel();	/* before the banner — it prints the model name */
+	clSplash();
 	clBanner(data);
 	if (!clDetectKoiDefault()) clFirstRunWizard(data);
 	clStartupMenu(data);
@@ -9295,6 +10104,7 @@ int main(int argc, char **argv) {
 			continue;
 		}
 		if (strcmp(a, "--no-color") == 0) { E.color_enabled = 0; continue; }
+		if (strcmp(a, "--no-splash") == 0) { E.show_splash = 0; continue; }
 		if (strcmp(a, "--debug") == 0) { E.debug = 1; continue; }
 		if (strcmp(a, "--compact") == 0) { E.compact = 1; continue; }
 		if (strcmp(a, "--pipe") == 0) { E.pipe_mode = 1; continue; }

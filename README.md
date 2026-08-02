@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.1-b89656?style=flat-square&labelColor=14130f" alt="v0.2.1"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.2-b89656?style=flat-square&labelColor=14130f" alt="v0.2.2"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-c8c2b2?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -30,19 +30,19 @@
 <table align="center">
   <tr>
     <td align="center" width="33%">
-      <!-- hako-code/vhs/splash.tape — startup banner, mithraeum/sho auto-default. -->
+      <!-- hako-code/vhs/splash.tape — the press-any-key splash. -->
       <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-splash.png?raw=true" alt="hako startup banner" width="100%"/><br/>
-      <sub>local <b>hako</b> model by default, via mithraeum</sub>
+      <sub>press-any-key splash · sizes down to a phone-width terminal</sub>
     </td>
     <td align="center" width="33%">
-      <!-- hako-code/vhs/models.tape — `:models` catalog. -->
+      <!-- hako-code/vhs/models.tape — `:models` against a live openrouter catalog. -->
       <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-models.png?raw=true" alt=":models output" width="100%"/><br/>
-      <sub><code>:models</code> · local hako + 13 cloud providers</sub>
+      <sub><code>:models</code> · the provider's own catalog, cached and filterable</sub>
     </td>
     <td align="center" width="33%">
-      <!-- hako-code/vhs/theme-picker.tape — bare :theme popup with live color swatches. -->
+      <!-- hako-code/vhs/theme-picker.tape — :theme swatches, then :model + / filter. -->
       <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/theme-picker.gif?raw=true" alt="theme picker popup with live swatches" width="100%"/><br/>
-      <sub>arrow-key <code>:theme</code> picker · live swatches</sub>
+      <sub><code>:theme</code> swatches · <code>:model</code> narrowed with <code>/</code></sub>
     </td>
   </tr>
 </table>
@@ -214,7 +214,7 @@ Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; g
 - **API-key paste** — `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
 - **Local** — `:login ollama` / `:login ollamacloud`. Local: ensure `ollama serve` is running. Cloud: paste an Ollama key.
 
-Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists installed local models on Ollama or curated suggestions per provider. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
+Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists the active provider's live catalog (its own listing endpoint, cached 24h — `:models refresh` refetches; installed `.mlf2` weights for **mithraeum**), falling back to a built-in list when offline. Bare `:model` opens the picker, where `/` filters as you type. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
 
 Resolution order: `HAKO_API_KEY` env → `<PROVIDER>_API_KEY` env → `~/.hako/credentials` (per provider). Legacy `CLAW_*` / `HAKOC_*` env names are read as fallback with a one-shot deprecation warning.
 
@@ -284,47 +284,31 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 <p align="center"><sub><b>—— VI ——</b></sub></p>
 
-## Change Log
+## What's new in v0.2.2
 
-### v0.2.1 (Latest)
+- **Live model lists** — `:models` and the `:model` picker read the provider's own catalog (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, Gemini, Copilot, ollama and the rest) instead of a table we maintained by hand. Cached 24h per provider+endpoint, `:models refresh` forces it, and offline falls back to the cache and then the built-in list. Non-chat entries are filtered out, newest first.
+- **`/` filters the picker** — it scrolls a window and narrows as you type (`model (30/353)`), so a gateway with hundreds of models is browsable. `:theme`, `:provider` and `:model` share it, and `:models` / `:providers` open it too.
+- **Shell-style TAB completion** — longest common prefix, then a column list when ambiguous; over commands, provider/theme/model vocabularies, and file paths anywhere in a line.
+- **Press-any-key splash** — wordmark, version and a blinking prompt, sized down through four tiers so a phone-width terminal still gets something readable. `show_splash=0` or `--no-splash` skips it.
+- **Works on a phone** — the pickers fit narrow/short windows without the title stacking on scroll, borders stay square on rows with swatches, and a lone `esc` cancels immediately instead of waiting for another key. Tested down to 24×10. `:help` opens in the same box, scrollable and filterable.
 
-- **Whole-file writes no longer truncate** — the output cap defaulted to 2048 tokens, so a `write_file` of a ~150+ line file was cut off mid-stream; nothing landed, the model re-read the old file, thought it "reverted", and looped into corruption (it strangled *capable* models, not just small ones). Tool turns now floor at 8192 (Anthropic) / 4096 (others); a stop sequence means the ceiling is never spent on a completed write, so it's pure upside.
-- **Function-call-paren tool dialect** — small models that emit `read_skill(skill="x", path="y")` inside the tags (instead of JSON) now parse and run instead of looping; `read_skill` is also clarified so a 3B stops reaching for it to *create* files (it's `write_file` for that).
-- **`:model` arrow-key picker** — bare `:model` opens the same popup as `:theme` / `:provider` (installed local weights, or the curated cloud list for the active provider); numbered fallback when piped.
-- **`~/.hakorc` wins over stale global state** — a provider/model/etc. set in `~/.hakorc` is no longer clobbered by a leftover `~/.hako/state` default, so a fresh project dir behaves as its rc says. An explicit per-project choice still overrides.
-- **More tool-name + param aliases** — `write_to_file` / `save_file` / `execute_command` / `read_text_file` / `insert_edit_into_file` and `contents` / `code` / `filepath` params, so models trained on other agents' tool names still land.
-- **Small-model harness (make a 3B actually useful)** — **auto-orient**: when a local model answers a project request with no tool (asks *you* to do it, or refuses "I can't see files"), the harness runs `list_dir(".")` itself and hands back the result, so it starts from ground truth (gated so greetings never trigger it). Plus a smaller local tool set (dropped `edit_lines`/`read_skill` — a 3B misused them), a renewable repair-nudge budget, `max_iters` 6→8 (`HAKO_MAX_ITERS`), and a shape-only tool-call example so tiny models copy the structure without parroting the prose.
-
-### v0.2.0
-
-- **`edit_file` + `edit_lines`** — change part of a file without rewriting it; indentation-tolerant match + an over-run guard so a small model can't clobber its own edit.
-- **Local-model tool reliability** — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write/edit nudges, and brevity + anti-refusal prompt rules so small models actually use their tools.
-- **Arrow-key popup picker** — bare `:theme` (live color swatches) and `:provider`; numbered fallback when piped.
-- **256-color fallback** — detects truecolor and maps the brand palette to 256 itself on terminals without it (e.g. macOS Terminal.app), so colors stay on-brand.
-- **Per-call tool permission** — `[y]/[n]/[a]` at the single exec chokepoint, every provider; `:auto` / `--yolo` to bypass.
-- **MCP client** — stdio JSON-RPC (`~/.hako/mcp.json`, `mcp__server__tool`); local models see and fuzzy-resolve MCP tools.
-- **Context + display** — `HAKO_CTX` default 8192; honest write chips; CommonMark underscores; spinner tracks the active theme.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full history (v0.1.4 → present).
+Every release since v0.1.4 is in **[CHANGELOG.md](CHANGELOG.md)**.
 
 <p align="center"><sub><b>—— VII ——</b></sub></p>
 
 ## Roadmap
 
-- [x] Termios line editor
-- [x] `--update`
-- [x] directory skills + `read_skill`
-- [x] universal2, Linux arm64, FreeBSD x86_64
-- [x] 4 OAuth providers (Anthropic, Copilot, GH Models, OpenRouter)
-- [x] Anthropic OAuth tool calls (CC-fingerprint prose mode)
-- [x] local hako auto-default (`hako-sho` 3B / `hako-koi` 7B) via the hakm subprocess
-- [x] [hako](https://github.com/mithraeums/hako) native engine wired as a **`hakm` subprocess** (`--chat-stdin`, one-shot per turn) — no ollama, no in-process link
-- [x] `edit_file` (str_replace) + `edit_lines` (line-range) tools
-- [x] local-model tool reliability — greedy tool turns, cross-turn dedup, raw `<write_file>` channel, write nudges + fence-autowrite, `HAKO_CTX`
-- [x] MCP client (stdio JSON-RPC, `mcp__server__tool`, local-model visibility + fuzzy resolve)
-- [x] arrow-key popup picker (`:theme` / `:provider` / `:model`, live swatches)
+**Shipped through v0.2.2** — termios line editor · `--update` · directory skills + `read_skill` ·
+universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
+local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
+`edit_file` + `edit_lines` · local-model tool reliability · MCP client ·
+popup pickers with live provider catalogs.
+
+**Next**
+
+- [ ] Stream local tokens — a long CPU turn currently looks dead while it works
 - [ ] MCP client mode with Dynamic Client Registration
-- [ ] Inline SHA-256 to drop openssl runtime dep
+- [ ] Inline SHA-256 to drop the openssl runtime dep
 - [ ] Vim-style error codes + Buddy BLE companion approval gateway
 
 <p align="center"><sub><b>—— VIII ——</b></sub></p>
