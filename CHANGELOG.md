@@ -3,6 +3,90 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.3] — 2026-08-14
+
+The agent grows a browser.
+
+
+### Fixed — requests that never left the machine
+- **Header buffer overflow.** Authorization headers were built into `char hdr[1024]`. An OAuth access token runs past a kilobyte, so `snprintf` truncated it mid-value and dropped the closing quote; the shell then died on an unterminated string and the turn reported "empty response". Buffer is 8192, and a command whose quotes do not balance is refused with a diagnosis instead of executed.
+- **Doubled endpoint path.** Compat bases already ending in `/openai` or `/v1` had `/v1/chat/completions` appended, producing `/v1beta/openai/v1/chat/completions`. Only the missing part is added now.
+- **Credentials were not trimmed.** A pasted key carrying a trailing newline split the curl command in two. Secrets are trimmed wherever they enter, and the assembled command is stripped of newlines.
+- **Credentials were cross-filed.** `clCredsCaptureCurrent()` saved the live key under whatever label was current, so an OAuth token could be written as another provider's API key — after which every request sent the wrong secret to the wrong host, surfacing as "over limit" or "invalid key". Capture refuses when the live token belongs to a different provider.
+- **Gemini 2.5 returned nothing.** It spends `max_tokens` on reasoning and answers `finish_reason: stop` with no content field. Requests to the Gemini compat endpoint with a 2.5 model send `reasoning_effort: none`.
+- **`:trust` could not grant trust** where `fopen` does not exist. The marker is written through `hk_fs_write`, like the rest of the agent's state.
+
+### Added — `--token`
+- `--serve --token [VALUE]` requires a secret on every request; omit the value and one is generated. Accepted as `X-Hako-Token`, or once as `?t=…`, which is exchanged for an HttpOnly cookie and redirected away so it does not sit in history. Comparison is length-independent. This is what makes it safe to reach your own machine through a tunnel.
+
+### Added — `--serve` on Windows
+- The server was fenced out of the Windows build entirely. Winsock differs from BSD sockets in five names, so those are shimmed and one server serves every platform: `WSAStartup`, `closesocket`/`recv`/`send`, `WSAGetLastError`, `getaddrinfo` in place of `getifaddrs` for the LAN URL, and `strcasestr` which the CRT does not ship. `make win-check` cross-compiles with mingw-w64 so this is caught at the desk rather than on a tag.
+
+### Added — PKCE without openssl
+- `clSha256Base64Url()` piped through the `openssl` binary, which does not exist in a browser and is not guaranteed on Windows. SHA-256 is now ~60 lines of C, verified against the standard vectors.
+
+### Changed — the browser build tells the truth about itself
+- `run_shell` is not offered where no process can be spawned, and `:providers` lists only what a page can reach — local models and OAuth flows whose token endpoints refuse cross-origin requests are hidden.
+- The tool-approval gate is skipped: a wasm turn cannot yield to ask, so the question was being auto-denied while the front end reported "allowed". The browser is already the boundary — no shell, and only files the user handed over.
+- Project trust is implicit for the same reason.
+- `chdir`/`getcwd` exist in the wasm build, so a project is a real directory there and sessions belong to folders rather than all collapsing into one.
+
+### Changed — macOS signing
+- `make` signs by default once a `hako-dev` identity exists, because an unsigned binary has its inbound LAN connections dropped silently and every rebuild otherwise broke the phone. Extended attributes are cleared before signing, which iCloud-stored checkouts need.
+
+
+### Added — `hako --serve`: hako studio, in-process
+- New mode of the same binary: an HTTP + Server-Sent Events front end for the agent, at `http://127.0.0.1:8787` by default. `--port`, `--bind`, `--dir` and `--web DIR` alongside it. **`--serve` implies `--pipe`** — it is the identical JSONL command surface the editor's Rei pane speaks, carried over a socket instead of stdin, so there is one protocol to keep honest and one place a bug can live.
+- **No child process.** HTTP threads enqueue commands, the serve loop runs them through the same `clPipeHandleLine` as `--pipe`, and every emit lands in a 2048-entry replay ring the browser reads as SSE. Nothing to respawn, nothing to wedge on a stale fd, and no `fork`/`exec` — which is what makes this mode viable where spawning is forbidden (iOS) and, later, in wasm.
+- **Tool approval round-trips to the browser.** `tool_request` goes out on the stream, `POST /api/approve` hands `y`/`n`/`a` back to the blocked worker through a condition variable; `a` routes through `hkAllowAdd`, so "always" is scoped exactly as it is at a tty (project for read/write, exact command for shell).
+- **The UI is embedded in the binary** (`hako_web.h`, generated from hako-studio's `index.html`), so one executable is the entire product and works with no network. `--web DIR` overrides it for UI work without a rebuild.
+- Routes: `/api/state` (capability handshake), `/api/events`, `/api/prompt`, `/api/slash`, `/api/approve`, `/api/stop`, `/api/sessions`, `/api/history`, `/api/dirs`, `/api/models`, `/api/link`, `/api/open`, `/api/reset`, `/api/session/{rename,delete}`. Sidebar routes are thin wrappers over the functions the CLI already uses — `clEnumerateSessions`, `hkProjectStateDir`, `hkGatherModels`, `hkMithraeumRelocate` — so the browser cannot drift from the terminal.
+- **Project switching in-process:** `{"type":"open","dir":…}` chdirs, reloads per-project state and credentials, replays the transcript, and re-announces `init` — on the command loop, so it can never race a turn in flight.
+- Loopback by default. Cross-origin POSTs are refused, session ids are validated against traversal, and a non-loopback `--bind` prints what it is exposing.
+
+### Added — `--serve` capability handshake
+- `GET /api/state` returns the core's version and the list of features it implements. A UI that updates over the air will routinely be newer than the binary it is talking to; it asks rather than assumes.
+
+### Changed — one emit sink for front-end output
+- `clPipeEmitRaw` is now the single exit for every `--pipe`/`--serve` message; `clPipeEmitMsg`, `clPipeEmitDisplay`, the new `clPipeEmitDone`/`clPipeEmitInit` and the worker's turn-boundary emit all go through it. `init` gained `dir` and `version` (additive — unknown fields are ignored by existing front ends).
+
+### Added — files, both directions (`--serve`)
+- `GET /api/dirs` returns `files[]` alongside `dirs[]`, so the browser can offer a file picker and not just a folder picker. Tapping a file puts its name in the composer.
+- `POST /api/upload?name=…` takes the raw request body as the file — `fetch(url,{body:file})` sends bytes with a `Content-Length` and no multipart wrapper, so there is no format to parse. Streams to disk (a phone video does not belong in a request buffer), lands in the **open project only** under a sanitized basename, **never overwrites** (`photo.jpg` → `photo-1.jpg`), caps at 128 MB, deletes a truncated file rather than leaving half of one, and announces itself in the transcript so the agent knows it arrived. On iOS the file input is the native Files/Photos sheet, which is the only route into a phone's storage from a browser.
+
+### Added — home-screen identity (`--serve`)
+- `/icon-180.png` (+ `/apple-touch-icon.png`, `/favicon`) and `/manifest.webmanifest` served from the embedded bundle. iOS ignores a `data:` URI for `apple-touch-icon`, so the icon has to be a real resource — it rides in the binary next to the HTML.
+
+### Fixed — `:login` wedged `--serve`
+- Commands that prompt on stdin (`:login`, `:logout`, `:auth`) parked the whole command loop on a terminal nobody could reach, with the browser showing nothing forever. Over `--serve` they now answer "that command needs the terminal" and return. `--pipe` is unaffected: the editor answers on the same channel.
+
+### Fixed — a dropped connection could kill the listener
+- `accept()` returning `ECONNABORTED` (or a momentary fd shortage) broke the accept loop, so **one** aborted connection left the server permanently deaf — including on loopback. Only a broken listening socket ends the loop now; transient errors retry, `EMFILE`/`ENFILE` back off.
+
+### Added — `--serve --debug` request log
+- Each request line, plus read/accept errno on failure. This is what identified a macOS firewall tearing down LAN sockets (`errno=57`, ENOTCONN) rather than any fault in the server.
+
+### Changed — macOS builds are signed
+- `make` signs the binary, preferring a self-signed `hako-dev` identity from the login keychain and falling back to ad-hoc. **This is functional, not cosmetic:** macOS silently blocks inbound non-loopback connections to an unsigned binary — handshake completes, socket dead by the first read — so `--serve --lan` hangs a phone with no error anywhere. With a certificate the firewall's designated requirement is `identifier + certificate leaf`, stable across rebuilds; with ad-hoc signing it is a bare code hash and every rebuild invalidates the allow entry. Signing and the Rez icon are mutually exclusive (resource fork), so the signed build carries no icon; `make SIGN=0` restores the old behaviour. Setup is in hako-studio's README.
+
+### Fixed — every OpenAI-compat provider was called "openai" where it counted
+- gemini, groq, deepseek, cerebras, xai, github-models and copilot all share `AI_PROVIDER_OPENAI`, and anything that asked the **enum** for a name got `"openai"` back. Consequences seen in one session: `:login gemini` filed the key under `openai`; `:provider gemini` auto-picked `gpt-4o-mini` (→ `404 models/gpt-4o-mini is not found`); and the fits-this-provider check agreed the two were compatible. Credentials, default-model selection and the fit heuristic now key on the **endpoint-derived label**, and one `HK_FAMILY` table holds each family's default model and name prefix — adding a provider is a row, not four scattered branches. (Same dead-data class as the curated-model-rows fix in v0.2.2, still live in three other places.)
+
+### Fixed — a near-miss tool dialect cost the whole turn
+- Models routinely emit `<tool_name="write_file">` for `<tool name="write_file">`, close it with `</invoke>` or `</tool_name>`, pass arguments as `<parameter name="path">x</parameter>` instead of a JSON body, and then **fabricate an `<observation>`** with invented results. `hkNormalizeToolDialect` repairs all of it at the single choke point inside `hkReactToolExecAll`, so the local-model, streaming and buffered paths all benefit. Fabricated observations are dropped: observations are ours to produce, and a model that writes its own has convinced itself it read a file it never opened.
+
+### Fixed — turns could end silently
+- If a response was suppressed as a tool call and then failed to parse, nothing reached the front end at all: the text was stored to the session jsonl and the user watched a spinner stop. A turn that says nothing now falls back to emitting the raw (normalized) text.
+
+### Fixed — streamed prose never reached `--pipe`/`--serve`
+- The streaming path wrote tokens straight to `stdout`. With Anthropic OAuth (which forces streaming on) the browser got tool chips and a `done` but never the model's answer, while the terminal had it. Also affected hake's Rei pane.
+
+### Added — recover a stale OAuth token without a re-login
+- An empty body from an OAuth provider triggers one silent `clOAuthRefresh` + retry per turn.
+
+### Note
+- `--serve` is POSIX-only for now; on Windows it prints that and exits. The rest of the binary is unchanged there.
+
 ## [v0.2.2] — 2026-07-30
 
 Model lists stop being a hand-maintained table.

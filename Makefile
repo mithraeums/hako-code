@@ -13,6 +13,23 @@ ICON_DIR = icon
 SRC      = hako.c
 BIN      = hako
 
+# The embedded hako studio bundle (UI + home-screen icon), generated from
+# hako-studio by `make embed` there. A prerequisite, not just an include: without
+# it a UI or icon change silently kept shipping the previous build's bundle.
+WEB_H     := $(wildcard hako_web.h)
+
+# hako_web.h is generated, and generated files that are committed go stale. It
+# is committed anyway so a clone of this repo alone builds a binary with the UI
+# in it — no second repo, no network, no submodule. The drift is closed from the
+# other side instead: if a hako-studio checkout is next door, regenerate before
+# building, so the two can never disagree on a machine that has both.
+STUDIO_UI := $(wildcard ../hako-studio/index.html)
+ifneq ($(STUDIO_UI),)
+hako_web.h: $(STUDIO_UI) ../hako-studio/tools/embed.sh
+	@sh ../hako-studio/tools/embed.sh $(STUDIO_UI) $@ ../hako-studio/icon-180.png
+WEB_H := hako_web.h
+endif
+
 # Local hako-model inference runs through the standalone `hakm` engine binary as
 # a subprocess — NOT linked into this agent. The agent build is therefore plain
 # (`make` / `all`): there is no compile-time engine flag that could be omitted,
@@ -44,7 +61,10 @@ ifeq ($(PLATFORM),macos)
     endif
 endif
 
-.PHONY: all hakm clean asan icons install uninstall
+.PHONY: all hakm clean asan icons install uninstall sign win-check
+# make deletes a target when its recipe is interrupted — which, with signing in
+# the recipe, meant Ctrl-C (or a hung codesign) destroyed a perfectly good binary.
+.PRECIOUS: $(BIN)
 
 all: $(BIN)
 
@@ -73,7 +93,7 @@ HAS_ICO := $(wildcard $(ICON_DIR)/hako.ico)
 
 ifeq ($(HAS_ICO),)
 # No icon — plain build.
-$(BIN): $(SRC)
+$(BIN): $(SRC) $(WEB_H)
 	$(CC) $(CFLAGS) $(SRC) -o $@ $(LDLIBS)
 else
 # Embed icon via windres.
@@ -83,7 +103,7 @@ hako.rc:
 hako.res: hako.rc $(ICON_DIR)/hako.ico
 	windres $< -O coff -o $@
 
-$(BIN): $(SRC) hako.res
+$(BIN): $(SRC) $(WEB_H) hako.res
 	$(CC) $(CFLAGS) $(SRC) hako.res -o $@ $(LDLIBS)
 endif
 
@@ -92,15 +112,25 @@ endif
 # ---------- macOS: build, then attach icon if tools exist ----------
 ifeq ($(PLATFORM),macos)
 
-$(BIN): $(SRC)
+$(BIN): $(SRC) $(WEB_H)
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
-	@if [ -f "$(ICON_DIR)/hako.icns" ] && command -v Rez >/dev/null 2>&1 && command -v SetFile >/dev/null 2>&1; then \
+	@# Plain build by default: compile, attach the icon, done. No keychain, no
+	@# prompts, nothing for someone cloning this to think about.
+	@#
+	@# `make sign` (or SIGN=1) is only needed for `--serve --lan`, because macOS
+	@# silently blocks inbound non-loopback connections to an unsigned binary —
+	@# handshake completes, socket dead by the first read. Signing and the Rez icon
+	@# are mutually exclusive (codesign refuses a resource fork), so signing drops
+	@# the icon. Details: hako-studio/README.
+	@if [ "$(SIGN)" != "0" ]; then \
+		$(MAKE) --no-print-directory sign; \
+	elif [ -f "$(ICON_DIR)/hako.icns" ] && command -v Rez >/dev/null 2>&1 && command -v SetFile >/dev/null 2>&1; then \
 		printf 'read %c%s%c (-16455) "%s/hako.icns";\n' "'" "icns" "'" "$(ICON_DIR)" > .hako.r; \
 		Rez -append .hako.r -o $(BIN) && SetFile -a C $(BIN) && \
-		echo "icon attached to $(BIN)" || echo "icon attach failed (non-fatal)"; \
+		echo "built $(BIN) (icon attached)" || echo "built $(BIN) (icon attach failed — harmless)"; \
 		rm -f .hako.r; \
 	else \
-		echo "icon skip (no .icns or Rez/SetFile not found)"; \
+		echo "built $(BIN)."; \
 	fi
 
 endif
@@ -108,7 +138,7 @@ endif
 # ---------- Linux: plain build, icon shipped alongside ----------
 ifeq ($(PLATFORM),linux)
 
-$(BIN): $(SRC)
+$(BIN): $(SRC) $(WEB_H)
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 	@if [ -f "$(ICON_DIR)/hako.png" ]; then \
 		echo "built $(BIN). copy $(ICON_DIR)/hako.png to ~/.local/share/icons/ for desktop entry."; \
@@ -121,16 +151,41 @@ endif
 # ---------- FreeBSD: plain build ----------
 ifeq ($(PLATFORM),freebsd)
 
-$(BIN): $(SRC)
+$(BIN): $(SRC) $(WEB_H)
 	$(CC) $(CFLAGS) $< -o $@ $(LDLIBS)
 
 endif
+
+# Sign on demand — ONLY needed to serve over a LAN on macOS (`--serve --lan`).
+# Prefers a self-signed "hako-dev" identity, because the firewall then matches on
+# the certificate and one allow entry survives every rebuild; an ad-hoc signature
+# is a bare code hash, so its allow entry dies on the next build. Falls back to
+# ad-hoc when no identity exists (still no password, still no prompt).
+# Signing strips the icon: codesign refuses a binary carrying a resource fork.
+sign: $(BIN)
+	@xattr -c $(BIN) 2>/dev/null || true
+	@id=$$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"hako-dev"' | head -1 | tr -d '"'); \
+	cp $(BIN) $(BIN).sign; \
+	xattr -c $(BIN).sign 2>/dev/null || true; \
+	echo "signing (trust evaluation can take ~30s the first time)…"; \
+	if [ -n "$$id" ]; then \
+		perl -e 'alarm 120; exec @ARGV' codesign -s "$$id" -f --timestamp=none -i com.mithraeum.hako $(BIN).sign 2>/dev/null \
+			&& mv $(BIN).sign $(BIN) && echo "signed with $$id — firewall allow survives rebuilds" \
+			|| { rm -f $(BIN).sign; echo "codesign timed out/failed; $(BIN) left as-is"; }; \
+	else \
+		perl -e 'alarm 120; exec @ARGV' codesign -s - -f --timestamp=none -i com.mithraeum.hako $(BIN).sign 2>/dev/null \
+			&& mv $(BIN).sign $(BIN) && echo "ad-hoc signed — re-run 'make sign' + re-allow after each build" \
+			|| { rm -f $(BIN).sign; echo "codesign failed; $(BIN) left as-is"; }; \
+	fi
+	@echo "then allow it once:"
+	@echo "  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add $(PWD)/$(BIN)"
+	@echo "  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp $(PWD)/$(BIN)"
 
 asan: $(SRC)
 	$(CC) -fsanitize=address,undefined -g -O1 -Wall $< -o hako_asan $(LDLIBS)
 
 clean:
-	rm -f hako hako.exe hako_asan hako.rc hako.res .hako.r
+	rm -f hako hako.exe hako.sign hako.sign.cstemp *.cstemp hako_asan hako.rc hako.res .hako.r
 	rm -rf hako_asan.dSYM
 
 # ---------- install / uninstall ----------
@@ -140,6 +195,11 @@ clean:
 
 PREFIX ?=
 ICONS  ?= 1
+# Signing is what lets --serve --lan accept connections: macOS silently drops
+# inbound non-loopback traffic to an unsigned binary. Once a hako-dev identity
+# exists, sign by default — every unsigned rebuild otherwise breaks the phone
+# with no error anywhere. SIGN=0 opts out.
+SIGN   ?= $(shell security find-identity -v -p codesigning 2>/dev/null | grep -c '"hako-dev"')
 
 _uname_s := $(shell uname -s 2>/dev/null)
 _resolve_prefix = $(if $(PREFIX),$(PREFIX),$(if $(shell test -w /usr/local/bin && echo y),/usr/local,$(HOME)/.local))
@@ -171,3 +231,13 @@ uninstall:
 		[ -d "$$d" ] && rm -f "$$d/hako.png" 2>/dev/null; \
 	done
 	@echo "(use \`rm -rf ~/.hako ~/.hakorc\` to purge state/credentials)"
+
+# Cross-compile for Windows without leaving the desk. This build has broken on
+# other platforms before — a missing feature macro, a POSIX name the Windows CRT
+# does not ship — and each time it was found by CI on a tag, which is the worst
+# place to find it. Needs mingw-w64 (brew install mingw-w64); skipped if absent.
+win-check:
+	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
+		x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra $(SRC) -o /tmp/hako-wincheck.exe -lws2_32 -lpthread && \
+		echo "windows: builds"; \
+	else echo "windows: skipped (no mingw-w64)"; fi
