@@ -22,3 +22,8 @@ hakoCLAW.res
 
 # vhs recordings — internal tooling, not shipped (outputs live in the website repo)
 vhs/
+
+# signing leftovers — codesign writes .cstemp beside its target, and an
+# interrupted run leaves both behind
+hako.sign
+*.cstemp

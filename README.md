@@ -284,7 +284,16 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 <p align="center"><sub><b>—— VI ——</b></sub></p>
 
-## What's new in v0.2.2
+## What's new in v0.2.3
+
+- **`hako --serve` — the agent in a browser.** Same binary, same sessions, same credentials, same trust: `hako --serve --dir ~/code/thing`, open `http://127.0.0.1:8787`, and there is [hako studio](https://github.com/mithraeums/hako-studio). Chat, tool approval boxes, a folder browser, per-folder sessions with rename/delete, the model picker and four themes — driven by the same JSONL protocol `--pipe` speaks to the editor, carried over HTTP + Server-Sent Events. No second process, no backend, no database, no account. `--bind 0.0.0.0` puts it on your phone (read the warning first).
+- **The UI ships inside the binary.** One executable is the whole product — nothing to install alongside it, and it works with no network at all. `--web DIR` serves the page off disk instead while you work on it.
+- **`--serve` runs the agent in-process.** No child `hako`, so there is nothing to respawn, nothing to wedge, and one process to reason about — which is also what lets this mode exist where spawning is not allowed at all.
+- **Capability handshake.** `GET /api/state` reports the version and the feature list, so a UI that updates faster than the binary asks what it is talking to instead of assuming.
+- **Files both ways.** Browse the machine's folders and files from the browser, or send a file *to* it — on a phone that opens the native Files/Photos sheet, and the upload lands in the open project without overwriting anything. Add the page to your home screen and it runs chromeless with its own icon.
+- **`--serve --lan`** prints the URL to type into a phone. On macOS `make` now signs the binary, which is what lets the firewall allow it at all — see [hako-studio](https://github.com/mithraeums/hako-studio#serving-to-a-phone-on-macos).
+
+### v0.2.2
 
 - **Live model lists** — `:models` and the `:model` picker read the provider's own catalog (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, Gemini, Copilot, ollama and the rest) instead of a table we maintained by hand. Cached 24h per provider+endpoint, `:models refresh` forces it, and offline falls back to the cache and then the built-in list. Non-chat entries are filtered out, newest first.
 - **`/` filters the picker** — it scrolls a window and narrows as you type (`model (30/353)`), so a gateway with hundreds of models is browsable. `:theme`, `:provider` and `:model` share it, and `:models` / `:providers` open it too.
@@ -298,7 +307,8 @@ Every release since v0.1.4 is in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Roadmap
 
-**Shipped through v0.2.2** — termios line editor · `--update` · directory skills + `read_skill` ·
+**Shipped through v0.2.3** — `--serve` (hako studio in a browser, UI embedded in the binary) ·
+termios line editor · `--update` · directory skills + `read_skill` ·
 universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
 local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
 `edit_file` + `edit_lines` · local-model tool reliability · MCP client ·
@@ -307,6 +317,7 @@ popup pickers with live provider catalogs.
 **Next**
 
 - [ ] Stream local tokens — a long CPU turn currently looks dead while it works
+- [ ] `hako.wasm` — the same core in a tab, no install (platform seam in `hako.c`)
 - [ ] MCP client mode with Dynamic Client Registration
 - [ ] Inline SHA-256 to drop the openssl runtime dep
 - [ ] Vim-style error codes + Buddy BLE companion approval gateway
