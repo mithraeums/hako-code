@@ -1,0 +1,43 @@
+{"id":"find-symbol","prompt":"Where is the function hkWalkDir defined in this project?","tool":"grep","key":"pattern","value":"hkWalkDir"}
+{"id":"find-caller","prompt":"Find everywhere parse_header is called.","tool":"grep","key":"pattern","value":"parse_header"}
+{"id":"find-string","prompt":"Which file contains the error message 'project not trusted'?","tool":"grep","key":"pattern","value":"project not trusted"}
+{"id":"find-todo","prompt":"Are there any TODO comments left in the code?","tool":"grep","key":"pattern","value":"TODO"}
+{"id":"find-case-insensitive","prompt":"Search for the word 'warning' anywhere, ignoring case.","tool":"grep","key":"pattern","value":"warning"}
+{"id":"find-scoped","prompt":"Search only the Python files for the word 'import'.","tool":"grep","key":"pattern","value":"import"}
+{"id":"glob-c","prompt":"List every C source file in this project.","tool":"glob","key":"pattern","value":"*.c"}
+{"id":"glob-headers","prompt":"What header files are there?","tool":"glob","key":"pattern","value":"*.h"}
+{"id":"glob-nested","prompt":"Find all the markdown files anywhere in the tree, including subdirectories.","tool":"glob","key":"pattern","value":".md"}
+{"id":"glob-tests","prompt":"Show me the test files.","tool":"glob","key":"pattern","value":"test"}
+{"id":"read-named","prompt":"Show me what is in README.md","tool":"read_file","key":"path","value":"README.md"}
+{"id":"read-makefile","prompt":"What does the Makefile do?","tool":"read_file","key":"path","value":"Makefile"}
+{"id":"read-config","prompt":"Open config.json so I can see the settings.","tool":"read_file","key":"path","value":"config.json"}
+{"id":"read-to-debug","prompt":"Why isn't parser.c compiling?","tool":"read_file","key":"path","value":"parser.c"}
+{"id":"list-here","prompt":"What files are in this directory?","tool":"list_dir","key":"path","value":"."}
+{"id":"list-subdir","prompt":"What's in the src folder?","tool":"list_dir","key":"path","value":"src"}
+{"id":"list-implicit","prompt":"What is this project?","tool":"list_dir","key":"path","value":"."}
+{"id":"create-file","prompt":"Create a file called hello.py that prints hello world.","tool":"write_file","key":"path","value":"hello.py"}
+{"id":"create-script","prompt":"Write a shell script build.sh that runs make and then the tests.","tool":"write_file","key":"path","value":"build.sh"}
+{"id":"create-polite","prompt":"Could you please make a file notes.txt with today's plan in it?","tool":"write_file","key":"path","value":"notes.txt"}
+{"id":"create-game","prompt":"Make me a pong game in python.","tool":"write_file","key":"path","value":".py"}
+{"id":"edit-existing","prompt":"In config.txt, change the line 'debug = false' to 'debug = true'.","tool":"edit_file","key":"path","value":"config.txt"}
+{"id":"edit-rename","prompt":"Rename the variable oldName to newName in util.c.","tool":"edit_file","key":"path","value":"util.c"}
+{"id":"edit-fix","prompt":"There's an off-by-one in loop.c line 40 — the condition should be < not <=. Fix it.","tool":"edit_file","key":"path","value":"loop.c"}
+{"id":"run-build","prompt":"Build the project and tell me if it compiles.","tool":"run_shell","key":"cmd","value":"make"}
+{"id":"run-tests","prompt":"Run the test suite.","tool":"run_shell","key":"cmd","value":"test"}
+{"id":"run-git","prompt":"What files have I changed since the last commit?","tool":"run_shell","key":"cmd","value":"git"}
+{"id":"run-version","prompt":"What version of python is installed here?","tool":"run_shell","key":"cmd","value":"python"}
+{"id":"fetch-doc","prompt":"Read https://example.com/changelog and summarize it.","tool":"web_fetch","key":"url","value":"example.com"}
+{"id":"fetch-api","prompt":"Fetch https://api.github.com/repos/mithraeums/hako-code and tell me the star count.","tool":"web_fetch","key":"url","value":"api.github.com"}
+{"id":"plan-multi","prompt":"Add tab support to the lexer, update the tests, and document it. Track your plan as you go.","tool":"todo","key":"","value":""}
+{"id":"plan-migration","prompt":"We need to migrate from v1 to v2: update the schema, migrate the data, update the client, and write a rollback. Keep a checklist.","tool":"todo","key":"","value":""}
+{"id":"remember-fact","prompt":"Remember for next time: this project builds with 'make all', not plain 'make'.","tool":"remember","key":"","value":""}
+{"id":"remember-pref","prompt":"Note that I always want tabs, never spaces, in this repo.","tool":"remember","key":"","value":""}
+{"id":"ask-ambiguous","prompt":"Should we rewrite the parser from scratch or patch the existing one? I can't decide.","tool":"ask_user","key":"","value":""}
+{"id":"no-tool-greeting","prompt":"hey there","tool":"","key":"","value":""}
+{"id":"no-tool-hello","prompt":"hello!","tool":"","key":"","value":""}
+{"id":"no-tool-thanks","prompt":"thanks, that worked","tool":"","key":"","value":""}
+{"id":"no-tool-concept","prompt":"What is a hash map and when would I use one?","tool":"","key":"","value":""}
+{"id":"no-tool-recursion","prompt":"Explain recursion to me like I'm new to programming.","tool":"","key":"","value":""}
+{"id":"no-tool-bigo","prompt":"What's the difference between O(n) and O(log n)?","tool":"","key":"","value":""}
+{"id":"no-tool-opinion","prompt":"Do you think Rust is better than C for systems programming?","tool":"","key":"","value":""}
+{"id":"no-tool-followup","prompt":"Why did you do it that way?","tool":"","key":"","value":""}

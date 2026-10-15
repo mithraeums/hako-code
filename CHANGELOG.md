@@ -3,6 +3,213 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.4] - 2026-10-15
+
+the agent gets teeth: it can search, it can wait for a build, it can show you what it is about to do; and it speaks the skill format the rest of the ecosystem already uses. then three weeks of running it on a phone, a tablet and a desktop (inside itself, with Claude driving) found the bugs below. every one of them was silent.
+
+### changed: the new look (2026-10-12)
+- `mithraeum` is the suite's inks on a dark terminal (washi text, bright ultramarine, straw for tool lines, so red is left to errors); `washi` is new, for a light terminal. 19 themes, the same names in hake and hako studio
+- in a 256-color terminal (terminal.app) each color maps to the nearest of the cube and the grey ramp; per-channel rounding sent warm paper to pink
+- new icon, the suite's new look: two inks, ultramarine and vermilion, on washi, printed the way a risograph misprints: the block katakana コ (the character is drawn as a box). windows `.exe`, macOS `.icns` and the linux `.png` all regenerated from `assets/icons`
+- the studio page embedded in `--serve` carries the same look (see hako-studio), and the home-screen manifest's colors follow it
+- README banner and badges in the new inks
+
+### fixed: housekeeping (2026-10-12)
+- a small model that finished its task and then said nothing more got "Error: empty response from hako engine" under the work it had just done. silence after tools ran is the end of the turn now; silence with no tool use is still an error
+- **an engine failure left the rei pane and the studio waiting forever.** a turn that errored out returned before its normal ending, so `--pipe` never sent `done`; every exit now closes the turn (harness: fails on the old binary)
+- **after any approval the input bar vanished for the rest of the turn, and typing went unread.** the keyboard hand-over wakes the reader with SIGUSR1, the same signal that means "turn over"; the flag stayed set, so the reader left the turn as soon as it had the keyboard back. type-ahead and the bar now survive approvals (harness §3k2: fails on the old binary)
+- **the second approval in a turn stranded part of the input bar above its prompt** and lost the `● run_shell  …` header. two causes: the header and diff were printed bare while the bar could be up, and the bar's own draw and erase took no lock, so the keyboard reader redrawing it as an approval handed the keyboard back raced the worker printing the tool's output (1 run in 4 under load). both fixed; pinned in the pty harness (§3k counts the rules at the second prompt)
+- **the installer refused iSh.** `install.sh` (behind `mithraeums.github.io/hako.sh`) knew only x86_64 and arm64, so on iSh (32-bit x86) it stopped at "unsupported linux arch: i686". anything without a release binary now builds from source (`SOURCE=1` forces it), and a failed tag lookup falls back to a source build instead of exiting
+- **the windows `.exe` still carried the old hakoCLAW icon.** `icon/hako.ico` and the leftover `icon/hako.iconset` predated the current mark; regenerated from the shared masters. `make icons` called a script that no longer existed; it runs the suite's icon builder now
+- **dragging the window still left a staircase of top rules** (terminal.app, any session with a few commands or a full screen). a drag sends resizes faster than the bar can be drawn, so a bar drawn at one width landed after the window had moved to the next, and the next erase climbed short. the bar now waits until the width has held still for 150 ms (or the next key) and draws once; the spinner and other output wait with it. reproduced in terminal.app before and after; `make test-tty` pins "a burst of resizes redraws once" (the old binary drew 12 times)
+- `:help` lists `:name`, `:color`, `:mouse`, `:mode`, `:e`, `:o` and `:remote`, which worked but were missing from it. `make quick` is gone; plain `make` is the same `-O0` build
+
+### fixed: hardening pass before tag (2026-09-30)
+found by a new mutation fuzzer (`make fuzz`, ASan+UBSan over every parser that reads model output or provider JSON) and by driving `--serve` with curl. every one of these is reachable from text nobody controls
+- **security: another website could drive `hako --serve`.** the Origin check compared prefixes, so a page at `http://127.0.0.1.evil.example` or `http://localhost.<anything>` passed it and could post prompts and approvals to an agent that runs shell commands; and a DNS-rebinding page (same-origin to itself, no Origin on a GET) could read the chat and files. the host is now matched exactly (loopback, a private-network address written as numbers, or the bound address) on both Origin and Host. with `--token`, the token cookie (SameSite=Strict) is the proof instead, which also un-breaks the tunnel flow: a tunnelled page's POSTs were refused with 403 because its https origin is not local. pinned in `make test-serve`; 3,000 malformed requests against an ASan build: no reports, still serving
+- **`hako --serve` wedged for good on any picker.** `:model`/`:provider`/`:sessions`/`:theme` and the model's own `ask_user` emit `choice_request`; the studio UI had no handler, and nothing (not even stop) could unpark the wait. the UI renders it now, and `/api/stop` releases any parked answer or input
+- **a stale answer approved the next tool.** `/api/approve` accepted an answer when nothing was waiting and kept it; the next approval resolved itself with it. answers are only taken while a request is pending (`{"ok":false}` otherwise), and the wait is armed before the request is visible so an instant answer is never lost
+- **heap overflow in the `<parameter>` tool dialect.** the normaliser sized its output at twice the input, but escaping can make a value six times longer. grown as it goes now
+- **a bare `<invoke name="write_file">` lost its tool name** in that same normaliser, so the call could never run; and the dedicated `<invoke>` path built its arguments in a fixed 8 KB buffer that cut large writes short. both fixed
+- **stack overflow in the markdown renderer** on a long bold/code span (`j += snprintf` past the buffer), and in the OpenAI-compatible stream on a long streamed tool name. a clamping `hkCatf()` replaces the pattern where the input is unbounded
+- **the session state file could carry stack memory.** past 8 KB (a long plan plus skills) the writer handed the over-count to the write call; every key after the plan was also lost. clamped, and the plan is written last
+- a long plan item over-read a stack buffer; the `:color` list sat 16 bytes from overflowing
+- **Claude over OAuth did not stream, and lost text.** the anthropic path held the whole answer back, then printed it raw at column 0 (no rail, no wrapping, no markdown); and printed none of the prose before a text-dialect tool call. it streams live now and goes quiet at the first tool tag, like the local engine; `--pipe` gets that prose too. pinned against a local fake of the anthropic SSE API (`tools/tty/fakeanthropic.py`)
+- **the input field placed the cursor by bytes.** after `é` or an emoji it sat cells to the right, which read as stray spaces after a paste; wrapping was miscounted the same way
+- **ctrl+o while typing threw the line away.** kept now
+- **`worked for Ns` printed at every spinner stop**; above the tool calls and the approval prompt. one line, after the turn
+- **an "always" approval was silent forever after**, which made ask mode look broken. the first tool it lets through says so; every approval decision is a `system` row in the session log
+- `:skill install` names what it installed and where
+- `:help` in `--pipe`/`--serve` is one command per line, sized for a pane, without the CLI-only keys
+- **the browser build did not compile** (33 errors, all code added since august without the wasm guard). hako studio builds `hako.c` from `main` every night, so pushing this release would have stopped the hosted studio updating. fixed, and **`make wasm-check`** guards it
+- **remote and serve tokens came from `rand()` seeded with the time and pid**; guessable, and they are all that stands between a tunnelled agent and the network. they come from the OS entropy source now (`getentropy`, `/dev/urandom`, `rand_s`), with no weak fallback; the OAuth PKCE verifier too
+- uploads claim their file name with an exclusive create (two at once could pick the same name); a small upload reports bytes, not "1 KB"
+- `-p --output-format json` reported a dead local engine as "empty response"; it carries the engine's own words and exit status now
+- **every approval in the rei pane and the studio waited five seconds** before it was even shown; the tool gate waited for a keyboard reader that `--pipe` and `--serve` do not have. 7.1 s → 0.45 s from prompt to approval box; `make test` 34 s → 7 s for the same reason. pinned in `pipe-conformance.py`
+- **`theme=` in `~/.hakorc` was never read**; only the agent's own saved state was. it is read now (same precedence as the other keys), and a theme only the editor has (gruvbox, dracula, …) uses your terminal's own colors instead of being ignored
+- release CI runs `make test` (linux, macOS, FreeBSD) and `make test-serve` (linux) before building; the **linux release is built `RELEASE=1 WEB=1` like the others** (it was `-O0` with no studio UI); every package carries LICENSE
+- `hako -v` prints `hako v…` like `hake -v` and `hakm -v`; SPDX license line on every source file
+- **the editor's 18 themes, in the agent too**; the same names as hake and hako studio, generated from hake.c (`hako-edit/tools/themes.py`; `make test` fails if the copy drifts). mithraeum and nord look as before; light themes keep body text in your terminal's own color, since the agent never paints a background. `claude` and `mono` are gone; `terminal` stays as the unlisted fallback. **the picker looks like the editor's**: title, divider, `▸`, `n/18` when it scrolls, all 18 at once on a tall enough terminal. the theme picker's name buffer held 16 entries while the count passed to it did not stop there
+- **`run_shell`'s timeout did nothing on linux or iSh.** it relied on `set -m` to put the command in its own process group, and dash/busybox sh refuse job control without a tty, so the watchdog killed nothing: `sleep 30` with a 2 s limit took 30 s. the deadline is kept in C now (fork, own process group, poll, kill the group). found by running the tests in debian and alpine containers. the command's stdin is `/dev/null` (it can never read the keyboard hako owns) and its script is a `mkstemp` file, not a guessable `/tmp/hako-cmd-<pid>.sh`
+- `make test` builds on musl (it assigned to `stdout`, which musl declares const)
+- zero warnings on Ubuntu's gcc 13 at `-O2` with `_FORTIFY_SOURCE` (the release build): the history path falls back to the global one rather than clipping, two message buffers were a byte short, and every ignored `write()`/`system()` result is handled
+- **`--pipe` init now says `"protocol":2`.** hake reads it and, finding none, greeted every session with "agent: … (protocol 1)"; its own name for the old wire without approval prompts. pinned in `pipe-conformance.py`. `--help` lists `--no-splash` and the `pump` spinner; `:expand` completes on Tab
+- the README documents `~/.hakorc` (every key the agent reads, which ones it shares with hake) and `make test` checks each documented key really applies. the theme and local-model lines were out of date
+- **startup's prompt build: ~97 ms → ~5 ms.** the ENVIRONMENT block spawned a shell per tool name (18 `command -v` calls; far slower under iSh's emulator) and printed each tool's absolute path into the prompt; tokens the model never needs, contradicting "never use absolute paths", and the user's home directory in every request. it walks `PATH` in C now and lists names only: ~120 fewer tokens on every cold local turn. `--bench` on hako-sho: unchanged (22/43 → 22/43)
+- **local models search instead of listing: hako-sho 22/43 → 26/43 correct on `--bench`** (39 → 40 well-formed), no task worse. RULE 1 sent every "find" to `list_dir`; one sentence now says where `grep` and `glob` belong. two other prompt edits were benchmarked and rejected (trimming the repeated write_file guidance lost create-game; extra examples were noise)
+- **first recorded `--bench` of hako-sho** (q4_k, CPU): 39/43 well-formed, 22/43 correct (`tools/bench/results/`). 7 tasks need tools the local surface leaves out by design (web_fetch, todo, remember, ask_user); the main miss is `list_dir` where `grep`/`glob` belongs
+- `make test` used the real `HOME` and left a `~/.hako/projects` entry behind for every temp dir it trusted
+- `make WEB=1` after a plain `make` said "nothing to be done" and shipped **no UI**; UI edits never re-embedded. the bundle and the build flags are prerequisites now
+
+### fixed: text that vanished with no error
+- **a backslash on a network chunk boundary deleted the whole chunk.** the JSON scanner found the closing quote with a lookbehind that cannot tell `\"` from `\\"`, so a value ending in a backslash returned nothing; and the stream loop skipped that delta entirely. `chat\n` split as `chat\` + `n…` arrived as `chatn`. scans walk forward honouring escapes now, in every place the idiom lived. this is a shared helper: it affected every string value ending in a backslash, not only streaming
+- **a line longer than the read buffer was silently cut.** `fgets` returned it in pieces; the head parsed as truncated JSON and every continuation was dropped. lines are reassembled whole now, on both the anthropic and OpenAI-compatible stream paths
+- **anthropic's overload was reported as "empty response".** it arrives as an SSE *error event* the delta loop never looked at. it is recognised, **retried once**, and named when it persists; `-p --output-format json` reports the real reason instead of a fixed string
+- **a tool call with only a closing tag ended the turn.** everything downstream keyed off the opening `<tool_call>`, so `{…}</tool_call>` ran nothing, showed nothing, and never reached the repair nudge. repaired in place; any response carrying tool debris but no runnable call is asked for one clean call instead of ending
+- **`read_file` truncated at 100 KB without saying so.** the model rewrote large files from the first 100 KB and destroyed the tail. truncation is announced with the real size and an explicit warning; `run_shell` says when its capture limit was hit
+- **the paren tool dialect double-escaped**, turning the model's `\n` into a literal backslash-n in every file written through it
+
+### fixed: the terminal
+- **a freeze after a successful edit.** the keyboard handover between the worker and the input reader could be skipped in a narrow gap, leaving two readers on one fd: the approval either waited forever or reported a denial nobody made. the claim is unconditional now and the reader re-acknowledges while parked
+- **pasting.** CRLF inside a bracketed paste became two spaces per line; a pasted tab hit the completion key and vanished. one space each now; UTF-8 was always fine
+- **the chat duplicated on every keyboard toggle on iSh.** the resize handler reprinted the transcript; the terminal had already reflowed it. only the bar redraws now
+- **`--debug` let the engine write straight to the terminal**, over the input bar. its stderr is always captured and printed through the normal path as `engine:` lines
+- **`read_file` on a directory returned 0 bytes**, which the model read as "empty" and retried forever; and the repeat guard remembered only the last call, so alternating between two useless calls never tripped it. both fixed
+- the legacy-state warning told iSh users (whose project *is* their home directory) to delete their global state. suppressed in that case
+
+### fixed: after `:login`
+- signing in kept the previous provider's model selected, so the next turn failed on a model the new provider had never heard of. the model heal that `:provider` already did now runs after every login path
+
+### added: you can see what happened
+- **system notices are logged.** errors, engine failures, repeat-guard stops and empty-response reasons were display-only; a failed session logged one line. they are `system` rows now, and the log usually says why on its own
+- **`~/.hako/startup.log`** under `--debug`: each startup phase and its elapsed time, so a launch that dies on a phone leaves the phase it died in behind
+- **ctrl+o is a transcript screen** (alternate buffer), not an in-place expansion; the in-place version could not be made correct against a terminal that scrolls
+- the engine's own words on failure (`it said: …`, with the signal that killed it), and `killed by signal 9 — out of memory` when that is what happened
+
+### changed
+- **comments: 7.4% → 3.4% of the file.** long rationale blocks moved verbatim to `.claude/hako-code/RATIONALE.md`; the source keeps short headers
+- stream buffers grow geometrically instead of one `realloc` per token
+- zero warnings under **gcc** as well as clang (35 fixed, not suppressed; including eight unterminated `strncpy` copies and a URL that could be truncated before reaching the shell)
+
+### companions
+- **hako-edit v0.1.7** and **hako engine v0.0.4** ship with this release; the `--pipe` protocol and local token streaming span the pairs
+
+### fixed: turns that showed you nothing at all
+- a reply was hidden if it *looked* like a tool call, and executed only if a **different**, narrower set of markers matched. when the two disagreed (or when they agreed and the parser then extracted nothing) the text was suppressed, no tool ran, and the turn ended having displayed nothing. both decisions now use the same test, and if a reply is hidden as a tool call that turns out not to parse, it is shown anyway with a note. a silent turn is the worst outcome: nothing to read and nothing to debug
+- **an untrusted project was told it had tools it did not have.** anthropic only receives the tools schema when the project is trusted, but the prose tool prompt went out regardless; so on a fresh checkout the model believed it could read and edit files, emitted tool syntax nothing would execute, and every such turn came back empty. it is now told plainly that it has no tools until `:trust`, and to say so in one line rather than pretend
+- **streaming replies reported one output token.** an anthropic SSE stream carries usage twice: a placeholder in `message_start` and the real figure in `message_delta`. usage read the first match, so `:usage` and the status line reported `↓1` for a full reply and undercounted cost accordingly
+
+### changed
+- the splash tagline is "agent harness" rather than "standalone llm agent"; it runs other people's models and speaks the open Agent Skills format, which is the more accurate and more useful claim
+
+### fixed: the splash no longer lives in your scrollback
+- the startup logo was drawn into the normal screen buffer, so scrolling back through a session meant scrolling past a full screen of blinking logo to reach the actual transcript. it now draws in the alternate screen buffer and leaves it on the first keypress, so the terminal is restored exactly as it was and the scrollback holds only the session
+
+### fixed: `make` no longer asks for your password on every build
+- `SIGN` defaulted to "on whenever a `hako-dev` signing identity exists", so anyone who had ever set one up got a keychain prompt for every single build; including the overwhelming majority that never serve over the LAN. it is opt-in now: `make sign` or `make SIGN=1`. plain `make` compiles, attaches the icon and stops, which is what the comment above it already claimed it did
+- signing is still what lets `--serve --lan` accept connections from a phone, so the `--serve` banner now says to run `make sign` if a phone cannot connect, rather than leaving you with a socket that dies on the first read and nothing logged
+- bonus: an unsigned build keeps its icon. `codesign` refuses a binary carrying a resource fork, so signing had been silently stripping it
+
+### added: `--bench`: is the model calling the right tool?
+- `hako --bench tools-v1.jsonl` scores tool-call reliability and prints JSON. two tiers: **well-formed** (exactly one parseable tool call came out) and **correct** (the right tool, with the expected argument). deterministic, no network beyond the provider, works against any provider; cloud or local
+- it runs the **real parser on a real turn**. only execution is neutralized: the tool call is recorded and a stub returned instead of touching the disk. a second parser written for the bench would drift from the one that ships, and the number would then be about the bench rather than about hako
+- a task with no expected tool is a restraint test; the right answer is to call nothing. small models reaching for a tool on "hey there" is a real failure this project has hit before, and scoring it the other way would push in the wrong direction
+- ships with a 12-task starter suite at `tools/bench/tools-v1.jsonl`. verified to discriminate: a stub that answers correctly scores 12/12, one that narrates instead of calling, picks the wrong tool, passes the wrong argument, fires two calls at once, or reaches for a tool on a greeting scores 0/12
+- this is the measurement the model work was blocked on. run it against the stock model before spending anything on a fine-tune: if the number is already high, there is nothing to buy
+
+### added: output that survives a phone
+- **text wraps.** output relied on the terminal's own soft-wrap, so every line longer than the window continued at column 0 and lost its gutter. on a desk terminal that is untidy; at 34 columns on a phone it runs prose, tool output and prompts together at the left edge. wrapping now happens in hako, counts cells rather than bytes, never splits an ANSI escape, and indents continuations to the gutter
+- **streaming renders like everything else.** the streaming path wrote deltas straight to stdout, so a streamed reply got no markdown, no wrapping and no gutter; it looked like a different program from the same answer unstreamed. deltas are now line-buffered and handed to the same renderer
+- **wider markdown.** heading levels are distinguished (the level was computed and then discarded), task checkboxes render as `○`/`✓` sharing the todo tool's glyphs, ordered lists keep their numbers as markers, and `---` draws a rule. code fences wrap instead of running off the edge
+- **CJK and fullwidth glyphs measure as two cells.** everything counted as one, so any box drawn around text containing them (including the 箱 in the banner) came out a column short
+- **tables and links render.** a table row drops its outer pipes and reads as cells separated by a divider; the `|---|:--:|` separator row becomes a rule, since it is pure layout for a renderer that aligns columns and this one does not. `[text](url)` shows the text with the target after it. both are line-local, so they cost no block buffering; and a column-aligned table is unreadable at phone width anyway
+- **a blank line is spacing again**, not a row of floating gutter markers
+- **an unclosed code fence no longer poisons the session.** the fence flag was global and never reset, so one reply that opened ``` and never closed it left every later turn rendered as code
+
+### added: the mithraeum rail
+- the identity used to live in the splash and then disappear thirty seconds into a session. a turn now opens with the keystone and runs down a rail; tool calls hang off it as ledger entries and their results indent beneath. two columns wide, so it survives a phone; it needs color and box-drawing, so plain, piped and narrow terminals fall back to the previous gutters unchanged
+
+### added: `ask_user`
+- the model can put a real choice in front of the user instead of writing options as prose and hoping. options are plain text, one per line; the shape the todo tool already proves small models emit reliably. at a terminal it renders through the same picker as `:model` and `:theme`; over `--pipe` it follows the request/reply shape tool approval established; with no terminal it announces the question, defaults to the first option, and **says that it defaulted** rather than reporting a choice nobody made
+- tool approval now uses that same picker at a terminal, so `[y] once / [n] no / [a] always` is arrow-selectable. non-interactive runs keep the typed prompt
+
+### fixed: Anthropic context windows and prices were a generation out of date
+- `hkContextWindow()` reported **200K for every anthropic model**. the current models are **1M** (Haiku 4.5 is the 200K exception), so compaction fired at around 140K on a model with a million tokens of room; throwing away conversation that did not need throwing away
+- the price table had the Opus tier at $15/$75 and no rows at all for the 5-series, so those fell through to a generic rate and `:usage` misreported cost. opus tier is $5/$25; sonnet 5, Opus 4.6/4.7/4.8 and Fable 5 now have their own rows
+- the default model id carried a date suffix; current ids are bare. the curated offline fallback list now leads with Opus 5 and Sonnet 5
+
+### added: it remembers, and it keeps a plan
+- **`remember`** saves one durable fact to one file: a decision and why, a convention, a trap and its fix. `<cwd>/.hako/memory/` for this project, `~/.hako/memory/` for everywhere, project first when both apply. `:memory` lists what it knows, `:memory forget <name>` drops one. files are plain markdown, so they can be edited or deleted by hand like any other note
+- **`todo`** records a plan for a multi-step task as plain text; one step per line, `[ ]` or `[x]`. sent whole each time, so it replaces rather than accumulates. `:todo` shows it, `:todo clear` drops it. plain text rather than nested JSON because a 3B emits `[x] thing` reliably and a nested object only sometimes
+- both live in the **system prompt, not the conversation**, so compaction cannot fold them away; the two things most worth keeping through a long session are exactly what a digest would flatten. both survive a restart
+
+### added: Agent Skills, the open standard
+- skills install straight from GitHub: `:skill install owner/repo` takes a whole repository of them, `:skill install owner/repo/skills/name` takes one. a plain URL still installs a single markdown file. no git, no tar, no zip; the contents API lists a directory and raw.githubusercontent serves the files, both over the curl path that was already here. `skills/` is tried first, since that is where a repo of skills usually keeps them, and the repository root second
+- a folder without a `SKILL.md` is not a skill, and is now rejected *before* anything is written rather than after, which used to leave a half-installed directory behind
+- **skills are read from four places**, nearest first: `./.hako/skills`, `./.claude/skills`, `~/.hako/skills`, `~/.claude/skills`. same name in two of them loads once, and the closest to the work wins. a project that already carries skills for another agent works without copying anything
+- this is the [Agent Skills](https://agentskills.io) format; a folder, a `SKILL.md` with `name` and `description`, and progressive disclosure in three stages. hako already stored and loaded skills that way; what was missing was a way to get them
+
+### added: project context from files you already have
+- `AGENTS.md` and `CLAUDE.md` in the working directory are read as project context, after `.hako/HAKO.md`. first match wins, and the prompt header names the file it came from. hako no longer needs its own file in a repo that already explains itself to another agent
+
+### added: a machine-readable result
+- `--output-format json` with `-p` prints one JSON object on stdout and nothing else; `response`, `provider`, `model`, token usage, session id, version; and exits 0 on success, 1 on failure. live tokens, spinner and color are suppressed in that mode, because stdout belongs to whatever is parsing it
+- `-p -` reads the prompt from stdin, so a caller does not have to fit a task into one shell-quoted argument
+- together these are what another tool needs to drive hako as a subprocess
+
+### added: search, at last
+- **`grep`** searches file contents across the project. literal by default; `*` and `?` turn it into a wildcard match. optional `glob` narrows which files are read, `path` narrows the directory, `ignore_case` does what it says. capped at 200 hits, and binaries and 19 junk directories (`.git`, `node_modules`, `target`, …) are skipped by name before anything is opened
+- **`glob`** finds files by name. `*` and `?` stay inside one path segment, `**` crosses directories, and a pattern with no `/` matches the file name alone; so `*.c` means what you expect
+- **`web_fetch`** reads an http(s) URL as text, markup stripped, JSON left alone
+- the matcher is hand-written rather than POSIX `<regex.h>`: mingw-w64 does not ship that header, and a grep that behaves differently on one of five platforms is worse than a simpler one that behaves the same everywhere. both tools walk through the same seam as every other file operation, so they work in the browser build; which matters more than it sounds, because wasm has no shell, and without them the agent in a tab could not find a file at all
+- local models get `grep` and `glob` too. a 3B without search invents filenames
+
+### added: `:use`, a skill as a mode
+- `:use <skill>` puts a skill's full instructions into every request until `:use none`. `:use` on its own opens a picker. it persists with the session, so it survives a restart
+- this is the half that was missing. a skill was a description the model could take or leave; now one of them can be a mode it must follow
+
+### added: context that does not simply run out
+- long sessions used to end by hitting the provider's ceiling, because every message was re-sent on every turn with nothing counting the cost. at 70% of the window the middle of the conversation now folds into a digest, keeping the opening request and the recent turns verbatim. measured on a tool-heavy history: 12,564 tokens to 3,250
+- the digest is built from the messages, not by asking a model to summarise them. a summarisation call in the middle of a turn is another request that can fail, cost money, need auth and take seconds; on the code path that is already in trouble
+- `:compact` forces it. `:usage` shows how full the context is. `context_window` in `~/.hakorc` corrects the guess for a custom endpoint
+
+### added: diff preview before you approve
+- `write_file`, `edit_file` and `edit_lines` show what they are about to change, with the unchanged head and tail folded away, before the `[y/n/a]` prompt. approving a file rewrite you cannot see is not consent. the preview also rides the `--pipe` protocol, so the editor pane and the browser can render it
+
+### added: prompt caching (Anthropic)
+- the system block is marked cacheable. if a host rejects it, caching is switched off and the turn is retried once rather than failing. `:usage` reports cache reads and writes
+
+### changed: skills are summaries until you need them
+- nine installed skills were about 23 KB of system prompt on every turn whether or not any of them applied. now the description goes into the prompt and the body arrives through the existing `read_skill` tool. measured with the mithraeum skill set: 7,418 tokens to 2,794. skills under 1600 bytes are still inlined whole, because the round trip would cost more than the text
+
+### changed: the agent loop has room to work
+- the tool-call cap goes from 8 iterations to 25. eight is two reads and a write
+- with more room, a model that cannot make progress repeats the same call further. the same tool and arguments three times in a row now stops the turn with an explanation, instead of spending the remaining iterations on it
+
+### fixed: `run_shell` had no timeout at all on macOS
+- the 10-second cap was applied only `if command -v timeout` succeeded, and macOS does not ship `timeout`. a hung command wedged the turn forever with nothing to do about it
+- the obvious repairs do not work either: `perl`'s `alarm` kills perl, and `timeout` kills its direct child, but an orphaned grandchild keeps the pipe open. measured: `sleep 30` capped at 2s still took 30 seconds to return. the command now runs in its own process group under `set -m` and the watchdog kills the group; 2.0 seconds, with whatever output it produced. plain POSIX shell: no coreutils, no perl, nothing to probe for
+- default 120s, `timeout` accepted per call up to 600, `shell_timeout` in `~/.hakorc`. a coding agent that cannot run `make` is not a coding agent
+
+### fixed: eleven of thirteen providers never streamed
+- every OpenAI-compatible provider returned its answer in one lump after a long silence, which on a slow model is indistinguishable from a hang. the request simply never asked to stream. it does now, and the deltas are reassembled into exactly the shape a non-streaming reply has, so extraction and tool dispatch run on the same code as before rather than a second, subtly different path
+- split `arguments` fragments and parallel tool calls both survive the trip. the tool-call index is read from inside `tool_calls`: the choice carries its own `index: 0`, and reading that one collapses every parallel call into the first slot
+
+### fixed: tool approvals never reached the editor's Rei pane
+- the agent emits `tool_request` with a `name`; the editor was listening for `permission_request` with a `tool`, and replying `permission_response`/`decision` where the agent reads `approve`/`answer`. nothing overlapped, so every write tool in the pane waited forever with no prompt shown. `PROTOCOL.md` and the browser UI both say `tool_request`, so the editor was the stale side. fixed in `hake.c`, which now also renders the diff and understands the new `net` permission kind. (Requires hako-edit built from this change.)
+- a slash command sent over `--pipe` without its leading `:` was silently ignored. it is normalised now, and an unrecognised command answers instead of going quiet
+
+### fixed: a model-supplied URL reached the shell unquoted
+- `hk_http_curl_cmd` interpolated the request URL into a shell command without quoting. that was safe while every URL came from configuration; `web_fetch` takes one from the model. URLs are quoted, and validated for scheme and character set before that
+
+### fixed: plain `make` stopped building the binary
+- with a hako-studio checkout beside this one, the generated `hako_web.h` rule became the first target in the Makefile, so `make` regenerated the bundle and stopped without ever linking `hako`
+
+### changed: housekeeping
+- `make test` runs a unit suite (`tools/tests.c`) over the matcher, the directory walker, the path jail, URL validation, the HTML stripper, tool aliases, both wire schemas, the diff preview, the shell timeout, the SSE parser, compaction and the skill loader. it is meant to be run on every target, iSh included
+- duplication pass: one JSON key scanner behind the string/int/object extractors, one `hkJsonFirst()` for the argument-spelling fallbacks that were open-coded 23 times, one `hkToolPath()` for the trust-and-resolve preamble, shared error strings, seven dead macros removed
+- the `<=8000 LOC` budget in the project notes was aspirational and had been wrong for six releases. it is now `<=13000` against 12,695, recorded with the reasoning: `hako.c` has ~150 comment lines and no dead functions, so the sweep that cut 1,000 lines from the editor has no equivalent here
+
 ## [v0.2.3] — 2026-08-14
 
 The agent grows a browser.

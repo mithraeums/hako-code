@@ -56,25 +56,37 @@ jobs:
       # The agent builds plain — it runs local models by spawning the `hakm`
       # engine CLI as a subprocess (no in-process link, no compile flag). The
       # hakm binary ships separately from mithraeums/hako; not built here.
+      # The tests run first and on the plain build; the release build after them
+      # replaces it (the flag stamp in the Makefile forces the rebuild).
+      - name: Test (linux)
+        if: matrix.platform == 'linux'
+        run: |
+          make test
+          make test-serve
+
       - name: Build (linux)
         if: matrix.platform == 'linux'
         run: |
-          make
+          make RELEASE=1 WEB=1
           ./hako --version
           mkdir -p ${{ matrix.staging }}
-          cp hako README.md ${{ matrix.staging }}/
+          cp hako README.md LICENSE ${{ matrix.staging }}/
           [ -f icon/hako.png ] && cp icon/hako.png ${{ matrix.staging }}/ || true
           tar czf ${{ matrix.artifact }} ${{ matrix.staging }}
           (cd ${{ matrix.staging }} && sha256sum hako > ../${{ matrix.sha }})
 
+      - name: Test (macos)
+        if: matrix.platform == 'macos'
+        run: make test
+
       - name: Build (macos universal2)
         if: matrix.platform == 'macos'
         run: |
-          make UNIVERSAL=1
+          make RELEASE=1 WEB=1 UNIVERSAL=1
           ./hako --version
           file hako
           mkdir -p ${{ matrix.staging }}
-          cp hako README.md ${{ matrix.staging }}/
+          cp hako README.md LICENSE ${{ matrix.staging }}/
           [ -f icon/hako.icns ] && cp icon/hako.icns ${{ matrix.staging }}/ || true
           tar czf ${{ matrix.artifact }} ${{ matrix.staging }}
           (cd ${{ matrix.staging }} && shasum -a 256 hako > ../${{ matrix.sha }})
@@ -99,10 +111,10 @@ jobs:
         shell: msys2 {0}
         run: |
           export PATH=/mingw64/bin:$PATH
-          make CC=gcc
+          make RELEASE=1 WEB=1 CC=gcc
           ./hako.exe --version
           mkdir -p ${{ matrix.staging }}
-          cp hako.exe README.md ${{ matrix.staging }}/
+          cp hako.exe README.md LICENSE ${{ matrix.staging }}/
           [ -f icon/hako.ico ] && cp icon/hako.ico ${{ matrix.staging }}/ || true
           zip -r ${{ matrix.artifact }} ${{ matrix.staging }}
           (cd ${{ matrix.staging }} && sha256sum hako.exe > ../${{ matrix.sha }})
@@ -130,10 +142,11 @@ jobs:
           prepare: |
             pkg install -y curl gmake gcc
           run: |
-            gmake CC=gcc MAKE=gmake
+            gmake test CC=gcc MAKE=gmake
+            gmake RELEASE=1 WEB=1 CC=gcc MAKE=gmake
             ./hako --version
             mkdir -p hako-code-freebsd-x86_64
-            cp hako README.md hako-code-freebsd-x86_64/
+            cp hako README.md LICENSE hako-code-freebsd-x86_64/
             tar czf hako-code-freebsd-x86_64.tar.gz hako-code-freebsd-x86_64
             (cd hako-code-freebsd-x86_64 && printf '%s  hako\n' "$(sha256 -q hako)" > ../hako-code-freebsd-x86_64.sha256)
 
