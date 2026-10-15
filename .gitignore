@@ -1,29 +1,25 @@
 .DS_Store
 *.swp
-# current build outputs (source is hako.c / hako.rc — keep those)
+# current build outputs
 /hako
 hako.exe
 hako.res
 hako_asan
-# legacy names
-hakoc
-hakoc.exe
-hakoc_asan
-hakoCLAW.rc
-hakoCLAW.res
-.hakoclaw.r
 *.o
 *.obj
-.claw/
-.hakoc/
-*.hakoc-pending
 *.dSYM/
 *.log
 
-# vhs recordings — internal tooling, not shipped (outputs live in the website repo)
+# vhs recordings
 vhs/
 
-# signing leftovers — codesign writes .cstemp beside its target, and an
-# interrupted run leaves both behind
+# signing leftovers
 hako.sign
 *.cstemp
+
+# build-flag stamp
+.hako.flags
+*.bak
+*.orig
+
+.snapshots/

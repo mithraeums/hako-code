@@ -1,30 +1,30 @@
 <p align="center">
   <a href="https://mithraeums.github.io">
-    <img src="https://mithraeums.github.io/assets/banner-hako-code-dark.svg" alt="hako-code — a standalone agent for the inner chamber" width="100%"/>
+    <img src="https://mithraeums.github.io/assets/banner-hako-code.png" alt="hako-code — a standalone agent for the inner chamber" width="100%"/>
   </a>
 </p>
 
 <p align="center">
-  <em>A standalone terminal AI agent in a single C file. Quiet, model-agnostic, skill-driven.</em>
+  <em>A coding agent in one C file. 400 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.2-b89656?style=flat-square&labelColor=14130f" alt="v0.2.2"/></a>
-  <img src="https://img.shields.io/badge/license-GPL--3.0-c8c2b2?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
-  <img src="https://img.shields.io/badge/C99-single%20file-c8c2b2?style=flat-square&labelColor=14130f" alt="C99 single file"/>
-  <img src="https://img.shields.io/badge/providers-13-c8c2b2?style=flat-square&labelColor=14130f" alt="13 providers"/>
-  <img src="https://img.shields.io/badge/platforms-5-c8c2b2?style=flat-square&labelColor=14130f" alt="5 platforms"/>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.4-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.4"/></a>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
+  <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
+  <img src="https://img.shields.io/badge/providers-13-2636c4?style=flat-square&labelColor=14130f" alt="13 providers"/>
+  <img src="https://img.shields.io/badge/platforms-5-2636c4?style=flat-square&labelColor=14130f" alt="5 platforms"/>
 </p>
 
 <p align="center">
-  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-code/releases">releases</a> &nbsp;·&nbsp; <a href="CHANGELOG.md">changelog</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako">hako (models)</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-edit">hako-edit</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
+  <sub><a href="https://mithraeums.github.io">site</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-code/releases">releases</a> &nbsp;·&nbsp; <a href="CHANGELOG.md">changelog</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako">hako (models)</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-edit">hako-edit</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums/hako-studio">hako-studio</a> &nbsp;·&nbsp; <a href="https://github.com/mithraeums">org</a></sub>
 </p>
 
 <br>
 
-<!-- HERO: screenrecord-hako.gif — animated agent demo. 11s @ 12fps, 960px wide, ~1.2MB. Auto-loops on GitHub. -->
+<!-- hero: screenrecord-hako.gif, a real hako-sho session recorded through a pty and rendered (waits shortened) -->
 <p align="center">
-  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenrecord-hako.gif?raw=true" alt="hako agent live demo" width="82%"/>
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenrecord-hako.gif?raw=true" alt="hako on hako-sho: writes hello.py, asks before each tool, runs it and prints the first five primes" width="82%"/>
 </p>
 
 <table align="center">
@@ -58,31 +58,68 @@
 
 <p align="center"><sub><b>—— I ——</b></sub></p>
 
-## Overview
+## Why this exists
 
-- **Local models run on the native engine — no ollama, no server.** Plain `make`
-  is all the agent needs; it runs Qwen-class models by spawning the
-  [hako engine](https://github.com/mithraeums/hako) as a one-shot `hakm`
-  subprocess per turn (`hakm <model.mlf2> --chat-stdin`) over mmap'd MLF2 weights.
-  No in-process link, no compile flag, no daemon, no socket. Install the engine
-  CLI once with `make hakm` (→ `~/.hako/bin/hakm`). Drop a `.mlf2` in
-  `~/.hako/models/` and `hako` auto-defaults to the **mithraeum** provider on
-  first launch — no key, no `:login`, no config (preference: koi > sho,
-  fine-tunes over stock-wraps). Force prose tool mode is on so
-  `<tool name="...">{...}</tool>` calls parse on small models. Convert a GGUF
-  with the engine's `tools/gguf2mlf.py`, or `:pull <tier>` it from HuggingFace.
-  (ollama is also supported as a *separate* optional provider — `:login ollama` —
-  for non-hako models.)
-- **13 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. `:login <name>` walks you through OAuth or hands you to the provider's console for an API key.
-- **Terminal-class line editor.** Termios raw mode, cursor keys, history (↑ ↓), `^R` reverse-search, Home/End, kill-word, kill-line, bracketed paste. Multi-row aware redraw, no flicker.
-- **Theme presets + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a popup you arrow through, each row showing that theme's colors as live swatches. Same picker on bare `:provider` and `:model`. Persisted in `~/.hakorc`. Truecolor where supported, 16-color fallback for the error chip in tmux without `RGB` passthrough.
-- **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
-- **Trust-gated tools.** `read_file`, `list_dir`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (10s timeout), `read_skill`. Per-call `[y]/[n]/[a]` approval; untrusted dir = all tools refused. `:trust` once per project.
-- **Persistent sessions + skills.** Per-cwd session id, 7-day resume, append-only JSONL history. Skills are markdown — flat or directory dispatchers ([corp](https://github.com/mithraeums/skills/tree/main/corp)-style) — pulled on demand via the `read_skill` tool. Notes you keep on disk for the agent to find.
-- **Self-update.** `hako --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
-- **Streaming + spinners.** Anthropic SSE streams live tokens. 8 spinner styles × 12 thinking labels rotate per turn (`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`).
+Every serious coding agent ships a runtime with it. Hermes pulls Python 3.11, Node, `uv`,
+ripgrep and ffmpeg — on Windows it downloads a portable Git too. Claude Code and its
+neighbours want Node and npm. They are good tools; they are also a language ecosystem you
+have to keep alive on every machine you want to think on.
+
+hako is the same idea built the other way. One C file. It compiles with
+
+```sh
+gcc hako.c -o hako -lpthread
+```
+
+and the result is a **400 KB binary that links libc and nothing else**. It talks to thirteen
+cloud providers when you want them, and to a 3B model on your own disk when you do not.
+It runs on a laptop, on a FreeBSD box, on Windows, and in a 32-bit Linux emulator on an
+iPhone — the same source, the same behaviour.
+
+|                        | hako                                   | agents that ship a runtime          |
+|------------------------|----------------------------------------|-------------------------------------|
+| install                | one binary, 400 KB                     | interpreter + package tree          |
+| runtime deps           | libc, pthread, `curl(1)`               | Python and/or Node, plus packages   |
+| build from source      | `gcc hako.c -o hako -lpthread`         | a package manager and a lockfile    |
+| works with no network  | yes, on local weights                  | usually only as a client            |
+| your data leaves       | only to the provider you chose         | varies                              |
+| license                | GPL-3.0                                | varies                              |
+
+The wager is simple: an agent is mostly a loop, some JSON, and careful text handling. None of
+that needs a runtime. Keeping it in C is what makes it small enough to live anywhere — and
+being small enough to live anywhere is the whole point.
 
 <p align="center"><sub><b>—— II ——</b></sub></p>
+
+## Overview
+
+- **Local models run on the native engine — no ollama, no server.** The agent
+  starts the [hako engine](https://github.com/mithraeums/hako) as a `hakm --serve`
+  child that keeps the model resident and the system prompt's KV prefix warm (on
+  disk too, so a cold first turn costs seconds, not minutes). Answers stream token
+  by token. No in-process link, no compile flag, no daemon, no socket. Install the
+  engine once (`curl -fsSL https://mithraeums.github.io/hakm.sh | sh`, or `make hakm`
+  next to a checkout), `hakm pull hako-sho`, and `hako` defaults to the
+  **mithraeum** provider on first launch — no key, no `:login`, no config. Small
+  models speak their native Qwen `<tool_call>` dialect, and the harness repairs the
+  shapes they get wrong. (ollama is also supported as a *separate* optional
+  provider — `:login ollama` — for non-hako models.)
+- **13 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. `:login <name>` walks you through OAuth or hands you to the provider's console for an API key.
+- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal — no absolute cursor moves, no scroll region — so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager.
+- **The editor's 19 themes + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a picker and the whole screen recolours as you move through it — enter keeps it, esc puts the old one back. The same names as hake and hako studio. Same picker on bare `:provider` and `:model`. `:theme` saves to `~/.hako/state`; `theme=` in `~/.hakorc` sets it for both tools. Truecolor where supported, 256-colour fallback otherwise.
+- **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
+- **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
+- **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `~/.hako/skills` and `~/.claude/skills`, nearest first. Install a whole repository of them with `:skill install owner/repo`.
+- **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
+- **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
+- **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON — *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
+- **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
+- **Self-update.** `hako --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
+- **Streaming everywhere.** Anthropic SSE, every OpenAI-compatible provider and the local engine stream live tokens, including through tool calls. The spinner names the tool in flight (`reading main.c`); `anim_style=` picks one of eight.
+- **Context that does not run out.** Token accounting per provider, and at 70% of the window the middle of the conversation folds into a digest while the opening request and recent turns stay verbatim. `:compact` to force it, `:usage` to see it.
+- **Skills as modes.** Skills load as one-line descriptions and fetch their body on demand, so installing ten costs almost nothing. `:use <skill>` promotes one to a mode: its full instructions go into every reply until `:use none`, and it survives a restart.
+
+<p align="center"><sub><b>—— III ——</b></sub></p>
 
 ## Build & Run
 
@@ -91,20 +128,25 @@
 ```sh
 gcc hako.c -o hako -lpthread        # one-liner
 
-make                                      # cross-OS Makefile
+make                                      # cross-OS Makefile (-O0: fast to build, the agent waits on I/O)
+make RELEASE=1                            # -O2, what releases ship
 make UNIVERSAL=1                          # macOS arm64 + x86_64 fat binary
-make asan                                 # ASan + UBSan build
+make WEB=1                                # embed hako studio, for `hako --serve`
+make test                                 # the gate: no model, no network, no credentials
+make asan                                 # ASan + UBSan build → ./hako_asan
 ```
 
 > Deps: libc + pthread + `curl(1)` on PATH. No third-party libraries linked.
+> More gates: `make test-tty` (a pty harness with a fake engine; python3 + pyte), `make test-serve`, `make fuzz` (the parsers under ASan), `make win-check`, `make wasm-check`.
 
 ### Install
 
 ```sh
-curl -fsSL https://mithraeums.github.io/install.sh | sh
+curl -fsSL https://mithraeums.github.io/hako.sh | sh       # the agent
+curl -fsSL https://mithraeums.github.io/install.sh | sh    # the whole suite: agent, editor, engine
 ```
 
-Detects OS and arch, downloads the latest signed release, verifies the sha256 sidecar, drops `hako` into `/usr/local/bin` (or `~/.local/bin`). No package manager. No daemon. No telemetry.
+Detects OS and arch, downloads the latest release, verifies the sha256 sidecar, drops `hako` into `/usr/local/bin` (or `~/.local/bin`). Where there is no release binary — iSh is 32-bit x86 — it builds from source instead (`apk add build-base git curl` first). No package manager. No daemon. No telemetry.
 
 <table align="center">
   <tr>
@@ -112,21 +154,19 @@ Detects OS and arch, downloads the latest signed release, verifies the sha256 si
     <td align="center"><b>Linux</b><br/><sub>x86_64 · arm64</sub></td>
     <td align="center"><b>FreeBSD</b><br/><sub>x86_64</sub></td>
     <td align="center"><b>Windows</b><br/><sub>x86_64 · MinGW</sub></td>
-    <td align="center"><b>iSh</b><br/><sub>linux-x86_64 binary</sub></td>
+    <td align="center"><b>iSh</b><br/><sub>i686 · built from source</sub></td>
   </tr>
 </table>
 
 ### First turn
 
-**Local, zero config (recommended)** — build with the engine, drop in a weight, launch:
+**Local, zero config (recommended)** — the engine, one model, launch:
 
 ```sh
-make                                                   # plain build — the agent
-make hakm                                              # installs the engine CLI → ~/.hako/bin/hakm
-# convert a Qwen2.5-Coder GGUF once → ~/.hako/models/hako-sho.mlf2
-#   (python3 ../hako/tools/gguf2mlf.py model.gguf ~/.hako/models/hako-sho.mlf2)
-hako                                                   # auto-detects the .mlf2, runs it via the hakm subprocess (mithraeum)
-> :trust                                                # grant tool access in this project
+curl -fsSL https://mithraeums.github.io/hakm.sh | sh   # the engine → ~/.hako/bin/hakm
+hakm pull hako-sho                                     # 3B weights, ~1.9 GB, resumable
+hako                                                   # finds them and runs locally
+> :trust                                               # grant tool access in this project
 > list files in this directory
 ```
 
@@ -152,7 +192,7 @@ Self-update:
 hako --update           # check + atomic-replace if newer
 ```
 
-<p align="center"><sub><b>—— III ——</b></sub></p>
+<p align="center"><sub><b>—— IV ——</b></sub></p>
 
 ## Key Bindings & Commands
 
@@ -167,30 +207,34 @@ hako --update           # check + atomic-replace if newer
 | `^R` | reverse-incremental history search |
 | `^L` | clear screen |
 | Backspace · Delete | delete back / forward at cursor |
-| `^C` | cancel current line |
+| `^C` | cancel the line, or stop the turn in flight |
 | `^D` (empty) | EOF / exit |
+| `^G` | finish the line in `$EDITOR` (`editor=` in `~/.hakorc`) |
+| `^O` | the whole transcript, expanded, in a pager (`q` closes) |
+| Shift+Tab | cycle ask → auto → plan |
+| Tab | complete commands, names and paths |
 
-*Bracketed paste enabled in raw mode — multi-line pastes batch-insert.*
+*Bracketed paste — multi-line pastes land as one entry.*
 
 ### Commands (inside prompt):
 
 `:` is the primary prefix (vim / hako style). `/` works as a legacy alias.
 
 ```
-:help     :clear     :retry     :edit     :undo     :usage     :q
-:providers   :models   :provider [<name>]   :model [<id>]   :theme [<name>]   :pull <model>
+:help     :clear     :retry     :edit     :undo     :usage     :compact     :q
+:providers   :models [refresh]   :provider [<name>]   :model [<id>]   :theme [<name>]   :pull <model>
 :login [<prov>]     :logout [<prov>]     :accounts
-:history [local|global]
-:skills [reload]    :skill install <url>     :skill uninstall <name>
-:tools on|off   :toolgate on|off   :toolmode native|prose   :auto on|off   :mcp [reload]   :trust [revoke]
-:sessions [clear [all]]   :resume <id>     :session [new]
+:history [local|global]   :todo [clear]   :memory [forget <name>]
+:skills [reload]    :skill install <url>     :skill uninstall <name>     :use <skill|none>
+:tools on|off   :toolgate on|off   :toolmode native|prose   :auto on|off   :mode ask|auto|plan
+:mcp [reload]   :trust [revoke]
+:sessions [clear [all]]   :resume <id>     :session [new]     :name <chat>     :color <name|off>
+:e [<editor>]   :o   :mouse on|off   :remote
 ```
 
-Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; give an argument to set directly.
+Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; give an argument to set directly. `:help` opens the same list in a filterable box.
 
-**TAB** completes commands and provider names after `:login` / `:provider` / `:logout`.
-
-<p align="center"><sub><b>—— IV ——</b></sub></p>
+<p align="center"><sub><b>—— V ——</b></sub></p>
 
 ## Configuration
 
@@ -208,11 +252,35 @@ Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; g
 <cwd>/.hako/HAKO.md                        per-project context (auto-loaded into system prompt)
 ```
 
+### `~/.hakorc`
+
+One file for the whole suite: hake reads its own keys from it too, and keys it does not
+know are left alone (`:config` in hake writes a commented template of every key).
+
+```
+ai_provider=mithraeum        # or anthropic, openai, gemini, ollama, groq, … (:providers)
+ai_model=hako-sho
+theme=mithraeum              # shared with hake: the same 18 names
+mouse=0                      # shared with hake; default off here — it takes the scroll wheel
+ai_auto_approve=0            # 0 = ask before tools (shift+tab cycles ask/auto/plan)
+show_splash=0
+anim_style=pump              # braille dots bar pulse bounce ghost arrows blocks pump
+editor=vim                   # for ctrl+g; else $EDITOR
+shell_timeout=120            # run_shell deadline in seconds (max 600)
+ai_max_tokens=4096
+ai_stream=1
+prompt_cache=1               # Anthropic prompt caching
+context_window=0             # override the model's window (0 = from the catalog)
+```
+
+A key set here beats a stale value in `~/.hako/state`; a project's own saved state still
+wins inside that project.
+
 **Three auth paths:**
 
 - **OAuth (subscription / account-bound)** — `:login anthropic` (Claude Pro/Max), `:login copilot` (GitHub Copilot Pro/Business), `:login github-models` (free for any GitHub user), `:login openrouter` (PKCE, auto-issue an OR API key). Inference bills against your subscription where applicable; no per-token API key needed.
 - **API-key paste** — `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
-- **Local** — `:login ollama` / `:login ollamacloud`. Local: ensure `ollama serve` is running. Cloud: paste an Ollama key.
+- **Local** — hako's own models need no login: `hakm pull hako-sho`, then `:provider mithraeum`. Ollama works too: `:login ollama` (ensure `ollama serve` is running) or `:login ollamacloud` (paste an Ollama key).
 
 Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists the active provider's live catalog (its own listing endpoint, cached 24h — `:models refresh` refetches; installed `.mlf2` weights for **mithraeum**), falling back to a built-in list when offline. Bare `:model` opens the picker, where `/` filters as you type. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
 
@@ -256,7 +324,7 @@ Some smaller / non-tool-tuned models (Mistral 7B, Phi-4, DeepSeek-R1 distills, s
 
 ReAct mode injects a tool schema in the system prompt and parses `<tool>...</tool>` blocks from the model's response. Each tool call is executed and the result is appended as `<observation tool="X">...</observation>` for the next turn. Works with any instruct-tuned model.
 
-<p align="center"><sub><b>—— V ——</b></sub></p>
+<p align="center"><sub><b>—— VI ——</b></sub></p>
 
 ## Skills
 
@@ -273,42 +341,35 @@ ReAct mode injects a tool schema in the system prompt and parses `<tool>...</too
 
 Directory skills inject only `SKILL.md` plus a `<files>` manifest. The agent reads inner files on demand via `read_skill(skill, path)` — no trust gate (skills are user-installed), path-traversal blocked.
 
-```sh
-git clone https://github.com/mithraeums/skills ~/.hako/skills/_tmp
-cp -r ~/.hako/skills/_tmp/corp ~/.hako/skills/
-rm -rf ~/.hako/skills/_tmp
-hako        # "loaded 1 skill(s)"
+```
+:skill install mithraeums/skills      # every skill in the repo, into ~/.hako/skills
+:skills                               # what is loaded
+:use brief                            # one of them, as a mode, until :use none
 ```
 
 Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
-<p align="center"><sub><b>—— VI ——</b></sub></p>
-
-## What's new in v0.2.3
-
-- **`hako --serve` — the agent in a browser.** Same binary, same sessions, same credentials, same trust: `hako --serve --dir ~/code/thing`, open `http://127.0.0.1:8787`, and there is [hako studio](https://github.com/mithraeums/hako-studio). Chat, tool approval boxes, a folder browser, per-folder sessions with rename/delete, the model picker and four themes — driven by the same JSONL protocol `--pipe` speaks to the editor, carried over HTTP + Server-Sent Events. No second process, no backend, no database, no account. `--bind 0.0.0.0` puts it on your phone (read the warning first).
-- **The UI ships inside the binary.** One executable is the whole product — nothing to install alongside it, and it works with no network at all. `--web DIR` serves the page off disk instead while you work on it.
-- **`--serve` runs the agent in-process.** No child `hako`, so there is nothing to respawn, nothing to wedge, and one process to reason about — which is also what lets this mode exist where spawning is not allowed at all.
-- **Capability handshake.** `GET /api/state` reports the version and the feature list, so a UI that updates faster than the binary asks what it is talking to instead of assuming.
-- **Files both ways.** Browse the machine's folders and files from the browser, or send a file *to* it — on a phone that opens the native Files/Photos sheet, and the upload lands in the open project without overwriting anything. Add the page to your home screen and it runs chromeless with its own icon.
-- **`--serve --lan`** prints the URL to type into a phone. On macOS `make` now signs the binary, which is what lets the firewall allow it at all — see [hako-studio](https://github.com/mithraeums/hako-studio#serving-to-a-phone-on-macos).
-
-### v0.2.2
-
-- **Live model lists** — `:models` and the `:model` picker read the provider's own catalog (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, Gemini, Copilot, ollama and the rest) instead of a table we maintained by hand. Cached 24h per provider+endpoint, `:models refresh` forces it, and offline falls back to the cache and then the built-in list. Non-chat entries are filtered out, newest first.
-- **`/` filters the picker** — it scrolls a window and narrows as you type (`model (30/353)`), so a gateway with hundreds of models is browsable. `:theme`, `:provider` and `:model` share it, and `:models` / `:providers` open it too.
-- **Shell-style TAB completion** — longest common prefix, then a column list when ambiguous; over commands, provider/theme/model vocabularies, and file paths anywhere in a line.
-- **Press-any-key splash** — wordmark, version and a blinking prompt, sized down through four tiers so a phone-width terminal still gets something readable. `show_splash=0` or `--no-splash` skips it.
-- **Works on a phone** — the pickers fit narrow/short windows without the title stacking on scroll, borders stay square on rows with swatches, and a lone `esc` cancels immediately instead of waiting for another key. Tested down to 24×10. `:help` opens in the same box, scrollable and filterable.
-
-Every release since v0.1.4 is in **[CHANGELOG.md](CHANGELOG.md)**.
-
 <p align="center"><sub><b>—— VII ——</b></sub></p>
+
+## Change Log
+
+### Latest — v0.2.4
+- **It runs where nothing else does.** Three weeks of use on an iPhone and an iPad under iSh — where Claude Code, Hermes and Codex would not install — and on a desktop, inside itself, with Claude driving. The bugs that found were all silent, and they are all gone: text that vanished when a backslash landed on a network chunk boundary, lines cut at the read buffer, an Anthropic overload reported as an empty answer, a tool call with only a closing tag that ended the turn, a large file truncated at 100 KB without a word, a freeze after a successful edit, pastes that doubled every line break.
+- **The input bar is in flow.** No absolute cursor moves, no scroll region, no alternate screen for the chat — so a resize (or a phone keyboard appearing) reflows cleanly instead of duplicating the conversation. Type while the model works; it queues. **ctrl+o** opens the transcript in a pager.
+- **Local models stream**, token by token, and the engine's prefilled system prompt persists on disk: a cold first turn on a 3B model went from four minutes to two seconds.
+- **`grep` / `glob` / `web_fetch`**, context compaction, skills as summaries with the body on demand, `:use <skill>` as a persistent mode, a diff preview before every `[y/n/a]`, Anthropic prompt caching, and **`--bench`** to score whether a model calls the right tool.
+- **You can see what happened.** The session log carries system notices — errors, engine failures, why a turn came back empty; `--debug` writes a startup trace to `~/.hako/startup.log`; a dead engine reports its own last words and the signal that killed it.
+- **`make test`** (no model, no network) and **`make test-tty`** (a pty harness with a fake engine) are the gates; zero warnings under gcc and clang; ASan clean.
+- Ships with **hako-edit v0.1.7** and **hako engine v0.0.4**.
+
+Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
+
+<p align="center"><sub><b>—— VIII ——</b></sub></p>
 
 ## Roadmap
 
-**Shipped through v0.2.3** — `--serve` (hako studio in a browser, UI embedded in the binary) ·
-termios line editor · `--update` · directory skills + `read_skill` ·
+**Shipped through v0.2.4** — local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
+termios line editor · `--update` · directory skills + `read_skill` · PKCE without openssl ·
 universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
 local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
 `edit_file` + `edit_lines` · local-model tool reliability · MCP client ·
@@ -316,13 +377,11 @@ popup pickers with live provider catalogs.
 
 **Next**
 
-- [ ] Stream local tokens — a long CPU turn currently looks dead while it works
-- [ ] `hako.wasm` — the same core in a tab, no install (platform seam in `hako.c`)
-- [ ] MCP client mode with Dynamic Client Registration
-- [ ] Inline SHA-256 to drop the openssl runtime dep
-- [ ] Vim-style error codes + Buddy BLE companion approval gateway
+- [ ] `hako.wasm` hosted at hako.mithraeum.studio, and the native app shells (see [hako-studio](https://github.com/mithraeums/hako-studio))
+- [ ] a phone-sized local model (0.5B–1.5B) for iSh and the browser
+- [ ] MCP over HTTP with Dynamic Client Registration (stdio MCP ships today)
 
-<p align="center"><sub><b>—— VIII ——</b></sub></p>
+<p align="center"><sub><b>—— IX ——</b></sub></p>
 
 ## Contributing
 If you share the belief that simplicity empowers creativity, feel free to contribute.
