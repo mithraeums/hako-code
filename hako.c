@@ -53,6 +53,7 @@ typedef int sig_atomic_t;         /* wasi has no <signal.h> without emulation */
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 
 #ifdef _WIN32
