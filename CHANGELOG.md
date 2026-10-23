@@ -3,6 +3,12 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.7] - 2026-10-23
+
+### fixed
+- the studio built into `--serve` / `:remote` is v0.0.6: a home-screen app on iOS no longer leaves a strip under the composer
+- the README said 400 KB; a release binary is ~650 KB with the browser UI inside (linux x86_64: 669,312 bytes)
+
 ## [v0.2.6] - 2026-10-23
 
 ### changed

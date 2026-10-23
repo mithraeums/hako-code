@@ -5,11 +5,11 @@
 </p>
 
 <p align="center">
-  <em>A coding agent in one C file. 400 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
+  <em>A coding agent in one C file. ~650 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.6-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.6"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.7-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.7"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-2636c4?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -71,14 +71,14 @@ hako is the same idea built the other way. One C file. It compiles with
 gcc hako.c -o hako -lpthread
 ```
 
-and the result is a **400 KB binary that links libc and nothing else**. It talks to thirteen
+and the result is a **~650 KB binary (the browser UI inside) that links libc and nothing else**. It talks to thirteen
 cloud providers when you want them, and to a 3B model on your own disk when you do not.
 It runs on a laptop, on a FreeBSD box, on Windows, and in a 32-bit Linux emulator on an
 iPhone — the same source, the same behaviour.
 
 |                        | hako                                   | agents that ship a runtime          |
 |------------------------|----------------------------------------|-------------------------------------|
-| install                | one binary, 400 KB                     | interpreter + package tree          |
+| install                | one binary, ~650 KB                    | interpreter + package tree          |
 | runtime deps           | libc, pthread, `curl(1)`               | Python and/or Node, plus packages   |
 | build from source      | `gcc hako.c -o hako -lpthread`         | a package manager and a lockfile    |
 | works with no network  | yes, on local weights                  | usually only as a client            |
@@ -355,11 +355,12 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.2.6
+### Latest — v0.2.7
+- **A patch:** the built-in studio page fills an iOS home-screen app (studio v0.0.6). The rest is v0.2.6:
 - **`:remote` is the relay only.** Tailscale is gone: `:remote on` always goes through your account (invite beta), and links this computer the first time.
 - **Signing in on iSh, or anywhere without a browser beside you, is less fiddly.** The sign-in link or device code goes on your clipboard, a pasted code loses any stray whitespace, and enter on an empty prompt takes the clipboard.
 - **Quieter.** A device reconnecting is said once, at the desk only; a theme picked in the studio says nothing in the chat.
-- Ships with **hako studio v0.0.5**.
+- Ships with **hako studio v0.0.6**.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -367,7 +368,7 @@ Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)
 
 ## Roadmap
 
-**Shipped through v0.2.6** — `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
+**Shipped through v0.2.7** — `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
 termios line editor · `--update` · directory skills + `read_skill` · PKCE without openssl ·
 universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
 local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
