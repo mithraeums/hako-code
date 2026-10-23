@@ -466,7 +466,7 @@ r.close()
 # ---- 3q. the CLOUD path (Claude over OAuth), against a local fake of the
 # Anthropic SSE API. It used to hold the whole answer back, print it off the
 # rail with no wrapping or markdown, and drop any prose before a tool call.
-import subprocess
+import subprocess, atexit
 def anth_home(port):
     fresh()
     open(os.path.join(HOME, ".hakorc"), "w").write(
@@ -478,6 +478,7 @@ def anth_home(port):
 APORT = 18911
 srv = subprocess.Popen([sys.executable, os.path.join(HERE, "fakeanthropic.py"), str(APORT),
                         os.path.join(WORK, "anth.log")])
+atexit.register(srv.kill)
 time.sleep(0.5)
 anth_home(APORT)
 r = Run(); r.wait_for("Trust this directory", 10); r.send("y\r"); r.wait_for("\u25b6\u25b6", 10)
@@ -513,6 +514,53 @@ pp = subprocess.run([HAKO, "--pipe"], input=b'{"type":"prompt","text":"CLAUDETOO
 check(b"Let me check what is in the project" in pp.stdout, "--pipe (the Rei pane) gets that prose too")
 srv.kill()
 
+# ---- 3q2. ChatGPT sign-in: the Responses stream rides the same prose path as
+# Claude's sign-in. That API has no stop sequences, so hako hangs up at </tool>.
+import base64
+def b64u(o):
+    return base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+GPT_JWT = "%s.%s.sig" % (b64u({"alg": "none"}), b64u({"exp": 4102444800,
+          "https://api.openai.com/auth": {"chatgpt_account_id": "acct-123'; rm -rf x"}}))
+def gpt_home(port):
+    fresh()
+    open(os.path.join(HOME, ".hakorc"), "w").write(
+        "ai_provider=openai\nai_model=gpt-5.5\nai_endpoint=http://127.0.0.1:%d/backend-api/codex\n"
+        "theme=mithraeum\nshow_splash=0\nai_auto_approve=1\n" % port)
+    open(os.path.join(HOME, ".hako", "state"), "w").write(
+        "ai_provider=openai\nai_oauth_provider=chatgpt\nai_api_key=%s\n"
+        "ai_oauth_refresh=r\nai_oauth_expires_at=4102444800\n" % GPT_JWT)
+GPORT = 18912
+GLOG = os.path.join(WORK, "gpt.log")
+srv = subprocess.Popen([sys.executable, os.path.join(HERE, "fakechatgpt.py"), str(GPORT), GLOG])
+atexit.register(srv.kill)   # a failed check must not leave it holding the port
+time.sleep(0.5)
+gpt_home(GPORT)
+r = Run(); r.wait_for("Trust this directory", 10); r.send("y\r"); r.wait_for("▶▶", 10)
+r.send("hello there\r"); r.wait_for("Done.", 20); settle(r)
+L = r.all_lines()
+check(any("Hello from the fake ChatGPT" in l for l in L), "a ChatGPT answer streams in", r)
+reqs = [json.loads(l) for l in open(GLOG)]
+post = [q for q in reqs if q["body"]][-1]
+body, hdr = post["body"], {k.lower(): v for k, v in post["headers"].items()}
+check(post["path"].endswith("/backend-api/codex/responses"), "it posts to the Responses endpoint")
+check(body.get("store") is False and body.get("instructions"), "store is false and the system prompt is instructions")
+check(not any(i.get("role") == "system" for i in body.get("input", [])), "and not a system message in input")
+check(hdr.get("originator") == "hako", "hako names itself as the originator")
+check(hdr.get("chatgpt-account-id") == "acct-123rm-rfx", "the account id comes from the token, shell-safe")
+r.send("GPTTOOL\r"); r.wait_for("everything here", 20); settle(r)
+L = r.all_lines()
+check(any("Let me check what is in the project" in l for l in L), "prose before a ChatGPT tool call is shown", r)
+check(not any("<tool" in l for l in L), "and the tool markup itself is not", r)
+r.send("GPTGOESON\r"); r.wait_for("everything here", 20); settle(r)
+L = r.all_lines()
+sent = open(GLOG, errors="replace").read()
+check("no project directory" not in sent and not any("no project directory" in l for l in L),
+      "hako hangs up at </tool>, so an invented result goes nowhere", r)
+r.send(":models refresh\r"); r.wait_for("gpt-5.4-mini", 10); settle(r)
+check(any("gpt-5.4-mini" in l for l in r.all_lines()), "the model list reads the codex catalog's slugs", r)
+r.close()
+srv.kill()
+
 # ---- 3r. -p --output-format json names an engine failure. It reported a bare
 # "empty response" and threw away the engine's own words and its exit status.
 fresh()
@@ -529,6 +577,108 @@ pp = subprocess.run([HAKO, "--pipe"], input=b'{"type":"prompt","text":"hi"}\n', 
                     env=dict(os.environ, HOME=HOME, HAKO_HAKM=dead), timeout=30)
 out = pp.stdout.decode("utf-8", "replace")
 check("not MLF2" in out and '"type":"done"' in out, "--pipe ends a turn with done even when the engine died")
+
+# ---- 3s. A menu comes and goes without a trace: no echoed command, no
+# "theme: unchanged", nothing in scrollback. :login opens the sign-ins; API keys
+# sit one level down, named for who bills you.
+r = start()
+def count(r, words): return sum(l.count(w) for l in r.all_lines() for w in words)
+WORDS = (":theme", ":model", ":provider", ":login", "theme:", "model:", "provider:")
+before = count(r, WORDS)
+for c in (":theme", ":model", ":provider"):
+    r.send(c + "\r"); r.pump(0.8); r.send("\x1b"); r.pump(0.6)
+check(count(r, WORDS) == before, "a menu closed with esc leaves nothing in the chat", r)
+r.send(":login\r"); r.pump(0.8); L = r.lines()
+check(any("Sign in" in l for l in L) and any("ChatGPT" in l and "free or paid" in l for l in L)
+      and any("API key" in l for l in L), ":login opens the sign-in menu", r)
+check(not any("OpenRouter" in l for l in L), "with no API-key vendors mixed in", r)
+r.send("\x1b"); r.pump(0.6)
+r.send(":login api\r"); r.pump(0.8); L = r.lines()
+check(any("billed by OpenRouter" in l for l in L) and any("separate from ChatGPT" in l for l in L),
+      ":login api lists keys by who bills you", r)
+r.send("\x1b"); r.pump(0.6)
+check(count(r, WORDS) == before, "and both close without a trace", r)
+r.send(":theme\r"); r.pump(0.8); r.send("\x1b[B\r"); r.pump(0.8)
+check(count(r, WORDS) == before, "a theme picked from the menu prints no chat line either", r)
+r.close()
+pp = subprocess.run([HAKO, "--pipe"], input=b'{"type":"slash","cmd":":model"}\n{"type":"choice","id":1,"answer":"1"}\n',
+                    capture_output=True, cwd=PROJ, env=dict(os.environ, HOME=HOME), timeout=30)
+out = pp.stdout.decode("utf-8", "replace")
+check('"choice_request"' in out, "bare :model opens the picker over --pipe too (it printed the model)")
+check('"model:' not in out and '"text":"model:' not in out, "and the pick says nothing in the chat")
+
+print("§3t :remote on shares the terminal session with a device")
+import threading, urllib.request, re as _re
+r = start(auto=True)                   # auto in the rc: ignored while remote is on
+RP = 18931
+r.send(f":remote on {RP}\r"); r.wait_for("?t=", 15)
+tok = next((m.group(1) for l in r.all_lines() for m in [_re.search(r"\?t=([a-z0-9]+)", l)] if m), "")
+check(len(tok) == 24, ":remote on prints a fresh token", r)
+r.pump(0.6)
+check(any("remote" in l and "▶▶" in l for l in r.lines()), "the bar says remote", r)
+U = f"http://127.0.0.1:{RP}"
+H = {"Cookie": "hako_token=" + tok}
+def http(path, data=None):
+    req = urllib.request.Request(U + path, data=data.encode() if data is not None else None, headers=H,
+                                 method="POST" if data is not None else "GET")
+    try: return urllib.request.urlopen(req, timeout=3).read().decode()
+    except Exception as e: return "ERR " + str(e)
+ev = []
+def reader():
+    try:
+        with urllib.request.urlopen(urllib.request.Request(U + "/api/events", headers=H), timeout=60) as f:
+            for raw in f:
+                if raw.startswith(b"data: "): ev.append(raw[6:].decode())
+    except Exception: pass
+threading.Thread(target=reader, daemon=True).start()
+r.pump(0.8)
+check('"remote":1' in http("/api/state"), "the device sees a remote session")
+http("/api/prompt", "hello from the phone")
+r.wait_for("hello from the phone", 10); settle(r)
+check(any('"role":"user"' in e and "hello from the phone" in e for e in ev), "a device prompt runs in the terminal and is mirrored back")
+import json as _json
+_tdone = lambda: any('"type":"done"' in e and '"turn":0,' not in e for e in ev)
+for _ in range(100):
+    if _tdone(): break
+    r.pump(0.1)
+check(_tdone(), "the turn's end reaches the device")
+_ds = [_json.loads(e)["text"] for e in ev if '"type":"delta"' in e]
+check(len(_ds) >= 1 and "alpha.txt" in "".join(_ds), "the reply streams to the device as it is written")
+_mi = next((i for i, e in enumerate(ev) if '"role":"ai"' in e), -1)
+check(_mi > 0 and any('"type":"delta"' in e for e in ev[:_mi]), "and the deltas land before the finished message")
+check(sum('"role":"ai"' in e for e in ev) == 1, "the finished reply reaches the device once")
+http("/api/prompt", "TOOL now")
+r.wait_for("llow", 10); r.pump(0.5)
+check(any('"type":"tool_request"' in e for e in ev), "the approval goes to the device too (auto is ignored)")
+check(not any("│" in l and "always" in l for l in r.lines()), "and the terminal popup offers no always", r)
+check(not any("auto mode: tools run" in l for l in r.all_lines()), "nor claims auto mode", r)
+check("true" in http("/api/approve", "y"), "the device answers it")
+r.pump(1.5); settle(r)
+check(any('"type":"tool_end"' in e for e in ev), "the terminal popup closed and the tool ran", r)
+n0 = sum("only the desktop terminal" in e for e in ev)
+http("/api/slash", ":auto on"); r.pump(0.6)
+check(sum("only the desktop terminal" in e for e in ev) > n0, "a device cannot turn on auto")
+http("/api/slash", ":model"); r.pump(0.6)
+check(any("menus open at the desktop" in e for e in ev), "a device's bare menu is refused, not opened on the desktop")
+check(not any("Model" in l and "esc" in l for l in r.lines()), "and no picker opened in the terminal", r)
+r.send("TOOL desk\r"); r.wait_for("llow", 10); r.send("\r"); r.pump(1.2); settle(r)
+check(any('"type":"tool_decision"' in e and '"answer":"y"' in e for e in ev), "a terminal answer settles the device's box")
+http("/api/prompt", "ASK me")
+r.wait_for("hich one", 10); r.pump(0.6)
+check(any('"type":"choice_request"' in e and "which one" in e for e in ev), "a model's question reaches the device")
+check("true" in http("/api/approve", "2"), "the device picks an answer")
+r.pump(1.5); settle(r)
+check(any("blue" in e for e in ev if '"tool_' in e), "the terminal popup closed with the device's pick", r)
+check(not any("│" in l and "hich one" in l for l in r.lines()), "and left no box behind", r)
+n0 = sum('"type":"choice_request"' in e for e in ev)
+r.send(":theme\r"); r.wait_for("Theme", 10); r.pump(0.5)
+check(sum('"type":"choice_request"' in e for e in ev) > n0, "a menu opened at the desk shows on the device too")
+r.send("\x1b"); r.pump(0.8)
+check(any('"type":"choice_decision"' in e for e in ev), "closing it at the desk settles the device's box")
+r.send(":remote off\r"); r.wait_for("remote: off", 10); r.pump(0.5)
+check(http("/api/state").startswith("ERR"), ":remote off closes the port")
+check(not any("remote" in l and "▶▶" in l for l in r.lines()), "and the bar drops it", r)
+r.close()
 
 shutil.rmtree(WORK, ignore_errors=True)
 print("RESULT:", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)

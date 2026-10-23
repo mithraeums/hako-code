@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.2.4"
+#define HAKO_VERSION "0.2.5"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -434,29 +434,2002 @@ static int hkFmtFits(char *dst, size_t cap, const char *fmt, ...) {
 	return 1;
 }
 
-/* n characters from alpha (length < 256), from the OS's entropy source, with no
-   modulo bias. Returns 0 when there is none: a guessable token is worse than no
-   token, so callers refuse rather than fall back to rand(). */
+/* n bytes from the OS's entropy source. Returns 0 when there is none: callers
+   refuse rather than fall back to rand(). */
+static int hkRandomBytes(uint8_t *out, size_t n) {
+	while (n > 0) {
+		size_t want = n < 64 ? n : 64, got = 0;
+#ifdef _WIN32
+		for (; got < want; got++) { unsigned v; if (rand_s(&v) != 0) break; out[got] = (uint8_t)v; }
+#else
+		if (getentropy(out, want) == 0) got = want;
+		else {
+			FILE *fp = fopen("/dev/urandom", "rb");
+			if (fp) { got = fread(out, 1, want, fp); fclose(fp); }
+		}
+#endif
+		if (got == 0) return 0;
+		out += got; n -= got;
+	}
+	return 1;
+}
+
+/* n characters from alpha (length < 256), with no modulo bias. Returns 0 when
+   there is no entropy: a guessable token is worse than no token. */
 static int hkRandomToken(char *out, int n, const char *alpha) {
 	int al = (int)strlen(alpha), lim = 256 - 256 % al, k = 0;
 	while (k < n) {
-		unsigned char b[64];
-		int got = 0;
-#ifdef _WIN32
-		for (int i = 0; i < (int)sizeof(b); i++) { unsigned v; if (rand_s(&v) != 0) break; b[i] = (unsigned char)v; got++; }
-#else
-		if (getentropy(b, sizeof(b)) == 0) got = (int)sizeof(b);
-		else {
-			FILE *fp = fopen("/dev/urandom", "rb");
-			if (fp) { got = (int)fread(b, 1, sizeof(b), fp); fclose(fp); }
-		}
-#endif
-		if (got <= 0) { out[0] = '\0'; return 0; }
-		for (int i = 0; i < got && k < n; i++) if (b[i] < lim) out[k++] = alpha[b[i] % al];
+		uint8_t b[64];
+		if (!hkRandomBytes(b, sizeof b)) { out[0] = '\0'; return 0; }
+		for (int i = 0; i < (int)sizeof b && k < n; i++) if (b[i] < lim) out[k++] = alpha[b[i] % al];
 	}
 	out[n] = '\0';
 	return 1;
 }
+
+/* ==== monocypher 4.0.2, vendored (RELAY.md §5) ================================
+   https://monocypher.org, monocypher-4.0.2.tar.gz sha512 bf275d4c53ff94af…
+   (matches the published checksum and the GitHub 4.0.2 tag). Upstream text,
+   trimmed to what hako calls: Argon2, EdDSA, Elligator, scalar arithmetic and
+   one unused helper removed, nothing else changed. */
+// Monocypher version 4.0.2
+//
+// This file is dual-licensed.  Choose whichever licence you want from
+// the two licences listed below.
+//
+// The first licence is a regular 2-clause BSD licence.  The second licence
+// is the CC-0 from Creative Commons. It is intended to release Monocypher
+// to the public domain.  The BSD licence serves as a fallback option.
+//
+// SPDX-License-Identifier: BSD-2-Clause OR CC0-1.0
+//
+// ------------------------------------------------------------------------
+//
+// Copyright (c) 2017-2020, Loup Vaillant
+// All rights reserved.
+//
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+// 1. Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//
+// 2. Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the
+//    distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// ------------------------------------------------------------------------
+//
+// Written in 2017-2020 by Loup Vaillant
+//
+// To the extent possible under law, the author(s) have dedicated all copyright
+// and related neighboring rights to this software to the public domain
+// worldwide.  This software is distributed without any warranty.
+//
+// You should have received a copy of the CC0 Public Domain Dedication along
+// with this software.  If not, see
+// <https://creativecommons.org/publicdomain/zero/1.0/>
+
+
+// --- from monocypher.h (trimmed to what hako calls) ---
+
+// Constant time comparisons
+// -------------------------
+
+// Return 0 if a and b are equal, -1 otherwise
+int crypto_verify16(const uint8_t a[16], const uint8_t b[16]);
+int crypto_verify32(const uint8_t a[32], const uint8_t b[32]);
+int crypto_verify64(const uint8_t a[64], const uint8_t b[64]);
+
+
+// Erase sensitive data
+// --------------------
+void crypto_wipe(void *secret, size_t size);
+
+
+// Authenticated encryption
+// ------------------------
+void crypto_aead_lock(uint8_t       *cipher_text,
+                      uint8_t        mac  [16],
+                      const uint8_t  key  [32],
+                      const uint8_t  nonce[24],
+                      const uint8_t *ad,         size_t ad_size,
+                      const uint8_t *plain_text, size_t text_size);
+int crypto_aead_unlock(uint8_t       *plain_text,
+                       const uint8_t  mac  [16],
+                       const uint8_t  key  [32],
+                       const uint8_t  nonce[24],
+                       const uint8_t *ad,          size_t ad_size,
+                       const uint8_t *cipher_text, size_t text_size);
+
+// Authenticated stream
+// --------------------
+typedef struct {
+	uint64_t counter;
+	uint8_t  key[32];
+	uint8_t  nonce[8];
+} crypto_aead_ctx;
+
+void crypto_aead_init_x(crypto_aead_ctx *ctx,
+                        const uint8_t key[32], const uint8_t nonce[24]);
+void crypto_aead_init_djb(crypto_aead_ctx *ctx,
+                          const uint8_t key[32], const uint8_t nonce[8]);
+void crypto_aead_init_ietf(crypto_aead_ctx *ctx,
+                           const uint8_t key[32], const uint8_t nonce[12]);
+
+void crypto_aead_write(crypto_aead_ctx *ctx,
+                       uint8_t         *cipher_text,
+                       uint8_t          mac[16],
+                       const uint8_t   *ad        , size_t ad_size,
+                       const uint8_t   *plain_text, size_t text_size);
+int crypto_aead_read(crypto_aead_ctx *ctx,
+                     uint8_t         *plain_text,
+                     const uint8_t    mac[16],
+                     const uint8_t   *ad        , size_t ad_size,
+                     const uint8_t   *cipher_text, size_t text_size);
+
+
+// General purpose hash (BLAKE2b)
+// ------------------------------
+
+// Direct interface
+void crypto_blake2b(uint8_t *hash,          size_t hash_size,
+                    const uint8_t *message, size_t message_size);
+
+void crypto_blake2b_keyed(uint8_t *hash,          size_t hash_size,
+                          const uint8_t *key,     size_t key_size,
+                          const uint8_t *message, size_t message_size);
+
+// Incremental interface
+typedef struct {
+	// Do not rely on the size or contents of this type,
+	// for they may change without notice.
+	uint64_t hash[8];
+	uint64_t input_offset[2];
+	uint64_t input[16];
+	size_t   input_idx;
+	size_t   hash_size;
+} crypto_blake2b_ctx;
+
+void crypto_blake2b_init(crypto_blake2b_ctx *ctx, size_t hash_size);
+void crypto_blake2b_keyed_init(crypto_blake2b_ctx *ctx, size_t hash_size,
+                               const uint8_t *key, size_t key_size);
+void crypto_blake2b_update(crypto_blake2b_ctx *ctx,
+                           const uint8_t *message, size_t message_size);
+void crypto_blake2b_final(crypto_blake2b_ctx *ctx, uint8_t *hash);
+
+
+// Key exchange (X-25519)
+// ----------------------
+
+// Shared secrets are not quite random.
+// Hash them to derive an actual shared key.
+void crypto_x25519_public_key(uint8_t       public_key[32],
+                              const uint8_t secret_key[32]);
+void crypto_x25519(uint8_t       raw_shared_secret[32],
+                   const uint8_t your_secret_key  [32],
+                   const uint8_t their_public_key [32]);
+
+// Conversion to EdDSA
+void crypto_x25519_to_eddsa(uint8_t eddsa[32], const uint8_t x25519[32]);
+
+// scalar "division"
+// Used for OPRF.  Be aware that exponential blinding is less secure
+// than Diffie-Hellman key exchange.
+void crypto_x25519_inverse(uint8_t       blind_salt [32],
+                           const uint8_t private_key[32],
+                           const uint8_t curve_point[32]);
+
+// "Dirty" versions of x25519_public_key().
+// Use with crypto_elligator_rev().
+// Leaks 3 bits of the private key.
+void crypto_x25519_dirty_small(uint8_t pk[32], const uint8_t sk[32]);
+void crypto_x25519_dirty_fast (uint8_t pk[32], const uint8_t sk[32]);
+
+
+// Chacha20
+// --------
+
+// Specialised hash.
+// Used to hash X25519 shared secrets.
+void crypto_chacha20_h(uint8_t       out[32],
+                       const uint8_t key[32],
+                       const uint8_t in [16]);
+
+// Unauthenticated stream cipher.
+// Don't forget to add authentication.
+uint64_t crypto_chacha20_djb(uint8_t       *cipher_text,
+                             const uint8_t *plain_text,
+                             size_t         text_size,
+                             const uint8_t  key[32],
+                             const uint8_t  nonce[8],
+                             uint64_t       ctr);
+uint32_t crypto_chacha20_ietf(uint8_t       *cipher_text,
+                              const uint8_t *plain_text,
+                              size_t         text_size,
+                              const uint8_t  key[32],
+                              const uint8_t  nonce[12],
+                              uint32_t       ctr);
+uint64_t crypto_chacha20_x(uint8_t       *cipher_text,
+                           const uint8_t *plain_text,
+                           size_t         text_size,
+                           const uint8_t  key[32],
+                           const uint8_t  nonce[24],
+                           uint64_t       ctr);
+
+
+// Poly 1305
+// ---------
+
+// This is a *one time* authenticator.
+// Disclosing the mac reveals the key.
+// See crypto_lock() on how to use it properly.
+
+// Direct interface
+void crypto_poly1305(uint8_t        mac[16],
+                     const uint8_t *message, size_t message_size,
+                     const uint8_t  key[32]);
+
+// Incremental interface
+typedef struct {
+	// Do not rely on the size or contents of this type,
+	// for they may change without notice.
+	uint8_t  c[16];  // chunk of the message
+	size_t   c_idx;  // How many bytes are there in the chunk.
+	uint32_t r  [4]; // constant multiplier (from the secret key)
+	uint32_t pad[4]; // random number added at the end (from the secret key)
+	uint32_t h  [5]; // accumulated hash
+} crypto_poly1305_ctx;
+
+void crypto_poly1305_init  (crypto_poly1305_ctx *ctx, const uint8_t key[32]);
+void crypto_poly1305_update(crypto_poly1305_ctx *ctx,
+                            const uint8_t *message, size_t message_size);
+void crypto_poly1305_final (crypto_poly1305_ctx *ctx, uint8_t mac[16]);
+
+// --- from monocypher.c (Argon2, EdDSA, Elligator, scalar arithmetic removed) ---
+
+
+/////////////////
+/// Utilities ///
+/////////////////
+#define FOR_T(type, i, start, end) for (type i = (start); i < (end); i++)
+#define FOR(i, start, end)         FOR_T(size_t, i, start, end)
+#define COPY(dst, src, size)       FOR(_i_, 0, size) (dst)[_i_] = (src)[_i_]
+#define ZERO(buf, size)            FOR(_i_, 0, size) (buf)[_i_] = 0
+#define WIPE_CTX(ctx)              crypto_wipe(ctx   , sizeof(*(ctx)))
+#define WIPE_BUFFER(buffer)        crypto_wipe(buffer, sizeof(buffer))
+#define MIN(a, b)                  ((a) <= (b) ? (a) : (b))
+#define MAX(a, b)                  ((a) >= (b) ? (a) : (b))
+
+typedef int8_t   i8;
+typedef uint8_t  u8;
+typedef int16_t  i16;
+typedef uint32_t u32;
+typedef int32_t  i32;
+typedef int64_t  i64;
+typedef uint64_t u64;
+
+static const u8 zero[128] = {0};
+
+// returns the smallest positive integer y such that
+// (x + y) % pow_2  == 0
+// Basically, y is the "gap" missing to align x.
+// Only works when pow_2 is a power of 2.
+// Note: we use ~x+1 instead of -x to avoid compiler warnings
+static size_t gap(size_t x, size_t pow_2)
+{
+	return (~x + 1) & (pow_2 - 1);
+}
+
+static u32 load24_le(const u8 s[3])
+{
+	return
+		((u32)s[0] <<  0) |
+		((u32)s[1] <<  8) |
+		((u32)s[2] << 16);
+}
+
+static u32 load32_le(const u8 s[4])
+{
+	return
+		((u32)s[0] <<  0) |
+		((u32)s[1] <<  8) |
+		((u32)s[2] << 16) |
+		((u32)s[3] << 24);
+}
+
+static u64 load64_le(const u8 s[8])
+{
+	return load32_le(s) | ((u64)load32_le(s+4) << 32);
+}
+
+static void store32_le(u8 out[4], u32 in)
+{
+	out[0] =  in        & 0xff;
+	out[1] = (in >>  8) & 0xff;
+	out[2] = (in >> 16) & 0xff;
+	out[3] = (in >> 24) & 0xff;
+}
+
+static void store64_le(u8 out[8], u64 in)
+{
+	store32_le(out    , (u32)in );
+	store32_le(out + 4, in >> 32);
+}
+
+static void load32_le_buf (u32 *dst, const u8 *src, size_t size) {
+	FOR(i, 0, size) { dst[i] = load32_le(src + i*4); }
+}
+static void load64_le_buf (u64 *dst, const u8 *src, size_t size) {
+	FOR(i, 0, size) { dst[i] = load64_le(src + i*8); }
+}
+static void store32_le_buf(u8 *dst, const u32 *src, size_t size) {
+	FOR(i, 0, size) { store32_le(dst + i*4, src[i]); }
+}
+static void store64_le_buf(u8 *dst, const u64 *src, size_t size) {
+	FOR(i, 0, size) { store64_le(dst + i*8, src[i]); }
+}
+
+static u64 rotr64(u64 x, u64 n) { return (x >> n) ^ (x << (64 - n)); }
+static u32 rotl32(u32 x, u32 n) { return (x << n) ^ (x >> (32 - n)); }
+
+static int neq0(u64 diff)
+{
+	// constant time comparison to zero
+	// return diff != 0 ? -1 : 0
+	u64 half = (diff >> 32) | ((u32)diff);
+	return (1 & ((half - 1) >> 32)) - 1;
+}
+
+static u64 x16(const u8 a[16], const u8 b[16])
+{
+	return (load64_le(a + 0) ^ load64_le(b + 0))
+		|  (load64_le(a + 8) ^ load64_le(b + 8));
+}
+static u64 x32(const u8 a[32],const u8 b[32]){return x16(a,b)| x16(a+16, b+16);}
+static u64 x64(const u8 a[64],const u8 b[64]){return x32(a,b)| x32(a+32, b+32);}
+int crypto_verify16(const u8 a[16], const u8 b[16]){ return neq0(x16(a, b)); }
+int crypto_verify32(const u8 a[32], const u8 b[32]){ return neq0(x32(a, b)); }
+int crypto_verify64(const u8 a[64], const u8 b[64]){ return neq0(x64(a, b)); }
+
+void crypto_wipe(void *secret, size_t size)
+{
+	volatile u8 *v_secret = (u8*)secret;
+	ZERO(v_secret, size);
+}
+
+/////////////////
+/// Chacha 20 ///
+/////////////////
+#define QUARTERROUND(a, b, c, d)	\
+	a += b;  d = rotl32(d ^ a, 16); \
+	c += d;  b = rotl32(b ^ c, 12); \
+	a += b;  d = rotl32(d ^ a,  8); \
+	c += d;  b = rotl32(b ^ c,  7)
+
+static void chacha20_rounds(u32 out[16], const u32 in[16])
+{
+	// The temporary variables make Chacha20 10% faster.
+	u32 t0  = in[ 0];  u32 t1  = in[ 1];  u32 t2  = in[ 2];  u32 t3  = in[ 3];
+	u32 t4  = in[ 4];  u32 t5  = in[ 5];  u32 t6  = in[ 6];  u32 t7  = in[ 7];
+	u32 t8  = in[ 8];  u32 t9  = in[ 9];  u32 t10 = in[10];  u32 t11 = in[11];
+	u32 t12 = in[12];  u32 t13 = in[13];  u32 t14 = in[14];  u32 t15 = in[15];
+
+	FOR (i, 0, 10) { // 20 rounds, 2 rounds per loop.
+		QUARTERROUND(t0, t4, t8 , t12); // column 0
+		QUARTERROUND(t1, t5, t9 , t13); // column 1
+		QUARTERROUND(t2, t6, t10, t14); // column 2
+		QUARTERROUND(t3, t7, t11, t15); // column 3
+		QUARTERROUND(t0, t5, t10, t15); // diagonal 0
+		QUARTERROUND(t1, t6, t11, t12); // diagonal 1
+		QUARTERROUND(t2, t7, t8 , t13); // diagonal 2
+		QUARTERROUND(t3, t4, t9 , t14); // diagonal 3
+	}
+	out[ 0] = t0;   out[ 1] = t1;   out[ 2] = t2;   out[ 3] = t3;
+	out[ 4] = t4;   out[ 5] = t5;   out[ 6] = t6;   out[ 7] = t7;
+	out[ 8] = t8;   out[ 9] = t9;   out[10] = t10;  out[11] = t11;
+	out[12] = t12;  out[13] = t13;  out[14] = t14;  out[15] = t15;
+}
+
+static const u8 *chacha20_constant = (const u8*)"expand 32-byte k"; // 16 bytes
+
+void crypto_chacha20_h(u8 out[32], const u8 key[32], const u8 in [16])
+{
+	u32 block[16];
+	load32_le_buf(block     , chacha20_constant, 4);
+	load32_le_buf(block +  4, key              , 8);
+	load32_le_buf(block + 12, in               , 4);
+
+	chacha20_rounds(block, block);
+
+	// prevent reversal of the rounds by revealing only half of the buffer.
+	store32_le_buf(out   , block   , 4); // constant
+	store32_le_buf(out+16, block+12, 4); // counter and nonce
+	WIPE_BUFFER(block);
+}
+
+u64 crypto_chacha20_djb(u8 *cipher_text, const u8 *plain_text,
+                        size_t text_size, const u8 key[32], const u8 nonce[8],
+                        u64 ctr)
+{
+	u32 input[16];
+	load32_le_buf(input     , chacha20_constant, 4);
+	load32_le_buf(input +  4, key              , 8);
+	load32_le_buf(input + 14, nonce            , 2);
+	input[12] = (u32) ctr;
+	input[13] = (u32)(ctr >> 32);
+
+	// Whole blocks
+	u32    pool[16];
+	size_t nb_blocks = text_size >> 6;
+	FOR (i, 0, nb_blocks) {
+		chacha20_rounds(pool, input);
+		if (plain_text != 0) {
+			FOR (j, 0, 16) {
+				u32 p = pool[j] + input[j];
+				store32_le(cipher_text, p ^ load32_le(plain_text));
+				cipher_text += 4;
+				plain_text  += 4;
+			}
+		} else {
+			FOR (j, 0, 16) {
+				u32 p = pool[j] + input[j];
+				store32_le(cipher_text, p);
+				cipher_text += 4;
+			}
+		}
+		input[12]++;
+		if (input[12] == 0) {
+			input[13]++;
+		}
+	}
+	text_size &= 63;
+
+	// Last (incomplete) block
+	if (text_size > 0) {
+		if (plain_text == 0) {
+			plain_text = zero;
+		}
+		chacha20_rounds(pool, input);
+		u8 tmp[64];
+		FOR (i, 0, 16) {
+			store32_le(tmp + i*4, pool[i] + input[i]);
+		}
+		FOR (i, 0, text_size) {
+			cipher_text[i] = tmp[i] ^ plain_text[i];
+		}
+		WIPE_BUFFER(tmp);
+	}
+	ctr = input[12] + ((u64)input[13] << 32) + (text_size > 0);
+
+	WIPE_BUFFER(pool);
+	WIPE_BUFFER(input);
+	return ctr;
+}
+
+u32 crypto_chacha20_ietf(u8 *cipher_text, const u8 *plain_text,
+                         size_t text_size,
+                         const u8 key[32], const u8 nonce[12], u32 ctr)
+{
+	u64 big_ctr = ctr + ((u64)load32_le(nonce) << 32);
+	return (u32)crypto_chacha20_djb(cipher_text, plain_text, text_size,
+	                                key, nonce + 4, big_ctr);
+}
+
+u64 crypto_chacha20_x(u8 *cipher_text, const u8 *plain_text,
+                      size_t text_size,
+                      const u8 key[32], const u8 nonce[24], u64 ctr)
+{
+	u8 sub_key[32];
+	crypto_chacha20_h(sub_key, key, nonce);
+	ctr = crypto_chacha20_djb(cipher_text, plain_text, text_size,
+	                          sub_key, nonce + 16, ctr);
+	WIPE_BUFFER(sub_key);
+	return ctr;
+}
+
+/////////////////
+/// Poly 1305 ///
+/////////////////
+
+// h = (h + c) * r
+// preconditions:
+//   ctx->h <= 4_ffffffff_ffffffff_ffffffff_ffffffff
+//   ctx->r <=   0ffffffc_0ffffffc_0ffffffc_0fffffff
+//   end    <= 1
+// Postcondition:
+//   ctx->h <= 4_ffffffff_ffffffff_ffffffff_ffffffff
+static void poly_blocks(crypto_poly1305_ctx *ctx, const u8 *in,
+                        size_t nb_blocks, unsigned end)
+{
+	// Local all the things!
+	const u32 r0 = ctx->r[0];
+	const u32 r1 = ctx->r[1];
+	const u32 r2 = ctx->r[2];
+	const u32 r3 = ctx->r[3];
+	const u32 rr0 = (r0 >> 2) * 5;  // lose 2 bits...
+	const u32 rr1 = (r1 >> 2) + r1; // rr1 == (r1 >> 2) * 5
+	const u32 rr2 = (r2 >> 2) + r2; // rr1 == (r2 >> 2) * 5
+	const u32 rr3 = (r3 >> 2) + r3; // rr1 == (r3 >> 2) * 5
+	const u32 rr4 = r0 & 3;         // ...recover 2 bits
+	u32 h0 = ctx->h[0];
+	u32 h1 = ctx->h[1];
+	u32 h2 = ctx->h[2];
+	u32 h3 = ctx->h[3];
+	u32 h4 = ctx->h[4];
+
+	FOR (i, 0, nb_blocks) {
+		// h + c, without carry propagation
+		const u64 s0 = (u64)h0 + load32_le(in);  in += 4;
+		const u64 s1 = (u64)h1 + load32_le(in);  in += 4;
+		const u64 s2 = (u64)h2 + load32_le(in);  in += 4;
+		const u64 s3 = (u64)h3 + load32_le(in);  in += 4;
+		const u32 s4 =      h4 + end;
+
+		// (h + c) * r, without carry propagation
+		const u64 x0 = s0*r0+ s1*rr3+ s2*rr2+ s3*rr1+ s4*rr0;
+		const u64 x1 = s0*r1+ s1*r0 + s2*rr3+ s3*rr2+ s4*rr1;
+		const u64 x2 = s0*r2+ s1*r1 + s2*r0 + s3*rr3+ s4*rr2;
+		const u64 x3 = s0*r3+ s1*r2 + s2*r1 + s3*r0 + s4*rr3;
+		const u32 x4 =                                s4*rr4;
+
+		// partial reduction modulo 2^130 - 5
+		const u32 u5 = x4 + (x3 >> 32); // u5 <= 7ffffff5
+		const u64 u0 = (u5 >>  2) * 5 + (x0 & 0xffffffff);
+		const u64 u1 = (u0 >> 32)     + (x1 & 0xffffffff) + (x0 >> 32);
+		const u64 u2 = (u1 >> 32)     + (x2 & 0xffffffff) + (x1 >> 32);
+		const u64 u3 = (u2 >> 32)     + (x3 & 0xffffffff) + (x2 >> 32);
+		const u32 u4 = (u3 >> 32)     + (u5 & 3); // u4 <= 4
+
+		// Update the hash
+		h0 = u0 & 0xffffffff;
+		h1 = u1 & 0xffffffff;
+		h2 = u2 & 0xffffffff;
+		h3 = u3 & 0xffffffff;
+		h4 = u4;
+	}
+	ctx->h[0] = h0;
+	ctx->h[1] = h1;
+	ctx->h[2] = h2;
+	ctx->h[3] = h3;
+	ctx->h[4] = h4;
+}
+
+void crypto_poly1305_init(crypto_poly1305_ctx *ctx, const u8 key[32])
+{
+	ZERO(ctx->h, 5); // Initial hash is zero
+	ctx->c_idx = 0;
+	// load r and pad (r has some of its bits cleared)
+	load32_le_buf(ctx->r  , key   , 4);
+	load32_le_buf(ctx->pad, key+16, 4);
+	FOR (i, 0, 1) { ctx->r[i] &= 0x0fffffff; }
+	FOR (i, 1, 4) { ctx->r[i] &= 0x0ffffffc; }
+}
+
+void crypto_poly1305_update(crypto_poly1305_ctx *ctx,
+                            const u8 *message, size_t message_size)
+{
+	// Avoid undefined NULL pointer increments with empty messages
+	if (message_size == 0) {
+		return;
+	}
+
+	// Align ourselves with block boundaries
+	size_t aligned = MIN(gap(ctx->c_idx, 16), message_size);
+	FOR (i, 0, aligned) {
+		ctx->c[ctx->c_idx] = *message;
+		ctx->c_idx++;
+		message++;
+		message_size--;
+	}
+
+	// If block is complete, process it
+	if (ctx->c_idx == 16) {
+		poly_blocks(ctx, ctx->c, 1, 1);
+		ctx->c_idx = 0;
+	}
+
+	// Process the message block by block
+	size_t nb_blocks = message_size >> 4;
+	poly_blocks(ctx, message, nb_blocks, 1);
+	message      += nb_blocks << 4;
+	message_size &= 15;
+
+	// remaining bytes (we never complete a block here)
+	FOR (i, 0, message_size) {
+		ctx->c[ctx->c_idx] = message[i];
+		ctx->c_idx++;
+	}
+}
+
+void crypto_poly1305_final(crypto_poly1305_ctx *ctx, u8 mac[16])
+{
+	// Process the last block (if any)
+	// We move the final 1 according to remaining input length
+	// (this will add less than 2^130 to the last input block)
+	if (ctx->c_idx != 0) {
+		ZERO(ctx->c + ctx->c_idx, 16 - ctx->c_idx);
+		ctx->c[ctx->c_idx] = 1;
+		poly_blocks(ctx, ctx->c, 1, 0);
+	}
+
+	// check if we should subtract 2^130-5 by performing the
+	// corresponding carry propagation.
+	u64 c = 5;
+	FOR (i, 0, 4) {
+		c  += ctx->h[i];
+		c >>= 32;
+	}
+	c += ctx->h[4];
+	c  = (c >> 2) * 5; // shift the carry back to the beginning
+	// c now indicates how many times we should subtract 2^130-5 (0 or 1)
+	FOR (i, 0, 4) {
+		c += (u64)ctx->h[i] + ctx->pad[i];
+		store32_le(mac + i*4, (u32)c);
+		c = c >> 32;
+	}
+	WIPE_CTX(ctx);
+}
+
+void crypto_poly1305(u8     mac[16],  const u8 *message,
+                     size_t message_size, const u8  key[32])
+{
+	crypto_poly1305_ctx ctx;
+	crypto_poly1305_init  (&ctx, key);
+	crypto_poly1305_update(&ctx, message, message_size);
+	crypto_poly1305_final (&ctx, mac);
+}
+
+////////////////
+/// BLAKE2 b ///
+////////////////
+static const u64 iv[8] = {
+	0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
+	0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+	0x510e527fade682d1, 0x9b05688c2b3e6c1f,
+	0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+};
+
+static void blake2b_compress(crypto_blake2b_ctx *ctx, int is_last_block)
+{
+	static const u8 sigma[12][16] = {
+		{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+		{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
+		{ 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
+		{  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
+		{  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
+		{  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 },
+		{ 12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11 },
+		{ 13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10 },
+		{  6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5 },
+		{ 10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0 },
+		{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+		{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
+	};
+
+	// increment input offset
+	u64   *x = ctx->input_offset;
+	size_t y = ctx->input_idx;
+	x[0] += y;
+	if (x[0] < y) {
+		x[1]++;
+	}
+
+	// init work vector
+	u64 v0 = ctx->hash[0];  u64 v8  = iv[0];
+	u64 v1 = ctx->hash[1];  u64 v9  = iv[1];
+	u64 v2 = ctx->hash[2];  u64 v10 = iv[2];
+	u64 v3 = ctx->hash[3];  u64 v11 = iv[3];
+	u64 v4 = ctx->hash[4];  u64 v12 = iv[4] ^ ctx->input_offset[0];
+	u64 v5 = ctx->hash[5];  u64 v13 = iv[5] ^ ctx->input_offset[1];
+	u64 v6 = ctx->hash[6];  u64 v14 = iv[6] ^ (u64)~(is_last_block - 1);
+	u64 v7 = ctx->hash[7];  u64 v15 = iv[7];
+
+	// mangle work vector
+	u64 *input = ctx->input;
+#define BLAKE2_G(a, b, c, d, x, y)	\
+	a += b + x;  d = rotr64(d ^ a, 32); \
+	c += d;      b = rotr64(b ^ c, 24); \
+	a += b + y;  d = rotr64(d ^ a, 16); \
+	c += d;      b = rotr64(b ^ c, 63)
+#define BLAKE2_ROUND(i)	\
+	BLAKE2_G(v0, v4, v8 , v12, input[sigma[i][ 0]], input[sigma[i][ 1]]); \
+	BLAKE2_G(v1, v5, v9 , v13, input[sigma[i][ 2]], input[sigma[i][ 3]]); \
+	BLAKE2_G(v2, v6, v10, v14, input[sigma[i][ 4]], input[sigma[i][ 5]]); \
+	BLAKE2_G(v3, v7, v11, v15, input[sigma[i][ 6]], input[sigma[i][ 7]]); \
+	BLAKE2_G(v0, v5, v10, v15, input[sigma[i][ 8]], input[sigma[i][ 9]]); \
+	BLAKE2_G(v1, v6, v11, v12, input[sigma[i][10]], input[sigma[i][11]]); \
+	BLAKE2_G(v2, v7, v8 , v13, input[sigma[i][12]], input[sigma[i][13]]); \
+	BLAKE2_G(v3, v4, v9 , v14, input[sigma[i][14]], input[sigma[i][15]])
+
+#ifdef BLAKE2_NO_UNROLLING
+	FOR (i, 0, 12) {
+		BLAKE2_ROUND(i);
+	}
+#else
+	BLAKE2_ROUND(0);  BLAKE2_ROUND(1);  BLAKE2_ROUND(2);  BLAKE2_ROUND(3);
+	BLAKE2_ROUND(4);  BLAKE2_ROUND(5);  BLAKE2_ROUND(6);  BLAKE2_ROUND(7);
+	BLAKE2_ROUND(8);  BLAKE2_ROUND(9);  BLAKE2_ROUND(10); BLAKE2_ROUND(11);
+#endif
+
+	// update hash
+	ctx->hash[0] ^= v0 ^ v8;   ctx->hash[1] ^= v1 ^ v9;
+	ctx->hash[2] ^= v2 ^ v10;  ctx->hash[3] ^= v3 ^ v11;
+	ctx->hash[4] ^= v4 ^ v12;  ctx->hash[5] ^= v5 ^ v13;
+	ctx->hash[6] ^= v6 ^ v14;  ctx->hash[7] ^= v7 ^ v15;
+}
+
+void crypto_blake2b_keyed_init(crypto_blake2b_ctx *ctx, size_t hash_size,
+                               const u8 *key, size_t key_size)
+{
+	// initial hash
+	COPY(ctx->hash, iv, 8);
+	ctx->hash[0] ^= 0x01010000 ^ (key_size << 8) ^ hash_size;
+
+	ctx->input_offset[0] = 0;  // beginning of the input, no offset
+	ctx->input_offset[1] = 0;  // beginning of the input, no offset
+	ctx->hash_size       = hash_size;
+	ctx->input_idx       = 0;
+	ZERO(ctx->input, 16);
+
+	// if there is a key, the first block is that key (padded with zeroes)
+	if (key_size > 0) {
+		u8 key_block[128] = {0};
+		COPY(key_block, key, key_size);
+		// same as calling crypto_blake2b_update(ctx, key_block , 128)
+		load64_le_buf(ctx->input, key_block, 16);
+		ctx->input_idx = 128;
+	}
+}
+
+void crypto_blake2b_init(crypto_blake2b_ctx *ctx, size_t hash_size)
+{
+	crypto_blake2b_keyed_init(ctx, hash_size, 0, 0);
+}
+
+void crypto_blake2b_update(crypto_blake2b_ctx *ctx,
+                           const u8 *message, size_t message_size)
+{
+	// Avoid undefined NULL pointer increments with empty messages
+	if (message_size == 0) {
+		return;
+	}
+
+	// Align with word boundaries
+	if ((ctx->input_idx & 7) != 0) {
+		size_t nb_bytes = MIN(gap(ctx->input_idx, 8), message_size);
+		size_t word     = ctx->input_idx >> 3;
+		size_t byte     = ctx->input_idx & 7;
+		FOR (i, 0, nb_bytes) {
+			ctx->input[word] |= (u64)message[i] << ((byte + i) << 3);
+		}
+		ctx->input_idx += nb_bytes;
+		message        += nb_bytes;
+		message_size   -= nb_bytes;
+	}
+
+	// Align with block boundaries (faster than byte by byte)
+	if ((ctx->input_idx & 127) != 0) {
+		size_t nb_words = MIN(gap(ctx->input_idx, 128), message_size) >> 3;
+		load64_le_buf(ctx->input + (ctx->input_idx >> 3), message, nb_words);
+		ctx->input_idx += nb_words << 3;
+		message        += nb_words << 3;
+		message_size   -= nb_words << 3;
+	}
+
+	// Process block by block
+	size_t nb_blocks = message_size >> 7;
+	FOR (i, 0, nb_blocks) {
+		if (ctx->input_idx == 128) {
+			blake2b_compress(ctx, 0);
+		}
+		load64_le_buf(ctx->input, message, 16);
+		message += 128;
+		ctx->input_idx = 128;
+	}
+	message_size &= 127;
+
+	if (message_size != 0) {
+		// Compress block & flush input buffer as needed
+		if (ctx->input_idx == 128) {
+			blake2b_compress(ctx, 0);
+			ctx->input_idx = 0;
+		}
+		if (ctx->input_idx == 0) {
+			ZERO(ctx->input, 16);
+		}
+		// Fill remaining words (faster than byte by byte)
+		size_t nb_words = message_size >> 3;
+		load64_le_buf(ctx->input, message, nb_words);
+		ctx->input_idx += nb_words << 3;
+		message        += nb_words << 3;
+		message_size   -= nb_words << 3;
+
+		// Fill remaining bytes
+		FOR (i, 0, message_size) {
+			size_t word = ctx->input_idx >> 3;
+			size_t byte = ctx->input_idx & 7;
+			ctx->input[word] |= (u64)message[i] << (byte << 3);
+			ctx->input_idx++;
+		}
+	}
+}
+
+void crypto_blake2b_final(crypto_blake2b_ctx *ctx, u8 *hash)
+{
+	blake2b_compress(ctx, 1); // compress the last block
+	size_t hash_size = MIN(ctx->hash_size, 64);
+	size_t nb_words  = hash_size >> 3;
+	store64_le_buf(hash, ctx->hash, nb_words);
+	FOR (i, nb_words << 3, hash_size) {
+		hash[i] = (ctx->hash[i >> 3] >> (8 * (i & 7))) & 0xff;
+	}
+	WIPE_CTX(ctx);
+}
+
+void crypto_blake2b_keyed(u8 *hash,          size_t hash_size,
+                          const u8 *key,     size_t key_size,
+                          const u8 *message, size_t message_size)
+{
+	crypto_blake2b_ctx ctx;
+	crypto_blake2b_keyed_init(&ctx, hash_size, key, key_size);
+	crypto_blake2b_update    (&ctx, message, message_size);
+	crypto_blake2b_final     (&ctx, hash);
+}
+
+void crypto_blake2b(u8 *hash, size_t hash_size, const u8 *msg, size_t msg_size)
+{
+	crypto_blake2b_keyed(hash, hash_size, 0, 0, msg, msg_size);
+}
+
+//////////////
+////////////////////////////////////
+/// Arithmetic modulo 2^255 - 19 ///
+////////////////////////////////////
+//  Originally taken from SUPERCOP's ref10 implementation.
+//  A bit bigger than TweetNaCl, over 4 times faster.
+
+// field element
+typedef i32 fe[10];
+
+// field constants
+//
+// sqrtm1      : sqrt(-1)
+static const fe sqrtm1  = {
+	-32595792, -7943725, 9377950, 3500415, 12389472,
+	-272473, -25146209, -2005654, 326686, 11406482,
+};
+
+static void fe_0(fe h) {           ZERO(h  , 10); }
+static void fe_1(fe h) { h[0] = 1; ZERO(h+1,  9); }
+
+static void fe_copy(fe h,const fe f           ){FOR(i,0,10) h[i] =  f[i];      }
+static void fe_neg (fe h,const fe f           ){FOR(i,0,10) h[i] = -f[i];      }
+static void fe_add (fe h,const fe f,const fe g){FOR(i,0,10) h[i] = f[i] + g[i];}
+static void fe_sub (fe h,const fe f,const fe g){FOR(i,0,10) h[i] = f[i] - g[i];}
+
+static void fe_cswap(fe f, fe g, int b)
+{
+	i32 mask = -b; // -1 = 0xffffffff
+	FOR (i, 0, 10) {
+		i32 x = (f[i] ^ g[i]) & mask;
+		f[i] = f[i] ^ x;
+		g[i] = g[i] ^ x;
+	}
+}
+
+static void fe_ccopy(fe f, const fe g, int b)
+{
+	i32 mask = -b; // -1 = 0xffffffff
+	FOR (i, 0, 10) {
+		i32 x = (f[i] ^ g[i]) & mask;
+		f[i] = f[i] ^ x;
+	}
+}
+
+
+// Signed carry propagation
+// ------------------------
+//
+// Let t be a number.  It can be uniquely decomposed thus:
+//
+//    t = h*2^26 + l
+//    such that -2^25 <= l < 2^25
+//
+// Let c = (t + 2^25) / 2^26            (rounded down)
+//     c = (h*2^26 + l + 2^25) / 2^26   (rounded down)
+//     c =  h   +   (l + 2^25) / 2^26   (rounded down)
+//     c =  h                           (exactly)
+// Because 0 <= l + 2^25 < 2^26
+//
+// Let u = t          - c*2^26
+//     u = h*2^26 + l - h*2^26
+//     u = l
+// Therefore, -2^25 <= u < 2^25
+//
+// Additionally, if |t| < x, then |h| < x/2^26 (rounded down)
+//
+// Notations:
+// - In C, 1<<25 means 2^25.
+// - In C, x>>25 means floor(x / (2^25)).
+// - All of the above applies with 25 & 24 as well as 26 & 25.
+//
+//
+// Note on negative right shifts
+// -----------------------------
+//
+// In C, x >> n, where x is a negative integer, is implementation
+// defined.  In practice, all platforms do arithmetic shift, which is
+// equivalent to division by 2^26, rounded down.  Some compilers, like
+// GCC, even guarantee it.
+//
+// If we ever stumble upon a platform that does not propagate the sign
+// bit (we won't), visible failures will show at the slightest test, and
+// the signed shifts can be replaced by the following:
+//
+//     typedef struct { i64 x:39; } s25;
+//     typedef struct { i64 x:38; } s26;
+//     i64 shift25(i64 x) { s25 s; s.x = ((u64)x)>>25; return s.x; }
+//     i64 shift26(i64 x) { s26 s; s.x = ((u64)x)>>26; return s.x; }
+//
+// Current compilers cannot optimise this, causing a 30% drop in
+// performance.  Fairly expensive for something that never happens.
+//
+//
+// Precondition
+// ------------
+//
+// |t0|       < 2^63
+// |t1|..|t9| < 2^62
+//
+// Algorithm
+// ---------
+// c   = t0 + 2^25 / 2^26   -- |c|  <= 2^36
+// t0 -= c * 2^26           -- |t0| <= 2^25
+// t1 += c                  -- |t1| <= 2^63
+//
+// c   = t4 + 2^25 / 2^26   -- |c|  <= 2^36
+// t4 -= c * 2^26           -- |t4| <= 2^25
+// t5 += c                  -- |t5| <= 2^63
+//
+// c   = t1 + 2^24 / 2^25   -- |c|  <= 2^38
+// t1 -= c * 2^25           -- |t1| <= 2^24
+// t2 += c                  -- |t2| <= 2^63
+//
+// c   = t5 + 2^24 / 2^25   -- |c|  <= 2^38
+// t5 -= c * 2^25           -- |t5| <= 2^24
+// t6 += c                  -- |t6| <= 2^63
+//
+// c   = t2 + 2^25 / 2^26   -- |c|  <= 2^37
+// t2 -= c * 2^26           -- |t2| <= 2^25        < 1.1 * 2^25  (final t2)
+// t3 += c                  -- |t3| <= 2^63
+//
+// c   = t6 + 2^25 / 2^26   -- |c|  <= 2^37
+// t6 -= c * 2^26           -- |t6| <= 2^25        < 1.1 * 2^25  (final t6)
+// t7 += c                  -- |t7| <= 2^63
+//
+// c   = t3 + 2^24 / 2^25   -- |c|  <= 2^38
+// t3 -= c * 2^25           -- |t3| <= 2^24        < 1.1 * 2^24  (final t3)
+// t4 += c                  -- |t4| <= 2^25 + 2^38 < 2^39
+//
+// c   = t7 + 2^24 / 2^25   -- |c|  <= 2^38
+// t7 -= c * 2^25           -- |t7| <= 2^24        < 1.1 * 2^24  (final t7)
+// t8 += c                  -- |t8| <= 2^63
+//
+// c   = t4 + 2^25 / 2^26   -- |c|  <= 2^13
+// t4 -= c * 2^26           -- |t4| <= 2^25        < 1.1 * 2^25  (final t4)
+// t5 += c                  -- |t5| <= 2^24 + 2^13 < 1.1 * 2^24  (final t5)
+//
+// c   = t8 + 2^25 / 2^26   -- |c|  <= 2^37
+// t8 -= c * 2^26           -- |t8| <= 2^25        < 1.1 * 2^25  (final t8)
+// t9 += c                  -- |t9| <= 2^63
+//
+// c   = t9 + 2^24 / 2^25   -- |c|  <= 2^38
+// t9 -= c * 2^25           -- |t9| <= 2^24        < 1.1 * 2^24  (final t9)
+// t0 += c * 19             -- |t0| <= 2^25 + 2^38*19 < 2^44
+//
+// c   = t0 + 2^25 / 2^26   -- |c|  <= 2^18
+// t0 -= c * 2^26           -- |t0| <= 2^25        < 1.1 * 2^25  (final t0)
+// t1 += c                  -- |t1| <= 2^24 + 2^18 < 1.1 * 2^24  (final t1)
+//
+// Postcondition
+// -------------
+//   |t0|, |t2|, |t4|, |t6|, |t8|  <  1.1 * 2^25
+//   |t1|, |t3|, |t5|, |t7|, |t9|  <  1.1 * 2^24
+#define FE_CARRY	\
+	i64 c; \
+	c = (t0 + ((i64)1<<25)) >> 26;  t0 -= c * ((i64)1 << 26);  t1 += c; \
+	c = (t4 + ((i64)1<<25)) >> 26;  t4 -= c * ((i64)1 << 26);  t5 += c; \
+	c = (t1 + ((i64)1<<24)) >> 25;  t1 -= c * ((i64)1 << 25);  t2 += c; \
+	c = (t5 + ((i64)1<<24)) >> 25;  t5 -= c * ((i64)1 << 25);  t6 += c; \
+	c = (t2 + ((i64)1<<25)) >> 26;  t2 -= c * ((i64)1 << 26);  t3 += c; \
+	c = (t6 + ((i64)1<<25)) >> 26;  t6 -= c * ((i64)1 << 26);  t7 += c; \
+	c = (t3 + ((i64)1<<24)) >> 25;  t3 -= c * ((i64)1 << 25);  t4 += c; \
+	c = (t7 + ((i64)1<<24)) >> 25;  t7 -= c * ((i64)1 << 25);  t8 += c; \
+	c = (t4 + ((i64)1<<25)) >> 26;  t4 -= c * ((i64)1 << 26);  t5 += c; \
+	c = (t8 + ((i64)1<<25)) >> 26;  t8 -= c * ((i64)1 << 26);  t9 += c; \
+	c = (t9 + ((i64)1<<24)) >> 25;  t9 -= c * ((i64)1 << 25);  t0 += c * 19; \
+	c = (t0 + ((i64)1<<25)) >> 26;  t0 -= c * ((i64)1 << 26);  t1 += c; \
+	h[0]=(i32)t0;  h[1]=(i32)t1;  h[2]=(i32)t2;  h[3]=(i32)t3;  h[4]=(i32)t4; \
+	h[5]=(i32)t5;  h[6]=(i32)t6;  h[7]=(i32)t7;  h[8]=(i32)t8;  h[9]=(i32)t9
+
+// Decodes a field element from a byte buffer.
+// mask specifies how many bits we ignore.
+// Traditionally we ignore 1. It's useful for EdDSA,
+// which uses that bit to denote the sign of x.
+// Elligator however uses positive representatives,
+// which means ignoring 2 bits instead.
+static void fe_frombytes_mask(fe h, const u8 s[32], unsigned nb_mask)
+{
+	u32 mask = 0xffffff >> nb_mask;
+	i64 t0 =  load32_le(s);                    // t0 < 2^32
+	i64 t1 =  load24_le(s +  4) << 6;          // t1 < 2^30
+	i64 t2 =  load24_le(s +  7) << 5;          // t2 < 2^29
+	i64 t3 =  load24_le(s + 10) << 3;          // t3 < 2^27
+	i64 t4 =  load24_le(s + 13) << 2;          // t4 < 2^26
+	i64 t5 =  load32_le(s + 16);               // t5 < 2^32
+	i64 t6 =  load24_le(s + 20) << 7;          // t6 < 2^31
+	i64 t7 =  load24_le(s + 23) << 5;          // t7 < 2^29
+	i64 t8 =  load24_le(s + 26) << 4;          // t8 < 2^28
+	i64 t9 = (load24_le(s + 29) & mask) << 2;  // t9 < 2^25
+	FE_CARRY;                                  // Carry precondition OK
+}
+
+static void fe_frombytes(fe h, const u8 s[32])
+{
+	fe_frombytes_mask(h, s, 1);
+}
+
+
+// Precondition
+//   |h[0]|, |h[2]|, |h[4]|, |h[6]|, |h[8]|  <  1.1 * 2^25
+//   |h[1]|, |h[3]|, |h[5]|, |h[7]|, |h[9]|  <  1.1 * 2^24
+//
+// Therefore, |h| < 2^255-19
+// There are two possibilities:
+//
+// - If h is positive, all we need to do is reduce its individual
+//   limbs down to their tight positive range.
+// - If h is negative, we also need to add 2^255-19 to it.
+//   Or just remove 19 and chop off any excess bit.
+static void fe_tobytes(u8 s[32], const fe h)
+{
+	i32 t[10];
+	COPY(t, h, 10);
+	i32 q = (19 * t[9] + (((i32) 1) << 24)) >> 25;
+	//                 |t9|                    < 1.1 * 2^24
+	//  -1.1 * 2^24  <  t9                     < 1.1 * 2^24
+	//  -21  * 2^24  <  19 * t9                < 21  * 2^24
+	//  -2^29        <  19 * t9 + 2^24         < 2^29
+	//  -2^29 / 2^25 < (19 * t9 + 2^24) / 2^25 < 2^29 / 2^25
+	//  -16          < (19 * t9 + 2^24) / 2^25 < 16
+	FOR (i, 0, 5) {
+		q += t[2*i  ]; q >>= 26; // q = 0 or -1
+		q += t[2*i+1]; q >>= 25; // q = 0 or -1
+	}
+	// q =  0 iff h >= 0
+	// q = -1 iff h <  0
+	// Adding q * 19 to h reduces h to its proper range.
+	q *= 19;  // Shift carry back to the beginning
+	FOR (i, 0, 5) {
+		t[i*2  ] += q;  q = t[i*2  ] >> 26;  t[i*2  ] -= q * ((i32)1 << 26);
+		t[i*2+1] += q;  q = t[i*2+1] >> 25;  t[i*2+1] -= q * ((i32)1 << 25);
+	}
+	// h is now fully reduced, and q represents the excess bit.
+
+	store32_le(s +  0, ((u32)t[0] >>  0) | ((u32)t[1] << 26));
+	store32_le(s +  4, ((u32)t[1] >>  6) | ((u32)t[2] << 19));
+	store32_le(s +  8, ((u32)t[2] >> 13) | ((u32)t[3] << 13));
+	store32_le(s + 12, ((u32)t[3] >> 19) | ((u32)t[4] <<  6));
+	store32_le(s + 16, ((u32)t[5] >>  0) | ((u32)t[6] << 25));
+	store32_le(s + 20, ((u32)t[6] >>  7) | ((u32)t[7] << 19));
+	store32_le(s + 24, ((u32)t[7] >> 13) | ((u32)t[8] << 12));
+	store32_le(s + 28, ((u32)t[8] >> 20) | ((u32)t[9] <<  6));
+
+	WIPE_BUFFER(t);
+}
+
+// Precondition
+// -------------
+//   |f0|, |f2|, |f4|, |f6|, |f8|  <  1.65 * 2^26
+//   |f1|, |f3|, |f5|, |f7|, |f9|  <  1.65 * 2^25
+//
+//   |g0|, |g2|, |g4|, |g6|, |g8|  <  1.65 * 2^26
+//   |g1|, |g3|, |g5|, |g7|, |g9|  <  1.65 * 2^25
+static void fe_mul_small(fe h, const fe f, i32 g)
+{
+	i64 t0 = f[0] * (i64) g;  i64 t1 = f[1] * (i64) g;
+	i64 t2 = f[2] * (i64) g;  i64 t3 = f[3] * (i64) g;
+	i64 t4 = f[4] * (i64) g;  i64 t5 = f[5] * (i64) g;
+	i64 t6 = f[6] * (i64) g;  i64 t7 = f[7] * (i64) g;
+	i64 t8 = f[8] * (i64) g;  i64 t9 = f[9] * (i64) g;
+	// |t0|, |t2|, |t4|, |t6|, |t8|  <  1.65 * 2^26 * 2^31  < 2^58
+	// |t1|, |t3|, |t5|, |t7|, |t9|  <  1.65 * 2^25 * 2^31  < 2^57
+
+	FE_CARRY; // Carry precondition OK
+}
+
+// Precondition
+// -------------
+//   |f0|, |f2|, |f4|, |f6|, |f8|  <  1.65 * 2^26
+//   |f1|, |f3|, |f5|, |f7|, |f9|  <  1.65 * 2^25
+//
+//   |g0|, |g2|, |g4|, |g6|, |g8|  <  1.65 * 2^26
+//   |g1|, |g3|, |g5|, |g7|, |g9|  <  1.65 * 2^25
+static void fe_mul(fe h, const fe f, const fe g)
+{
+	// Everything is unrolled and put in temporary variables.
+	// We could roll the loop, but that would make curve25519 twice as slow.
+	i32 f0 = f[0]; i32 f1 = f[1]; i32 f2 = f[2]; i32 f3 = f[3]; i32 f4 = f[4];
+	i32 f5 = f[5]; i32 f6 = f[6]; i32 f7 = f[7]; i32 f8 = f[8]; i32 f9 = f[9];
+	i32 g0 = g[0]; i32 g1 = g[1]; i32 g2 = g[2]; i32 g3 = g[3]; i32 g4 = g[4];
+	i32 g5 = g[5]; i32 g6 = g[6]; i32 g7 = g[7]; i32 g8 = g[8]; i32 g9 = g[9];
+	i32 F1 = f1*2; i32 F3 = f3*2; i32 F5 = f5*2; i32 F7 = f7*2; i32 F9 = f9*2;
+	i32 G1 = g1*19;  i32 G2 = g2*19;  i32 G3 = g3*19;
+	i32 G4 = g4*19;  i32 G5 = g5*19;  i32 G6 = g6*19;
+	i32 G7 = g7*19;  i32 G8 = g8*19;  i32 G9 = g9*19;
+	// |F1|, |F3|, |F5|, |F7|, |F9|  <  1.65 * 2^26
+	// |G0|, |G2|, |G4|, |G6|, |G8|  <  2^31
+	// |G1|, |G3|, |G5|, |G7|, |G9|  <  2^30
+
+	i64 t0 = f0*(i64)g0 + F1*(i64)G9 + f2*(i64)G8 + F3*(i64)G7 + f4*(i64)G6
+	       + F5*(i64)G5 + f6*(i64)G4 + F7*(i64)G3 + f8*(i64)G2 + F9*(i64)G1;
+	i64 t1 = f0*(i64)g1 + f1*(i64)g0 + f2*(i64)G9 + f3*(i64)G8 + f4*(i64)G7
+	       + f5*(i64)G6 + f6*(i64)G5 + f7*(i64)G4 + f8*(i64)G3 + f9*(i64)G2;
+	i64 t2 = f0*(i64)g2 + F1*(i64)g1 + f2*(i64)g0 + F3*(i64)G9 + f4*(i64)G8
+	       + F5*(i64)G7 + f6*(i64)G6 + F7*(i64)G5 + f8*(i64)G4 + F9*(i64)G3;
+	i64 t3 = f0*(i64)g3 + f1*(i64)g2 + f2*(i64)g1 + f3*(i64)g0 + f4*(i64)G9
+	       + f5*(i64)G8 + f6*(i64)G7 + f7*(i64)G6 + f8*(i64)G5 + f9*(i64)G4;
+	i64 t4 = f0*(i64)g4 + F1*(i64)g3 + f2*(i64)g2 + F3*(i64)g1 + f4*(i64)g0
+	       + F5*(i64)G9 + f6*(i64)G8 + F7*(i64)G7 + f8*(i64)G6 + F9*(i64)G5;
+	i64 t5 = f0*(i64)g5 + f1*(i64)g4 + f2*(i64)g3 + f3*(i64)g2 + f4*(i64)g1
+	       + f5*(i64)g0 + f6*(i64)G9 + f7*(i64)G8 + f8*(i64)G7 + f9*(i64)G6;
+	i64 t6 = f0*(i64)g6 + F1*(i64)g5 + f2*(i64)g4 + F3*(i64)g3 + f4*(i64)g2
+	       + F5*(i64)g1 + f6*(i64)g0 + F7*(i64)G9 + f8*(i64)G8 + F9*(i64)G7;
+	i64 t7 = f0*(i64)g7 + f1*(i64)g6 + f2*(i64)g5 + f3*(i64)g4 + f4*(i64)g3
+	       + f5*(i64)g2 + f6*(i64)g1 + f7*(i64)g0 + f8*(i64)G9 + f9*(i64)G8;
+	i64 t8 = f0*(i64)g8 + F1*(i64)g7 + f2*(i64)g6 + F3*(i64)g5 + f4*(i64)g4
+	       + F5*(i64)g3 + f6*(i64)g2 + F7*(i64)g1 + f8*(i64)g0 + F9*(i64)G9;
+	i64 t9 = f0*(i64)g9 + f1*(i64)g8 + f2*(i64)g7 + f3*(i64)g6 + f4*(i64)g5
+	       + f5*(i64)g4 + f6*(i64)g3 + f7*(i64)g2 + f8*(i64)g1 + f9*(i64)g0;
+	// t0 < 0.67 * 2^61
+	// t1 < 0.41 * 2^61
+	// t2 < 0.52 * 2^61
+	// t3 < 0.32 * 2^61
+	// t4 < 0.38 * 2^61
+	// t5 < 0.22 * 2^61
+	// t6 < 0.23 * 2^61
+	// t7 < 0.13 * 2^61
+	// t8 < 0.09 * 2^61
+	// t9 < 0.03 * 2^61
+
+	FE_CARRY; // Everything below 2^62, Carry precondition OK
+}
+
+// Precondition
+// -------------
+//   |f0|, |f2|, |f4|, |f6|, |f8|  <  1.65 * 2^26
+//   |f1|, |f3|, |f5|, |f7|, |f9|  <  1.65 * 2^25
+//
+// Note: we could use fe_mul() for this, but this is significantly faster
+static void fe_sq(fe h, const fe f)
+{
+	i32 f0 = f[0]; i32 f1 = f[1]; i32 f2 = f[2]; i32 f3 = f[3]; i32 f4 = f[4];
+	i32 f5 = f[5]; i32 f6 = f[6]; i32 f7 = f[7]; i32 f8 = f[8]; i32 f9 = f[9];
+	i32 f0_2  = f0*2;   i32 f1_2  = f1*2;   i32 f2_2  = f2*2;   i32 f3_2 = f3*2;
+	i32 f4_2  = f4*2;   i32 f5_2  = f5*2;   i32 f6_2  = f6*2;   i32 f7_2 = f7*2;
+	i32 f5_38 = f5*38;  i32 f6_19 = f6*19;  i32 f7_38 = f7*38;
+	i32 f8_19 = f8*19;  i32 f9_38 = f9*38;
+	// |f0_2| , |f2_2| , |f4_2| , |f6_2| , |f8_2|  <  1.65 * 2^27
+	// |f1_2| , |f3_2| , |f5_2| , |f7_2| , |f9_2|  <  1.65 * 2^26
+	// |f5_38|, |f6_19|, |f7_38|, |f8_19|, |f9_38| <  2^31
+
+	i64 t0 = f0  *(i64)f0    + f1_2*(i64)f9_38 + f2_2*(i64)f8_19
+	       + f3_2*(i64)f7_38 + f4_2*(i64)f6_19 + f5  *(i64)f5_38;
+	i64 t1 = f0_2*(i64)f1    + f2  *(i64)f9_38 + f3_2*(i64)f8_19
+	       + f4  *(i64)f7_38 + f5_2*(i64)f6_19;
+	i64 t2 = f0_2*(i64)f2    + f1_2*(i64)f1    + f3_2*(i64)f9_38
+	       + f4_2*(i64)f8_19 + f5_2*(i64)f7_38 + f6  *(i64)f6_19;
+	i64 t3 = f0_2*(i64)f3    + f1_2*(i64)f2    + f4  *(i64)f9_38
+	       + f5_2*(i64)f8_19 + f6  *(i64)f7_38;
+	i64 t4 = f0_2*(i64)f4    + f1_2*(i64)f3_2  + f2  *(i64)f2
+	       + f5_2*(i64)f9_38 + f6_2*(i64)f8_19 + f7  *(i64)f7_38;
+	i64 t5 = f0_2*(i64)f5    + f1_2*(i64)f4    + f2_2*(i64)f3
+	       + f6  *(i64)f9_38 + f7_2*(i64)f8_19;
+	i64 t6 = f0_2*(i64)f6    + f1_2*(i64)f5_2  + f2_2*(i64)f4
+	       + f3_2*(i64)f3    + f7_2*(i64)f9_38 + f8  *(i64)f8_19;
+	i64 t7 = f0_2*(i64)f7    + f1_2*(i64)f6    + f2_2*(i64)f5
+	       + f3_2*(i64)f4    + f8  *(i64)f9_38;
+	i64 t8 = f0_2*(i64)f8    + f1_2*(i64)f7_2  + f2_2*(i64)f6
+	       + f3_2*(i64)f5_2  + f4  *(i64)f4    + f9  *(i64)f9_38;
+	i64 t9 = f0_2*(i64)f9    + f1_2*(i64)f8    + f2_2*(i64)f7
+	       + f3_2*(i64)f6    + f4  *(i64)f5_2;
+	// t0 < 0.67 * 2^61
+	// t1 < 0.41 * 2^61
+	// t2 < 0.52 * 2^61
+	// t3 < 0.32 * 2^61
+	// t4 < 0.38 * 2^61
+	// t5 < 0.22 * 2^61
+	// t6 < 0.23 * 2^61
+	// t7 < 0.13 * 2^61
+	// t8 < 0.09 * 2^61
+	// t9 < 0.03 * 2^61
+
+	FE_CARRY;
+}
+
+// Returns 1 if equal, 0 if not equal
+static int fe_isequal(const fe f, const fe g)
+{
+	u8 fs[32];
+	u8 gs[32];
+	fe_tobytes(fs, f);
+	fe_tobytes(gs, g);
+	int isdifferent = crypto_verify32(fs, gs);
+	WIPE_BUFFER(fs);
+	WIPE_BUFFER(gs);
+	return 1 + isdifferent;
+}
+
+// Inverse square root.
+// Returns true if x is a square, false otherwise.
+// After the call:
+//   isr = sqrt(1/x)        if x is a non-zero square.
+//   isr = sqrt(sqrt(-1)/x) if x is not a square.
+//   isr = 0                if x is zero.
+// We do not guarantee the sign of the square root.
+//
+// Notes:
+// Let quartic = x^((p-1)/4)
+//
+// x^((p-1)/2) = chi(x)
+// quartic^2   = chi(x)
+// quartic     = sqrt(chi(x))
+// quartic     = 1 or -1 or sqrt(-1) or -sqrt(-1)
+//
+// Note that x is a square if quartic is 1 or -1
+// There are 4 cases to consider:
+//
+// if   quartic         = 1  (x is a square)
+// then x^((p-1)/4)     = 1
+//      x^((p-5)/4) * x = 1
+//      x^((p-5)/4)     = 1/x
+//      x^((p-5)/8)     = sqrt(1/x) or -sqrt(1/x)
+//
+// if   quartic                = -1  (x is a square)
+// then x^((p-1)/4)            = -1
+//      x^((p-5)/4) * x        = -1
+//      x^((p-5)/4)            = -1/x
+//      x^((p-5)/8)            = sqrt(-1)   / sqrt(x)
+//      x^((p-5)/8) * sqrt(-1) = sqrt(-1)^2 / sqrt(x)
+//      x^((p-5)/8) * sqrt(-1) = -1/sqrt(x)
+//      x^((p-5)/8) * sqrt(-1) = -sqrt(1/x) or sqrt(1/x)
+//
+// if   quartic         = sqrt(-1)  (x is not a square)
+// then x^((p-1)/4)     = sqrt(-1)
+//      x^((p-5)/4) * x = sqrt(-1)
+//      x^((p-5)/4)     = sqrt(-1)/x
+//      x^((p-5)/8)     = sqrt(sqrt(-1)/x) or -sqrt(sqrt(-1)/x)
+//
+// Note that the product of two non-squares is always a square:
+//   For any non-squares a and b, chi(a) = -1 and chi(b) = -1.
+//   Since chi(x) = x^((p-1)/2), chi(a)*chi(b) = chi(a*b) = 1.
+//   Therefore a*b is a square.
+//
+//   Since sqrt(-1) and x are both non-squares, their product is a
+//   square, and we can compute their square root.
+//
+// if   quartic                = -sqrt(-1)  (x is not a square)
+// then x^((p-1)/4)            = -sqrt(-1)
+//      x^((p-5)/4) * x        = -sqrt(-1)
+//      x^((p-5)/4)            = -sqrt(-1)/x
+//      x^((p-5)/8)            = sqrt(-sqrt(-1)/x)
+//      x^((p-5)/8)            = sqrt( sqrt(-1)/x) * sqrt(-1)
+//      x^((p-5)/8) * sqrt(-1) = sqrt( sqrt(-1)/x) * sqrt(-1)^2
+//      x^((p-5)/8) * sqrt(-1) = sqrt( sqrt(-1)/x) * -1
+//      x^((p-5)/8) * sqrt(-1) = -sqrt(sqrt(-1)/x) or sqrt(sqrt(-1)/x)
+static int invsqrt(fe isr, const fe x)
+{
+	fe t0, t1, t2;
+
+	// t0 = x^((p-5)/8)
+	// Can be achieved with a simple double & add ladder,
+	// but it would be slower.
+	fe_sq(t0, x);
+	fe_sq(t1,t0);                     fe_sq(t1, t1);    fe_mul(t1, x, t1);
+	fe_mul(t0, t0, t1);
+	fe_sq(t0, t0);                                      fe_mul(t0, t1, t0);
+	fe_sq(t1, t0);  FOR (i, 1,   5) { fe_sq(t1, t1); }  fe_mul(t0, t1, t0);
+	fe_sq(t1, t0);  FOR (i, 1,  10) { fe_sq(t1, t1); }  fe_mul(t1, t1, t0);
+	fe_sq(t2, t1);  FOR (i, 1,  20) { fe_sq(t2, t2); }  fe_mul(t1, t2, t1);
+	fe_sq(t1, t1);  FOR (i, 1,  10) { fe_sq(t1, t1); }  fe_mul(t0, t1, t0);
+	fe_sq(t1, t0);  FOR (i, 1,  50) { fe_sq(t1, t1); }  fe_mul(t1, t1, t0);
+	fe_sq(t2, t1);  FOR (i, 1, 100) { fe_sq(t2, t2); }  fe_mul(t1, t2, t1);
+	fe_sq(t1, t1);  FOR (i, 1,  50) { fe_sq(t1, t1); }  fe_mul(t0, t1, t0);
+	fe_sq(t0, t0);  FOR (i, 1,   2) { fe_sq(t0, t0); }  fe_mul(t0, t0, x);
+
+	// quartic = x^((p-1)/4)
+	i32 *quartic = t1;
+	fe_sq (quartic, t0);
+	fe_mul(quartic, quartic, x);
+
+	i32 *check = t2;
+	fe_0  (check);          int z0 = fe_isequal(x      , check);
+	fe_1  (check);          int p1 = fe_isequal(quartic, check);
+	fe_neg(check, check );  int m1 = fe_isequal(quartic, check);
+	fe_neg(check, sqrtm1);  int ms = fe_isequal(quartic, check);
+
+	// if quartic == -1 or sqrt(-1)
+	// then  isr = x^((p-1)/4) * sqrt(-1)
+	// else  isr = x^((p-1)/4)
+	fe_mul(isr, t0, sqrtm1);
+	fe_ccopy(isr, t0, 1 - (m1 | ms));
+
+	WIPE_BUFFER(t0);
+	WIPE_BUFFER(t1);
+	WIPE_BUFFER(t2);
+	return p1 | m1 | z0;
+}
+
+// Inverse in terms of inverse square root.
+// Requires two additional squarings to get rid of the sign.
+//
+//   1/x = x * (+invsqrt(x^2))^2
+//       = x * (-invsqrt(x^2))^2
+//
+// A fully optimised exponentiation by p-1 would save 6 field
+// multiplications, but it would require more code.
+static void fe_invert(fe out, const fe x)
+{
+	fe tmp;
+	fe_sq(tmp, x);
+	invsqrt(tmp, tmp);
+	fe_sq(tmp, tmp);
+	fe_mul(out, tmp, x);
+	WIPE_BUFFER(tmp);
+}
+
+// trim a scalar for scalar multiplication
+void crypto_eddsa_trim_scalar(u8 out[32], const u8 in[32])
+{
+	COPY(out, in, 32);
+	out[ 0] &= 248;
+	out[31] &= 127;
+	out[31] |= 64;
+}
+
+// get bit from scalar at position i
+static int scalar_bit(const u8 s[32], int i)
+{
+	if (i < 0) { return 0; } // handle -1 for sliding windows
+	return (s[i>>3] >> (i&7)) & 1;
+}
+
+///////////////
+/// X-25519 /// Taken from SUPERCOP's ref10 implementation.
+///////////////
+static void scalarmult(u8 q[32], const u8 scalar[32], const u8 p[32],
+                       int nb_bits)
+{
+	// computes the scalar product
+	fe x1;
+	fe_frombytes(x1, p);
+
+	// computes the actual scalar product (the result is in x2 and z2)
+	fe x2, z2, x3, z3, t0, t1;
+	// Montgomery ladder
+	// In projective coordinates, to avoid divisions: x = X / Z
+	// We don't care about the y coordinate, it's only 1 bit of information
+	fe_1(x2);        fe_0(z2); // "zero" point
+	fe_copy(x3, x1); fe_1(z3); // "one"  point
+	int swap = 0;
+	for (int pos = nb_bits-1; pos >= 0; --pos) {
+		// constant time conditional swap before ladder step
+		int b = scalar_bit(scalar, pos);
+		swap ^= b; // xor trick avoids swapping at the end of the loop
+		fe_cswap(x2, x3, swap);
+		fe_cswap(z2, z3, swap);
+		swap = b;  // anticipates one last swap after the loop
+
+		// Montgomery ladder step: replaces (P2, P3) by (P2*2, P2+P3)
+		// with differential addition
+		fe_sub(t0, x3, z3);
+		fe_sub(t1, x2, z2);
+		fe_add(x2, x2, z2);
+		fe_add(z2, x3, z3);
+		fe_mul(z3, t0, x2);
+		fe_mul(z2, z2, t1);
+		fe_sq (t0, t1    );
+		fe_sq (t1, x2    );
+		fe_add(x3, z3, z2);
+		fe_sub(z2, z3, z2);
+		fe_mul(x2, t1, t0);
+		fe_sub(t1, t1, t0);
+		fe_sq (z2, z2    );
+		fe_mul_small(z3, t1, 121666);
+		fe_sq (x3, x3    );
+		fe_add(t0, t0, z3);
+		fe_mul(z3, x1, z2);
+		fe_mul(z2, t1, t0);
+	}
+	// last swap is necessary to compensate for the xor trick
+	// Note: after this swap, P3 == P2 + P1.
+	fe_cswap(x2, x3, swap);
+	fe_cswap(z2, z3, swap);
+
+	// normalises the coordinates: x == X / Z
+	fe_invert(z2, z2);
+	fe_mul(x2, x2, z2);
+	fe_tobytes(q, x2);
+
+	WIPE_BUFFER(x1);
+	WIPE_BUFFER(x2);  WIPE_BUFFER(z2);  WIPE_BUFFER(t0);
+	WIPE_BUFFER(x3);  WIPE_BUFFER(z3);  WIPE_BUFFER(t1);
+}
+
+void crypto_x25519(u8       raw_shared_secret[32],
+                   const u8 your_secret_key  [32],
+                   const u8 their_public_key [32])
+{
+	// restrict the possible scalar values
+	u8 e[32];
+	crypto_eddsa_trim_scalar(e, your_secret_key);
+	scalarmult(raw_shared_secret, e, their_public_key, 255);
+	WIPE_BUFFER(e);
+}
+
+void crypto_x25519_public_key(u8       public_key[32],
+                              const u8 secret_key[32])
+{
+	static const u8 base_point[32] = {9};
+	crypto_x25519(public_key, secret_key, base_point);
+}
+
+///////////////////////////
+////////////////////////////////
+/// Authenticated encryption ///
+////////////////////////////////
+static void lock_auth(u8 mac[16], const u8  auth_key[32],
+                      const u8 *ad         , size_t ad_size,
+                      const u8 *cipher_text, size_t text_size)
+{
+	u8 sizes[16]; // Not secret, not wiped
+	store64_le(sizes + 0, ad_size);
+	store64_le(sizes + 8, text_size);
+	crypto_poly1305_ctx poly_ctx;           // auto wiped...
+	crypto_poly1305_init  (&poly_ctx, auth_key);
+	crypto_poly1305_update(&poly_ctx, ad         , ad_size);
+	crypto_poly1305_update(&poly_ctx, zero       , gap(ad_size, 16));
+	crypto_poly1305_update(&poly_ctx, cipher_text, text_size);
+	crypto_poly1305_update(&poly_ctx, zero       , gap(text_size, 16));
+	crypto_poly1305_update(&poly_ctx, sizes      , 16);
+	crypto_poly1305_final (&poly_ctx, mac); // ...here
+}
+
+void crypto_aead_init_x(crypto_aead_ctx *ctx,
+                        u8 const key[32], const u8 nonce[24])
+{
+	crypto_chacha20_h(ctx->key, key, nonce);
+	COPY(ctx->nonce, nonce + 16, 8);
+	ctx->counter = 0;
+}
+
+void crypto_aead_init_djb(crypto_aead_ctx *ctx,
+                          const u8 key[32], const u8 nonce[8])
+{
+	COPY(ctx->key  , key  , 32);
+	COPY(ctx->nonce, nonce,  8);
+	ctx->counter = 0;
+}
+
+void crypto_aead_init_ietf(crypto_aead_ctx *ctx,
+                           const u8 key[32], const u8 nonce[12])
+{
+	COPY(ctx->key  , key      , 32);
+	COPY(ctx->nonce, nonce + 4,  8);
+	ctx->counter = (u64)load32_le(nonce) << 32;
+}
+
+void crypto_aead_write(crypto_aead_ctx *ctx, u8 *cipher_text, u8 mac[16],
+                       const u8 *ad,         size_t ad_size,
+                       const u8 *plain_text, size_t text_size)
+{
+	u8 auth_key[64]; // the last 32 bytes are used for rekeying.
+	crypto_chacha20_djb(auth_key, 0, 64, ctx->key, ctx->nonce, ctx->counter);
+	crypto_chacha20_djb(cipher_text, plain_text, text_size,
+	                    ctx->key, ctx->nonce, ctx->counter + 1);
+	lock_auth(mac, auth_key, ad, ad_size, cipher_text, text_size);
+	COPY(ctx->key, auth_key + 32, 32);
+	WIPE_BUFFER(auth_key);
+}
+
+int crypto_aead_read(crypto_aead_ctx *ctx, u8 *plain_text, const u8 mac[16],
+                     const u8 *ad,          size_t ad_size,
+                     const u8 *cipher_text, size_t text_size)
+{
+	u8 auth_key[64]; // the last 32 bytes are used for rekeying.
+	u8 real_mac[16];
+	crypto_chacha20_djb(auth_key, 0, 64, ctx->key, ctx->nonce, ctx->counter);
+	lock_auth(real_mac, auth_key, ad, ad_size, cipher_text, text_size);
+	int mismatch = crypto_verify16(mac, real_mac);
+	if (!mismatch) {
+		crypto_chacha20_djb(plain_text, cipher_text, text_size,
+		                    ctx->key, ctx->nonce, ctx->counter + 1);
+		COPY(ctx->key, auth_key + 32, 32);
+	}
+	WIPE_BUFFER(auth_key);
+	WIPE_BUFFER(real_mac);
+	return mismatch;
+}
+
+void crypto_aead_lock(u8 *cipher_text, u8 mac[16], const u8 key[32],
+                      const u8  nonce[24], const u8 *ad, size_t ad_size,
+                      const u8 *plain_text, size_t text_size)
+{
+	crypto_aead_ctx ctx;
+	crypto_aead_init_x(&ctx, key, nonce);
+	crypto_aead_write(&ctx, cipher_text, mac, ad, ad_size,
+	                  plain_text, text_size);
+	crypto_wipe(&ctx, sizeof(ctx));
+}
+
+int crypto_aead_unlock(u8 *plain_text, const u8  mac[16], const u8 key[32],
+                       const u8 nonce[24], const u8 *ad, size_t ad_size,
+                       const u8 *cipher_text, size_t text_size)
+{
+	crypto_aead_ctx ctx;
+	crypto_aead_init_x(&ctx, key, nonce);
+	int mismatch = crypto_aead_read(&ctx, plain_text, mac, ad, ad_size,
+	                                cipher_text, text_size);
+	crypto_wipe(&ctx, sizeof(ctx));
+	return mismatch;
+}
+
+
+#undef FOR_T
+#undef FOR
+#undef COPY
+#undef ZERO
+#undef WIPE_CTX
+#undef WIPE_BUFFER
+#undef MIN
+#undef MAX
+#undef QUARTERROUND
+#undef BLAKE2_G
+#undef BLAKE2_ROUND
+#undef FE_CARRY
+/* ==== end monocypher ======================================================== */
+
+#if !defined(_WIN32) || defined(HAKO_RELAY)   /* the desktop link and the studio page */
+/* ---- noise: XX and XXpsk3, 25519 / ChaChaPoly / BLAKE2b (noiseprotocol.org rev 34) ----
+   The relay link (RELAY.md §5). XXpsk3 for sessions, the psk from the account
+   key; plain XX for the six-digit fallback. Checked against the cacophony
+   vectors in tools/tests.c. */
+#define HK_NOISE_MAX 65535
+typedef struct { uint8_t k[32]; uint64_t n; int has_k; } hkNoiseCipher;
+typedef struct {
+	hkNoiseCipher cs;
+	uint8_t ck[64], h[64];
+	uint8_t s[32], s_pub[32], e[32], e_pub[32], rs[32], re[32], psk[32];
+	int has_s, has_e, has_rs, has_re, has_psk, initiator;
+	const char *msgs;      /* tokens, "," between them, "|" between messages */
+	int next;              /* index of the next handshake message */
+} hkNoise;
+
+/* HMAC over BLAKE2b (block 128), as Noise's HKDF wants it, over a || b. */
+static void hkNoiseHmac(uint8_t out[64], const uint8_t *key, size_t kl,
+                        const uint8_t *a, size_t al, const uint8_t *b, size_t bl) {
+	uint8_t pad[128], inner[64];
+	crypto_blake2b_ctx c;
+	memset(pad, 0, sizeof pad);
+	memcpy(pad, key, kl);
+	for (int i = 0; i < 128; i++) pad[i] ^= 0x36;
+	crypto_blake2b_init(&c, 64);
+	crypto_blake2b_update(&c, pad, 128);
+	crypto_blake2b_update(&c, a, al);
+	crypto_blake2b_update(&c, b, bl);
+	crypto_blake2b_final(&c, inner);
+	for (int i = 0; i < 128; i++) pad[i] ^= 0x36 ^ 0x5c;
+	crypto_blake2b_init(&c, 64);
+	crypto_blake2b_update(&c, pad, 128);
+	crypto_blake2b_update(&c, inner, 64);
+	crypto_blake2b_final(&c, out);
+	crypto_wipe(pad, sizeof pad);
+	crypto_wipe(inner, sizeof inner);
+}
+
+static void hkNoiseHkdf(const uint8_t ck[64], const uint8_t *ikm, size_t il,
+                        uint8_t o1[64], uint8_t o2[64], uint8_t *o3) {
+	static const uint8_t one = 1, two = 2, three = 3;
+	uint8_t t[64];
+	hkNoiseHmac(t, ck, 64, ikm, il, NULL, 0);
+	hkNoiseHmac(o1, t, 64, &one, 1, NULL, 0);
+	hkNoiseHmac(o2, t, 64, o1, 64, &two, 1);
+	if (o3) hkNoiseHmac(o3, t, 64, o2, 64, &three, 1);
+	crypto_wipe(t, sizeof t);
+}
+
+static void hkNoiseMixHash(hkNoise *ns, const uint8_t *d, size_t n) {
+	crypto_blake2b_ctx c;
+	crypto_blake2b_init(&c, 64);
+	crypto_blake2b_update(&c, ns->h, 64);
+	crypto_blake2b_update(&c, d, n);
+	crypto_blake2b_final(&c, ns->h);
+}
+
+static void hkNoiseMixKey(hkNoise *ns, const uint8_t *ikm, size_t n) {
+	uint8_t o1[64], o2[64];
+	hkNoiseHkdf(ns->ck, ikm, n, o1, o2, NULL);
+	memcpy(ns->ck, o1, 64);
+	memcpy(ns->cs.k, o2, 32);
+	ns->cs.n = 0;
+	ns->cs.has_k = 1;
+	crypto_wipe(o1, sizeof o1);
+	crypto_wipe(o2, sizeof o2);
+}
+
+static void hkNoiseMixPsk(hkNoise *ns) {
+	uint8_t o1[64], o2[64], o3[64];
+	hkNoiseHkdf(ns->ck, ns->psk, 32, o1, o2, o3);
+	memcpy(ns->ck, o1, 64);
+	hkNoiseMixHash(ns, o2, 64);
+	memcpy(ns->cs.k, o3, 32);
+	ns->cs.n = 0;
+	ns->cs.has_k = 1;
+	crypto_wipe(o1, sizeof o1);
+	crypto_wipe(o2, sizeof o2);
+	crypto_wipe(o3, sizeof o3);
+}
+
+/* ChaCha20-Poly1305 (RFC 8439): nonce = 4 zero bytes, then n little-endian.
+   out holds n + 16 bytes. Returns 0, or -1 when the nonce is spent. */
+static int hkNoiseSeal(hkNoiseCipher *c, const uint8_t *ad, size_t adl,
+                       const uint8_t *in, size_t n, uint8_t *out) {
+	if (c->n == UINT64_MAX) return -1;
+	uint8_t nonce[12] = {0};
+	for (int i = 0; i < 8; i++) nonce[4 + i] = (uint8_t)(c->n >> (8 * i));
+	crypto_aead_ctx ctx;
+	crypto_aead_init_ietf(&ctx, c->k, nonce);
+	crypto_aead_write(&ctx, out, out + n, ad, adl, in, n);
+	crypto_wipe(&ctx, sizeof ctx);
+	c->n++;
+	return 0;
+}
+
+/* in holds n bytes, the last 16 the tag. Returns the plaintext length, or -1. */
+static long hkNoiseOpen(hkNoiseCipher *c, const uint8_t *ad, size_t adl,
+                        const uint8_t *in, size_t n, uint8_t *out) {
+	if (n < 16 || c->n == UINT64_MAX) return -1;
+	uint8_t nonce[12] = {0};
+	for (int i = 0; i < 8; i++) nonce[4 + i] = (uint8_t)(c->n >> (8 * i));
+	crypto_aead_ctx ctx;
+	crypto_aead_init_ietf(&ctx, c->k, nonce);
+	int bad = crypto_aead_read(&ctx, out, in + n - 16, ad, adl, in, n - 16);
+	crypto_wipe(&ctx, sizeof ctx);
+	if (bad) return -1;
+	c->n++;
+	return (long)(n - 16);
+}
+
+/* A DH that lands on zero means the peer sent a low-order point: refuse it. */
+static int hkNoiseDh(hkNoise *ns, const uint8_t priv[32], const uint8_t pub[32]) {
+	uint8_t out[32], acc = 0;
+	crypto_x25519(out, priv, pub);
+	for (int i = 0; i < 32; i++) acc |= out[i];
+	if (acc) hkNoiseMixKey(ns, out, 32);
+	crypto_wipe(out, sizeof out);
+	return acc ? 0 : -1;
+}
+
+/* pattern "XX" or "XXpsk3". Set s (and psk for XXpsk3) first; s_pub is derived here. */
+static int hkNoiseInit(hkNoise *ns, const char *pattern, int initiator,
+                       const uint8_t *prologue, size_t pl) {
+	char name[64];
+	snprintf(name, sizeof name, "Noise_%s_25519_ChaChaPoly_BLAKE2b", pattern);
+	int psk = !strcmp(pattern, "XXpsk3");
+	if (!psk && strcmp(pattern, "XX")) return -1;
+	if (!ns->has_s || psk != ns->has_psk) return -1;
+	ns->initiator = initiator;
+	ns->msgs = psk ? "e|e,ee,s,es|s,se,psk" : "e|e,ee,s,es|s,se";
+	ns->next = 0;
+	memset(&ns->cs, 0, sizeof ns->cs);
+	memset(ns->h, 0, 64);
+	memcpy(ns->h, name, strlen(name));
+	memcpy(ns->ck, ns->h, 64);
+	crypto_x25519_public_key(ns->s_pub, ns->s);
+	hkNoiseMixHash(ns, prologue, pl);
+	return 0;
+}
+
+static const char *hkNoiseTokens(const hkNoise *ns) {
+	const char *p = ns->msgs;
+	for (int i = 0; i < ns->next && p; i++) { p = strchr(p, '|'); if (p) p++; }
+	return p;
+}
+
+/* 0 while the handshake runs, 1 once it is complete. */
+static int hkNoiseDone(const hkNoise *ns) { return hkNoiseTokens(ns) == NULL; }
+
+/* The DH for token "ee", "es", "se" or "ss": the first letter names the
+   initiator's key, the second the responder's. */
+static int hkNoiseDhToken(hkNoise *ns, const char *t) {
+	int mine_e = (ns->initiator ? t[0] : t[1]) == 'e';
+	int peer_e = (ns->initiator ? t[1] : t[0]) == 'e';
+	if ((mine_e && !ns->has_e) || (!mine_e && !ns->has_s)
+	    || (peer_e && !ns->has_re) || (!peer_e && !ns->has_rs)) return -1;
+	return hkNoiseDh(ns, mine_e ? ns->e : ns->s, peer_e ? ns->re : ns->rs);
+}
+
+/* Writes the next handshake message carrying payload. Returns its length or -1. */
+static long hkNoiseWrite(hkNoise *ns, const uint8_t *payload, size_t pl, uint8_t *out, size_t cap) {
+	const char *t = hkNoiseTokens(ns);
+	if (!t || ((ns->next & 1) == 0) != ns->initiator) return -1;
+	size_t o = 0;
+	for (size_t tl; *t && *t != '|'; t += tl + (t[tl] == ',')) {
+		tl = strcspn(t, ",|");
+		if (tl == 1 && t[0] == 'e') {
+			if (!ns->has_e && !hkRandomBytes(ns->e, 32)) return -1;
+			ns->has_e = 1;
+			crypto_x25519_public_key(ns->e_pub, ns->e);
+			if (o + 32 > cap) return -1;
+			memcpy(out + o, ns->e_pub, 32); o += 32;
+			hkNoiseMixHash(ns, ns->e_pub, 32);
+			if (ns->has_psk) hkNoiseMixKey(ns, ns->e_pub, 32);
+		} else if (tl == 1 && t[0] == 's') {
+			size_t n = 32 + (ns->cs.has_k ? 16 : 0);
+			if (o + n > cap) return -1;
+			if (ns->cs.has_k) { if (hkNoiseSeal(&ns->cs, ns->h, 64, ns->s_pub, 32, out + o)) return -1; }
+			else memcpy(out + o, ns->s_pub, 32);
+			hkNoiseMixHash(ns, out + o, n); o += n;
+		} else if (tl == 3) hkNoiseMixPsk(ns);
+		else if (hkNoiseDhToken(ns, t)) return -1;
+	}
+	size_t n = pl + (ns->cs.has_k ? 16 : 0);
+	if (o + n > cap || o + n > HK_NOISE_MAX) return -1;
+	if (ns->cs.has_k) { if (hkNoiseSeal(&ns->cs, ns->h, 64, payload, pl, out + o)) return -1; }
+	else if (pl) memcpy(out + o, payload, pl);
+	hkNoiseMixHash(ns, out + o, n);
+	ns->next++;
+	return (long)(o + n);
+}
+
+/* Reads the next handshake message. Returns the payload length or -1. */
+static long hkNoiseRead(hkNoise *ns, const uint8_t *in, size_t n, uint8_t *payload, size_t cap) {
+	const char *t = hkNoiseTokens(ns);
+	if (!t || ((ns->next & 1) == 0) == ns->initiator || n > HK_NOISE_MAX) return -1;
+	size_t o = 0;
+	for (size_t tl; *t && *t != '|'; t += tl + (t[tl] == ',')) {
+		tl = strcspn(t, ",|");
+		if (tl == 1 && t[0] == 'e') {
+			if (o + 32 > n) return -1;
+			memcpy(ns->re, in + o, 32); o += 32;
+			ns->has_re = 1;
+			hkNoiseMixHash(ns, ns->re, 32);
+			if (ns->has_psk) hkNoiseMixKey(ns, ns->re, 32);
+		} else if (tl == 1 && t[0] == 's') {
+			size_t sn = 32 + (ns->cs.has_k ? 16 : 0);
+			uint8_t hold[64];
+			if (o + sn > n) return -1;
+			memcpy(hold, ns->h, 64);
+			if (ns->cs.has_k) { if (hkNoiseOpen(&ns->cs, hold, 64, in + o, sn, ns->rs) != 32) return -1; }
+			else memcpy(ns->rs, in + o, 32);
+			ns->has_rs = 1;
+			hkNoiseMixHash(ns, in + o, sn); o += sn;
+		} else if (tl == 3) hkNoiseMixPsk(ns);
+		else if (hkNoiseDhToken(ns, t)) return -1;
+	}
+	size_t rest = n - o;
+	uint8_t hold[64];
+	memcpy(hold, ns->h, 64);
+	long pl;
+	if (ns->cs.has_k) {
+		if (rest < 16 || rest - 16 > cap) return -1;
+		pl = hkNoiseOpen(&ns->cs, hold, 64, in + o, rest, payload);
+		if (pl < 0) return -1;
+	} else {
+		if (rest > cap) return -1;
+		if (rest) memcpy(payload, in + o, rest);
+		pl = (long)rest;
+	}
+	hkNoiseMixHash(ns, in + o, rest);
+	ns->next++;
+	return pl;
+}
+
+/* After the last message: the two transport ciphers, send then receive for
+   this side. The handshake's secrets are wiped; h stays for the link check. */
+static void hkNoiseSplit(hkNoise *ns, hkNoiseCipher *tx, hkNoiseCipher *rx) {
+	uint8_t o1[64], o2[64];
+	hkNoiseHkdf(ns->ck, NULL, 0, o1, o2, NULL);
+	memset(tx, 0, sizeof *tx);
+	memset(rx, 0, sizeof *rx);
+	memcpy(ns->initiator ? tx->k : rx->k, o1, 32);
+	memcpy(ns->initiator ? rx->k : tx->k, o2, 32);
+	tx->has_k = rx->has_k = 1;
+	crypto_wipe(o1, sizeof o1);
+	crypto_wipe(o2, sizeof o2);
+	crypto_wipe(ns->ck, sizeof ns->ck);
+	crypto_wipe(ns->e, sizeof ns->e);
+	crypto_wipe(ns->psk, sizeof ns->psk);
+	crypto_wipe(&ns->cs, sizeof ns->cs);
+}
+
+/* The session psk from the account key K (RELAY.md §4): only a holder of K
+   completes XXpsk3, so the relay has nothing to guess. */
+static void hkSessionPsk(uint8_t psk[32], const uint8_t k[32]) {
+	crypto_blake2b_keyed(psk, 32, k, 32, (const uint8_t *)"hako session psk", 16);
+}
+
+/* A device name sealed under K (nonce 24, mac 16, text), so the relay lists
+   "computer:<host>" for the account's devices without reading it. */
+static void hkNameKey(uint8_t key[32], const uint8_t k[32]) {
+	crypto_blake2b_keyed(key, 32, k, 32, (const uint8_t *)"hako device name", 16);
+}
+
+#ifdef HAKO_WASM
+/* ---- the studio page's crypto (RELAY.md §5): the desktop's C, exported ----
+   JS copies bytes into hkw_in, calls, and reads hkw_out. One session per page. */
+#define HKW_IO 70000
+#define HKW(name) __attribute__((export_name(#name)))
+static uint8_t hkw_in[HKW_IO], hkw_out[HKW_IO];
+static hkNoise hkw_ns;
+static hkNoiseCipher hkw_tx, hkw_rx;
+static int hkw_split;
+
+HKW(hkw_in_ptr) uint8_t *hkw_in_ptr(void) { return hkw_in; }
+HKW(hkw_out_ptr) uint8_t *hkw_out_ptr(void) { return hkw_out; }
+HKW(hkw_random) int hkw_random(int n) { return n > 0 && n <= HKW_IO && hkRandomBytes(hkw_out, (size_t)n) ? 0 : -1; }
+
+/* in: s(32) -> out: pub(32), device id(16) */
+HKW(hkw_pub) void hkw_pub(void) {
+	uint8_t h[64];
+	crypto_x25519_public_key(hkw_out, hkw_in);
+	crypto_blake2b(h, 64, hkw_out, 32);
+	memcpy(hkw_out + 32, h, 16);
+}
+
+/* in: a device's pub(32) -> out: its relay id(16) */
+HKW(hkw_id) void hkw_id(void) {
+	uint8_t h[64];
+	crypto_blake2b(h, 64, hkw_in, 32);
+	memcpy(hkw_out, h, 16);
+}
+
+/* in: s(32) relay ephemeral(32) challenge(16) -> out: the sign-in MAC(32) */
+HKW(hkw_proof) int hkw_proof(void) {
+	uint8_t k[32], pub[32], acc = 0;
+	crypto_x25519(k, hkw_in, hkw_in + 32);
+	for (int i = 0; i < 32; i++) acc |= k[i];
+	crypto_x25519_public_key(pub, hkw_in);
+	crypto_blake2b_ctx c;
+	crypto_blake2b_init(&c, 64);
+	crypto_blake2b_update(&c, k, 32);
+	crypto_blake2b_update(&c, hkw_in + 64, 16);
+	crypto_blake2b_update(&c, pub, 32);
+	crypto_blake2b_final(&c, hkw_out);
+	crypto_wipe(k, sizeof k);
+	return acc ? 0 : -1;
+}
+
+/* in: s(32) K(32). XXpsk3 as the initiator (the page dials the computer). */
+HKW(hkw_session) int hkw_session(void) {
+	memset(&hkw_ns, 0, sizeof hkw_ns);
+	crypto_wipe(&hkw_tx, sizeof hkw_tx);
+	crypto_wipe(&hkw_rx, sizeof hkw_rx);
+	hkw_split = 0;
+	memcpy(hkw_ns.s, hkw_in, 32); hkw_ns.has_s = 1;
+	hkSessionPsk(hkw_ns.psk, hkw_in + 32); hkw_ns.has_psk = 1;
+	return hkNoiseInit(&hkw_ns, "XXpsk3", 1, (const uint8_t *)"hako session", 12);
+}
+
+static void hkwMaybeSplit(void) {
+	if (!hkw_split && hkNoiseDone(&hkw_ns)) { hkNoiseSplit(&hkw_ns, &hkw_tx, &hkw_rx); hkw_split = 1; }
+}
+
+/* payload in -> message out. Returns its length, or -1. */
+HKW(hkw_hs_write) long hkw_hs_write(int plen) {
+	long n = plen >= 0 && plen < 1024 ? hkNoiseWrite(&hkw_ns, hkw_in, (size_t)plen, hkw_out, HKW_IO) : -1;
+	if (n > 0) hkwMaybeSplit();
+	return n;
+}
+
+HKW(hkw_hs_read) long hkw_hs_read(int n) {
+	long r = n > 0 && n <= HKW_IO ? hkNoiseRead(&hkw_ns, hkw_in, (size_t)n, hkw_out, HKW_IO) : -1;
+	if (r >= 0) hkwMaybeSplit();
+	return r;
+}
+
+HKW(hkw_ready) int hkw_ready(void) { return hkw_split; }
+
+HKW(hkw_seal) long hkw_seal(int n) {
+	if (!hkw_split || n < 0 || n + 16 > HKW_IO) return -1;
+	return hkNoiseSeal(&hkw_tx, NULL, 0, hkw_in, (size_t)n, hkw_out) ? -1 : n + 16;
+}
+
+HKW(hkw_open) long hkw_open(int n) {
+	return hkw_split && n >= 16 && n <= HKW_IO ? hkNoiseOpen(&hkw_rx, NULL, 0, hkw_in, (size_t)n, hkw_out) : -1;
+}
+
+/* The account key under a passkey's prf output. in: prf(32) K(32) ->
+   out: nonce(24) mac(16) sealed K(32). */
+HKW(hkw_wrap) int hkw_wrap(void) {
+	uint8_t key[32];
+	if (!hkRandomBytes(hkw_out, 24)) return -1;
+	crypto_blake2b_keyed(key, 32, hkw_in, 32, (const uint8_t *)"hako account key", 16);
+	crypto_aead_lock(hkw_out + 40, hkw_out + 24, key, hkw_out, NULL, 0, hkw_in + 32, 32);
+	crypto_wipe(key, sizeof key);
+	return 0;
+}
+
+/* in: prf(32) nonce(24) mac(16) sealed(32) -> out: K(32). 0, or -1. */
+HKW(hkw_unwrap) int hkw_unwrap(void) {
+	uint8_t key[32];
+	crypto_blake2b_keyed(key, 32, hkw_in, 32, (const uint8_t *)"hako account key", 16);
+	int bad = crypto_aead_unlock(hkw_out, hkw_in + 56, key, hkw_in + 32, NULL, 0, hkw_in + 72, 32);
+	crypto_wipe(key, sizeof key);
+	return bad ? -1 : 0;
+}
+
+/* in: K(32) sealed name(n) -> out: the name. Its length, or -1. */
+HKW(hkw_name_open) long hkw_name_open(int n) {
+	uint8_t key[32];
+	if (n < 32 + 40 || n > 32 + 40 + 512) return -1;
+	hkNameKey(key, hkw_in);
+	long len = n - 32 - 40;
+	int bad = crypto_aead_unlock(hkw_out, hkw_in + 32 + 24, key, hkw_in + 32, NULL, 0, hkw_in + 72, (size_t)len);
+	crypto_wipe(key, sizeof key);
+	return bad ? -1 : len;
+}
+
+/* The link frame's body for a computer: in: secret(32) K(32) account id(16)
+   -> out: nonce(24) mac(16) sealed(48). hrOnLink opens it. */
+HKW(hkw_link) int hkw_link(void) {
+	uint8_t key[32];
+	if (!hkRandomBytes(hkw_out, 24)) return -1;
+	crypto_blake2b_keyed(key, 32, hkw_in, 32, (const uint8_t *)"hako link key", 13);
+	crypto_aead_lock(hkw_out + 40, hkw_out + 24, key, hkw_out, NULL, 0, hkw_in + 32, 48);
+	crypto_wipe(key, sizeof key);
+	return 0;
+}
+#endif
+
+#ifdef HAKO_RELAY    /* the six-digit fallback: built by the tests until a link uses it */
+/* The link check (RELAY.md §4): the side that answers commits to a nonce
+   before it sees the other's, so a relay in the middle gets one random guess
+   at six digits instead of grinding keys until both screens agree. */
+static void hkLinkCommit(uint8_t out[32], const uint8_t nonce[32]) {
+	crypto_blake2b_keyed(out, 32, (const uint8_t *)"hako link commit", 16, nonce, 32);
+}
+
+static void hkLinkDigits(char out[7], const uint8_t h[64], const uint8_t ni[32], const uint8_t nr[32]) {
+	uint8_t d[8];
+	crypto_blake2b_ctx c;
+	crypto_blake2b_keyed_init(&c, 8, (const uint8_t *)"hako link digits", 16);
+	crypto_blake2b_update(&c, h, 64);
+	crypto_blake2b_update(&c, ni, 32);
+	crypto_blake2b_update(&c, nr, 32);
+	crypto_blake2b_final(&c, d);
+	uint64_t v = 0;
+	for (int i = 0; i < 8; i++) v = (v << 8) | d[i];
+	snprintf(out, 7, "%06u", (unsigned)(v % 1000000u));
+}
+#endif
+#endif
 
 /* Is an executable called `name` on PATH? A stat per directory, no shell. */
 static int hkOnPath(const char *name) {
@@ -763,6 +2736,8 @@ static int clOAuthGithubCopilot(aiData *data);
 static int clOAuthCopilotExchange(aiData *data);
 static int clOAuthGithubModels(aiData *data);
 static int clOAuthOpenRouter(aiData *data);
+static int clOAuthChatGPT(aiData *data);
+static int clOAuthChatGPTRefresh(aiData *data);
 static void hkHealModelForProvider(aiData *data);
 static int clOAuthRefresh(aiData *data);
 static void clOAuthEnsureFresh(aiData *data);
@@ -882,6 +2857,12 @@ static int cl_in_vp = 0;
 
 static volatile sig_atomic_t cl_winch = 0;
 static int hk_queue_n;           /* messages typed during a turn, waiting to run */
+/* --serve --token or :remote on: reachable from another device (tailscale, LAN),
+   so every tool asks: no auto mode, no "always" rules, set only at the desktop. */
+static int hs_remote = 0;
+static volatile int hs_attached = 0;       /* :remote on, inside this terminal session */
+static volatile int hs_streams = 0;        /* devices watching (open event streams) */
+static char hs_ts_host[128], hs_ts_login[128];  /* this machine on its tailnet, and its owner */
 static void hkAllowSummary(char *out, size_t cap);
 
 /* A drag sends resizes faster than a bar can be drawn: one drawn at one width
@@ -972,16 +2953,19 @@ static void clBarShowRaw(aiData *data) {
 	}
 	/* Three widths, because a phone in portrait is 30-something columns and a
 	   bar row that wraps costs a row we did not count. */
-	const char *mode_c = E.ai_plan_mode ? TH_TOOL : E.ai_auto_approve ? TH_OK : TH_ACCENT;
-	const char *mode_s = E.ai_plan_mode ? "plan" : E.ai_auto_approve ? "auto" : "ask";
+	int eff_auto = E.ai_auto_approve && !hs_remote;    /* remote on: auto is ignored, so say ask */
+	const char *mode_c = E.ai_plan_mode ? TH_TOOL : eff_auto ? TH_OK : TH_ACCENT;
+	const char *mode_s = E.ai_plan_mode ? "plan" : eff_auto ? "auto" : "ask";
 	char verb[64];
 	snprintf(verb, sizeof(verb), "%s", hk_expand_output ? " \xC2\xB7 verbose" : "");
-	if (!E.ai_plan_mode && !E.ai_auto_approve) {   /* an "always" answer, visible where the mode is */
+	if (!E.ai_plan_mode && !E.ai_auto_approve && !hs_remote) {   /* an "always" answer, visible where the mode is */
 		char al[48]; hkAllowSummary(al, sizeof(al));
 		if (*al) snprintf(verb + strlen(verb), sizeof(verb) - strlen(verb), " \xC2\xB7 always %s", al);
 	}
 	if (hk_queue_n > 0)   /* in the bar, not the chat: a chat line under a streaming answer is overwritten by it */
 		snprintf(verb + strlen(verb), sizeof(verb) - strlen(verb), " \xC2\xB7 %d queued", hk_queue_n);
+	if (hs_attached)      /* shared: never easy to forget */
+		snprintf(verb + strlen(verb), sizeof(verb) - strlen(verb), " \xC2\xB7 remote %d", hs_streams);
 	char left[256];
 	if (cols >= 64)
 		snprintf(left, sizeof(left), "  %s\xE2\x96\xB6\xE2\x96\xB6 %s mode%s %s(shift+tab)%s  %s%s \xC2\xB7 %s \xC2\xB7 t%d%s%s",
@@ -994,7 +2978,7 @@ static void clBarShowRaw(aiData *data) {
 		         data ? E.session_turn_count : 0, TH_META, verb);
 	else
 		snprintf(left, sizeof(left), "  %s\xE2\x96\xB6\xE2\x96\xB6 %s%s %s%s%s%s",
-		         mode_c, mode_s, ANSI_RESET, TH_ACCENT, model, TH_META, hk_queue_n > 0 ? verb : "");
+		         mode_c, mode_s, ANSI_RESET, TH_ACCENT, model, TH_META, hk_queue_n > 0 || hs_attached ? verb : "");
 	if (clCellWidth(left) + clCellWidth(right) + 2 > cols - 1) right[0] = '\0';
 	if (clCellWidth(left) > cols - 1) clClipToCells(left, cols - 1);
 	int gap = cols - 1 - clCellWidth(left) - clCellWidth(right);
@@ -1194,6 +3178,7 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 	char *cmd = malloc(cap);
 	if (!cmd) { if (body_tmp[0]) unlink(body_tmp); return NULL; }
 	int has_accept = req->headers && (strstr(req->headers, "accept:") || strstr(req->headers, "Accept:"));
+	int has_ctype = req->headers && strstr(req->headers, "Content-Type:");
 	char limits[64];
 	limits[0] = '\0';
 	if (req->follow || req->timeout_s > 0)
@@ -1207,7 +3192,7 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 		req->method ? req->method : "GET", req->url, HAKO_VERSION,
 		has_accept ? "" : "-H 'Accept: application/json' ",
 		req->headers ? req->headers : "",
-		req->body ? " -H 'Content-Type: application/json' --data @" : "",
+		req->body ? (has_ctype ? " --data @" : " -H 'Content-Type: application/json' --data @") : "",
 		req->body ? body_tmp : "",
 		"");
 	for (char *p = cmd; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
@@ -1676,9 +3661,18 @@ static int hkModelPriceUSDperM(const char *model, double *in_p, double *out_p) {
 	return 0;
 }
 
+static int hkOAuthIs(const char *p) {
+	return E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, p);
+}
+
+/* A subscription sign-in: no native tool schema, tools travel as prose. */
+static int hkSubProse(void) {
+	return hkOAuthIs("anthropic") || hkOAuthIs("chatgpt");
+}
+
 static double hkSessionCostUSD(aiData *data) {
 	if (!data) return 0.0;
-	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic")) return 0.0;
+	if (hkSubProse()) return 0.0;
 	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) return 0.0;
 	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) return 0.0;
 	if (HK_IS_OLLAMA_WIRE(E.ai_provider_type)) return 0.0;
@@ -1688,7 +3682,7 @@ static double hkSessionCostUSD(aiData *data) {
 }
 
 static const char *hkFreeTierLabel(void) {
-	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))      return "sub";
+	if (hkSubProse())                                                         return "sub";
 	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot")) return "sub";
 	if (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-models")) return "free";
 	if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) return "local";
@@ -1967,6 +3961,9 @@ static int hkProjectTrusted(void) {
 #ifdef HAKO_WASM
 	return 1;
 #else
+	/* --bench records tool calls and never runs them; scoring a model with no
+	   tools offered (8/43 for every model, silently) measures nothing */
+	if (hk_bench_mode) return 1;
 	char dir[PATH_MAX];
 	if (!hkProjectStateDir(dir, sizeof(dir))) return 0;
 	char trust[PATH_MAX + 16];
@@ -2124,6 +4121,7 @@ static enum aiProviderType hkParseProvider(const char *s) {
 		|| strcmp(s, "cerebras") == 0
 		|| strcmp(s, "github-copilot") == 0 || strcmp(s, "copilot") == 0
 		|| strcmp(s, "github-models") == 0 || strcmp(s, "ghmodels") == 0
+		|| strcmp(s, "chatgpt") == 0 || strcmp(s, "codex") == 0
 		|| strcmp(s, "custom") == 0) return AI_PROVIDER_OPENAI;
 	if (strcmp(s, "mithraeum") == 0 || strcmp(s, "hakm") == 0
 		|| strcmp(s, "koi") == 0) return AI_PROVIDER_MITHRAEUM;
@@ -2157,6 +4155,8 @@ static const char *hkProviderDefaultEndpoint(const char *s) {
 		return "https://api.githubcopilot.com";
 	if (strcmp(s, "github-models") == 0 || strcmp(s, "ghmodels") == 0)
 		return "https://models.inference.ai.azure.com";
+	if (strcmp(s, "chatgpt") == 0 || strcmp(s, "codex") == 0)
+		return "https://chatgpt.com/backend-api/codex";
 	return NULL;
 }
 
@@ -2183,6 +4183,7 @@ static const struct {
 	{ "xai",           "grok-2-latest",             "grok"     },
 	{ "github-models", "gpt-4o-mini",               NULL       },
 	{ "copilot",       "gpt-4o-mini",               NULL       },
+	{ "chatgpt",       "gpt-5.5",                   "gpt"      },
 	{ "openrouter",    NULL,                        NULL       },
 	{ "together",      NULL,                        NULL       },
 	{ "fireworks",     NULL,                        NULL       },
@@ -2424,6 +4425,251 @@ static unsigned char *clB64Decode(const char *in, size_t *outlen) {
 	}
 	*outlen = o;
 	return out;
+}
+
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+/* ---- relay link (RELAY.md §7): this device on the relay ----
+   A key-possession sign-in, then two curl processes, a stream down and a
+   chunked upload up. A frame is "<device id> <base64>"; what is inside is
+   Noise, sealed end to end, so the relay only routes. */
+typedef struct {
+	char url[256], token[65], id[33], acct[17];   /* acct: "" until the page binds this device */
+	uint8_t s[32], s_pub[32];
+	pid_t down_pid, up_pid;
+	FILE *down, *up;
+	char *line;                 /* getline buffer for down */
+	size_t line_cap;
+	pthread_mutex_t up_lock;
+	time_t up_kept;             /* the relay drops an upload idle for 15 min */
+} hkRelay;
+
+static void hkHexEnc(char *out, const uint8_t *b, size_t n) {
+	static const char d[] = "0123456789abcdef";
+	for (size_t i = 0; i < n; i++) { out[2 * i] = d[b[i] >> 4]; out[2 * i + 1] = d[b[i] & 15]; }
+	out[2 * n] = '\0';
+}
+
+static int hkHexDec(uint8_t *out, const char *h, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		unsigned v;
+		if (!isxdigit((unsigned char)h[2 * i]) || !isxdigit((unsigned char)h[2 * i + 1])
+		    || sscanf(h + 2 * i, "%2x", &v) != 1) return -1;
+		out[i] = (uint8_t)v;
+	}
+	return 0;
+}
+
+static void hkRelayDeviceId(char out[33], const uint8_t pub[32]) {
+	uint8_t h[64];
+	crypto_blake2b(h, 64, pub, 32);
+	hkHexEnc(out, h, 16);
+}
+
+/* curl with argv (no shell), its stdout (writing=0) or stdin (writing=1) on
+   the returned stream. */
+static FILE *hkRelayCurl(char *const argv[], int writing, pid_t *pid) {
+	int p[2];
+	if (pipe(p) != 0) return NULL;
+	*pid = fork();
+	if (*pid < 0) { close(p[0]); close(p[1]); return NULL; }
+	if (*pid == 0) {
+		int nul = open("/dev/null", O_RDWR);
+		dup2(writing ? p[0] : nul, 0);
+		dup2(writing ? nul : p[1], 1);
+		dup2(nul, 2);
+		close(p[0]); close(p[1]);
+		execvp("curl", argv);
+		_exit(127);
+	}
+	close(writing ? p[0] : p[1]);
+	return fdopen(writing ? p[1] : p[0], writing ? "w" : "r");
+}
+
+static char *hkRelayPost(const char *url, const char *body) {
+	pid_t pid;
+	char *argv[] = { "curl", "-s", "--max-time", "15", "-X", "POST", "--data-binary", (char *)body,
+	                 "-H", "Content-Type: text/plain", (char *)url, NULL };
+	FILE *fp = hkRelayCurl(argv, 0, &pid);
+	if (!fp) return NULL;
+	char *out = hk_slurp(fp, 0);
+	fclose(fp);
+	waitpid(pid, NULL, 0);
+	return out;
+}
+
+/* Prove to the relay that this device holds s: the MAC is keyed by
+   X25519(s, the relay's one-off key). Returns 0 and fills token and id. */
+static int hkRelaySignIn(hkRelay *r) {
+	char url[300], pubh[66], body[128];
+	crypto_x25519_public_key(r->s_pub, r->s);
+	hkHexEnc(pubh, r->s_pub, 32);
+	snprintf(url, sizeof url, "%s/v1/auth/challenge", r->url);
+	char *a = hkRelayPost(url, pubh);
+	uint8_t cid[16], epub[32], k[32], mac[64];
+	int ok = a && strlen(a) >= 97 && a[32] == ' ' && !hkHexDec(cid, a, 16) && !hkHexDec(epub, a + 33, 32);
+	char cidh[33];
+	if (ok) memcpy(cidh, a, 32), cidh[32] = '\0';
+	free(a);
+	if (!ok) return -1;
+	uint8_t acc = 0;
+	crypto_x25519(k, r->s, epub);
+	for (int i = 0; i < 32; i++) acc |= k[i];
+	if (!acc) return -1;
+	crypto_blake2b_ctx c;
+	crypto_blake2b_init(&c, 64);
+	crypto_blake2b_update(&c, k, 32);
+	crypto_blake2b_update(&c, cid, 16);
+	crypto_blake2b_update(&c, r->s_pub, 32);
+	crypto_blake2b_final(&c, mac);
+	crypto_wipe(k, sizeof k);
+	char mach[65];
+	hkHexEnc(mach, mac, 32);
+	snprintf(body, sizeof body, "%s %s", cidh, mach);
+	snprintf(url, sizeof url, "%s/v1/auth/prove", r->url);
+	char *t = hkRelayPost(url, body);
+	char want[33];
+	hkRelayDeviceId(want, r->s_pub);
+	ok = t && strlen(t) >= 97 && t[64] == ' ' && !strncmp(t + 65, want, 32);
+	if (ok) {
+		memcpy(r->token, t, 64); r->token[64] = '\0'; memcpy(r->id, want, 33);
+		r->acct[0] = '\0';
+		if (t[97] == ' ' && strlen(t + 98) >= 16 && t[98] != '-') snprintf(r->acct, sizeof r->acct, "%.16s", t + 98);
+	}
+	free(t);
+	return ok ? 0 : -1;
+}
+
+/* POST a route with this device's token. The reply body, or NULL. */
+static char *hkRelayCall(hkRelay *r, const char *route, const char *body) {
+	char url[320], auth[96];
+	pid_t pid;
+	snprintf(url, sizeof url, "%s%s", r->url, route);
+	snprintf(auth, sizeof auth, "Authorization: Bearer %s", r->token);
+	char *argv[] = { "curl", "-s", "--max-time", "10", "-X", "POST", "--data-binary", (char *)body,
+	                 "-H", auth, "-H", "Content-Type: text/plain", url, NULL };
+	FILE *fp = hkRelayCurl(argv, 0, &pid);
+	if (!fp) return NULL;
+	char *out = hk_slurp(fp, 0);
+	fclose(fp);
+	waitpid(pid, NULL, 0);
+	return out;
+}
+
+static int hkRelayOpen(hkRelay *r) {
+	char auth[96], down[300], up[300];
+	snprintf(auth, sizeof auth, "Authorization: Bearer %s", r->token);
+	snprintf(down, sizeof down, "%s/v1/down", r->url);
+	snprintf(up, sizeof up, "%s/v1/up", r->url);
+	char *dv[] = { "curl", "-sN", "-H", auth, down, NULL };
+	char *uv[] = { "curl", "-sN", "-X", "POST", "-T", "-", "-H", auth,
+	               "-H", "Content-Type: text/plain", up, NULL };
+	pthread_mutex_init(&r->up_lock, NULL);
+	r->down = hkRelayCurl(dv, 0, &r->down_pid);
+	r->up = hkRelayCurl(uv, 1, &r->up_pid);
+	return r->down && r->up ? 0 : -1;
+}
+
+static int hkRelaySend(hkRelay *r, const char to[33], const uint8_t *b, size_t n) {
+	if (n == 0 || n > 256 * 1024) return -1;                         /* the relay's frame limit */
+	char *enc = clB64Encode(b, n);
+	if (!enc) return -1;
+	pthread_mutex_lock(&r->up_lock);
+	int ok = r->up && fprintf(r->up, "%s %s\n", to, enc) > 0 && fflush(r->up) == 0;
+	pthread_mutex_unlock(&r->up_lock);
+	free(enc);
+	return ok ? 0 : -1;
+}
+
+/* The next frame. Returns its length, -2 when the relay says a device is
+   offline (its id in from), -1 when the stream ends. */
+static long hkRelayRecv(hkRelay *r, char from[33], uint8_t *out, size_t cap) {
+	for (;;) {
+		ssize_t n = r->down ? getline(&r->line, &r->line_cap, r->down) : -1;
+		if (n < 0) return -1;
+		while (n > 0 && (r->line[n - 1] == '\n' || r->line[n - 1] == '\r')) r->line[--n] = '\0';
+		if (n == 0) {                                                /* keepalive: answer it now and then */
+			time_t now = time(NULL);
+			if (now - r->up_kept > 300) {
+				pthread_mutex_lock(&r->up_lock);
+				if (r->up && fputc('\n', r->up) != EOF) fflush(r->up);
+				pthread_mutex_unlock(&r->up_lock);
+				r->up_kept = now;
+			}
+			continue;
+		}
+		if (!strncmp(r->line, "! offline ", 10) && n == 42) { memcpy(from, r->line + 10, 33); return -2; }
+		if (n < 34 || r->line[32] != ' ') continue;
+		memcpy(from, r->line, 32);
+		from[32] = '\0';
+		size_t dl = 0;
+		uint8_t *d = clB64Decode(r->line + 33, &dl);
+		if (!d) continue;
+		if (dl > cap) { free(d); continue; }
+		memcpy(out, d, dl);
+		free(d);
+		return (long)dl;
+	}
+}
+
+/* Wakes a thread blocked in hkRelayRecv (its stream ends); it then closes. */
+static void hkRelayStop(hkRelay *r) {
+	if (r->down_pid > 0) kill(r->down_pid, SIGTERM);
+}
+
+static void hkRelayClose(hkRelay *r) {
+	if (r->up) { fclose(r->up); r->up = NULL; }
+	if (r->up_pid > 0) { kill(r->up_pid, SIGTERM); waitpid(r->up_pid, NULL, 0); r->up_pid = 0; }
+	if (r->down_pid > 0) { kill(r->down_pid, SIGTERM); waitpid(r->down_pid, NULL, 0); r->down_pid = 0; }
+	if (r->down) { fclose(r->down); r->down = NULL; }
+	free(r->line);
+	r->line = NULL;
+	r->line_cap = 0;
+	crypto_wipe(r->token, sizeof r->token);
+}
+#endif
+
+/* The middle part of a JWT, decoded. Not verified: only read for claims the
+   server checks anyway (expiry, account id). */
+static char *hkJwtPayload(const char *jwt) {
+	const char *a = jwt ? strchr(jwt, '.') : NULL;
+	if (!a) return NULL;
+	a++;
+	const char *b = strchr(a, '.');
+	size_t n = b ? (size_t)(b - a) : strlen(a);
+	if (!n) return NULL;
+	char *s = malloc(n + 1);
+	if (!s) return NULL;
+	for (size_t i = 0; i < n; i++) s[i] = a[i] == '-' ? '+' : a[i] == '_' ? '/' : a[i];
+	s[n] = '\0';
+	size_t pl = 0;
+	unsigned char *p = clB64Decode(s, &pl);
+	free(s);
+	if (!p) return NULL;
+	p[pl] = '\0';                   /* decoded is always shorter than the input */
+	return (char *)p;
+}
+
+/* Headers for chatgpt.com/backend-api/codex. hako names itself (originator,
+   User-Agent) instead of posing as the Codex CLI. */
+static int hkChatGPTHeaders(char *hdr, size_t cap, const char *token, int stream) {
+	char acct[96] = "";
+	char *pl = hkJwtPayload(token);
+	char *id = pl ? hkExtractJsonString(pl, "chatgpt_account_id") : NULL;
+	if (id) {
+		size_t j = 0;
+		for (const char *c = id; *c && j + 1 < sizeof(acct); c++)
+			if (isalnum((unsigned char)*c) || *c == '-' || *c == '_') acct[j++] = *c;
+		acct[j] = '\0';
+	}
+	free(id); free(pl);
+	const char *orig = getenv("HAKO_CHATGPT_ORIGINATOR");
+	if (!orig || !*orig || strchr(orig, '\'')) orig = "hako";
+	/* a cut header is a broken shell quote: refuse instead */
+	return hkFmtFits(hdr, cap, "-H 'Authorization: Bearer %s' -H 'originator: %s' "
+		"-H 'OpenAI-Beta: responses=experimental'%s%s%s%s",
+		token ? token : "", orig,
+		acct[0] ? " -H 'ChatGPT-Account-ID: " : "", acct, acct[0] ? "'" : "",
+		stream ? " -H 'accept: text/event-stream'" : "");
 }
 
 static void clCredsPath(char *out, size_t cap) {
@@ -3460,8 +5706,7 @@ static int hkBuildPrompt(aiData *data) {
 		tool_prompt = UNTRUSTED_PROMPT;
 	} else if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM)
 		tool_prompt = QWEN_TOOL_PROMPT;
-	else if (E.ai_toolmode == 1
-	      || (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic")))
+	else if (E.ai_toolmode == 1 || hkSubProse())
 		tool_prompt = REACT_PROMPT;
 	char *mcp_tools = (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) ? hkMcpLocalToolsPrompt() : NULL;
 	size_t mlen = mcp_tools ? strlen(mcp_tools) : 0;
@@ -3514,8 +5759,75 @@ static void clPipeEscape(const char *src, char *dst, int dsz) {
 	dst[d] = '\0';
 }
 
+/* :remote on runs the --serve listener inside a terminal session, so the phone
+   sees it and can type into it. Everything the pipe would say goes to its ring. */
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+#define HK_ATTACH 1
+#else
+#define HK_ATTACH 0
+#endif
+static volatile int hs_answer_armed = 0;   /* a terminal approval the phone may also answer */
+static volatile int hs_listen_stop = 0;    /* :remote off: the listener and its streams end */
+static void hkServePush(const char *json);
+
+#if HK_ATTACH
+static int hs_wake[2] = { -1, -1 };        /* a phone answer closes the terminal popup */
+
+/* Block for a key or a phone answer; 1 = the phone answered. */
+static int hkWaitKeyOrWake(void) {
+	fd_set fs;
+	FD_ZERO(&fs);
+	FD_SET(STDIN_FILENO, &fs);
+	FD_SET(hs_wake[0], &fs);
+	int mx = hs_wake[0] > STDIN_FILENO ? hs_wake[0] : STDIN_FILENO;
+	if (select(mx + 1, &fs, NULL, NULL, NULL) <= 0 || !FD_ISSET(hs_wake[0], &fs)) return 0;
+	char d[16];
+	if (read(hs_wake[0], d, sizeof(d)) < 0) {}
+	return 1;
+}
+#endif
+
+/* The reply as it streams, for a remote device. Batched so a long answer does
+   not flood the replay ring; the final message replaces it. */
+static char hk_delta[1024];
+static size_t hk_delta_n = 0;
+static long hk_delta_t = 0;
+static pthread_mutex_t hk_delta_lock = PTHREAD_MUTEX_INITIALIZER;
+static void hkDeltaFlush(void) {
+	char text[sizeof hk_delta];
+	pthread_mutex_lock(&hk_delta_lock);
+	memcpy(text, hk_delta, hk_delta_n);
+	text[hk_delta_n] = '\0';
+	int had = hk_delta_n > 0;
+	hk_delta_n = 0;
+	hk_delta_t = hk_time_ms();
+	pthread_mutex_unlock(&hk_delta_lock);
+	if (!had) return;
+	char esc[sizeof hk_delta * 6 + 8], line[sizeof esc + 32];
+	clPipeEscape(text, esc, sizeof esc);
+	snprintf(line, sizeof line, "{\"type\":\"delta\",\"text\":\"%s\"}", esc);
+	hkServePush(line);
+}
+static void hkDeltaPush(const char *t) {
+	if (!(E.serve_mode || hs_attached) || !t) return;
+	for (; *t; t++) {
+		if (*t == '\r') continue;
+		/* cut only on a character boundary: half a UTF-8 sequence is not text */
+		if (hk_delta_n >= sizeof hk_delta - 8 && ((unsigned char)*t & 0xC0) != 0x80) hkDeltaFlush();
+		pthread_mutex_lock(&hk_delta_lock);
+		if (hk_delta_n < sizeof hk_delta - 1) hk_delta[hk_delta_n++] = *t;
+		pthread_mutex_unlock(&hk_delta_lock);
+	}
+	if (hk_delta_n && (unsigned char)hk_delta[hk_delta_n - 1] < 0x80 && hk_time_ms() - hk_delta_t >= 120)
+		hkDeltaFlush();
+}
+
 static void clPipeEmitRaw(const char *json) {
-	if (E.serve_mode) { hkServePush(json); return; }
+	if (E.serve_mode || hs_attached) {
+		if (hk_delta_n) hkDeltaFlush();          /* streamed text lands before what follows it */
+		hkServePush(json);
+		return;
+	}
 	puts(json);
 	fflush(stdout);
 }
@@ -3568,9 +5880,19 @@ static void clPipeEmitInit(void) {
 		E.session_id ? E.session_id : "",
 		E.session_resumed ? 1 : 0,
 		E.session_turn_count,
-		hkProviderName(E.ai_provider_type),
+		hkProviderLabel(),
 		E.ai_model ? E.ai_model : "",
 		esc, HAKO_VERSION, HAKO_PIPE_PROTOCOL);
+	clPipeEmitRaw(json);
+}
+
+/* Provider or model moved. Front ends show it in their own status line; a menu
+   pick says nothing in the chat, so this is the only word they get. */
+static void clPipeEmitState(void) {
+	char pe[96], me[320], json[512];
+	clPipeEscape(hkProviderLabel(), pe, sizeof pe);
+	clPipeEscape(E.ai_model ? E.ai_model : "", me, sizeof me);
+	snprintf(json, sizeof json, "{\"type\":\"state\",\"provider\":\"%s\",\"model\":\"%s\"}", pe, me);
 	clPipeEmitRaw(json);
 }
 
@@ -3579,13 +5901,12 @@ static void clPipeEmitInit(void) {
    and blocks for the answer; the front end renders and replies. Returns the
    chosen 0-based index, or -1 for cancel. */
 static long g_pipe_choice_seq = 0;
-static int hkPipeChoice(const char *title, const char **items, int n) {
-	if (n <= 0) return -1;
+static int hkEmitChoiceRequest(const char *title, const char **items, int n) {
 	size_t cap = (title ? strlen(title) : 0) * 6 + 256;
 	for (int i = 0; i < n; i++) cap += strlen(items[i]) * 6 + 8;
 	char *req = malloc(cap);
-	if (!req) return -1;
-	char te[512];
+	if (!req) return 0;
+	char te[2048];
 	clPipeEscape(title ? title : "select", te, sizeof(te));
 	int off = snprintf(req, cap,
 		"{\"type\":\"choice_request\",\"id\":%ld,\"question\":\"%s\",\"options\":[",
@@ -3598,8 +5919,25 @@ static int hkPipeChoice(const char *title, const char **items, int n) {
 		off += w;
 	}
 	if (off > 0 && (size_t)off < cap) snprintf(req + off, cap - off, "]}");
+	else snprintf(req, cap, "{\"type\":\"choice_request\",\"id\":%ld,\"options\":[]}", g_pipe_choice_seq);
 	clPipeEmitRaw(req);
 	free(req);
+	return 1;
+}
+
+/* A 1-based index or the item's own text; -1 when it names none. */
+static int hkChoiceIndex(const char *ans, const char **items, int n) {
+	if (!ans || !ans[0]) return -1;
+	if (ans[0] >= '1' && ans[0] <= '9') {
+		int k = atoi(ans) - 1;
+		if (k >= 0 && k < n) return k;
+	}
+	for (int i = 0; i < n; i++) if (!strcasecmp(ans, items[i])) return i;
+	return -1;
+}
+
+static int hkPipeChoice(const char *title, const char **items, int n) {
+	if (n <= 0 || !hkEmitChoiceRequest(title, items, n)) return -1;
 
 	char ans[128] = {0};
 	if (E.serve_mode) {
@@ -3618,14 +5956,7 @@ static int hkPipeChoice(const char *title, const char **items, int n) {
 			break;
 		}
 	}
-	if (!ans[0]) return -1;                       /* closed with no pick */
-	/* answer is a 1-based index or the item's own text */
-	if (ans[0] >= '1' && ans[0] <= '9') {
-		int k = atoi(ans) - 1;
-		if (k >= 0 && k < n) return k;
-	}
-	for (int i = 0; i < n; i++) if (!strcasecmp(ans, items[i])) return i;
-	return -1;
+	return hkChoiceIndex(ans, items, n);
 }
 
 static void clRenderMarkdownInline(const char *in, char *out, size_t cap) {
@@ -3883,6 +6214,7 @@ static void clStreamEmit(clStreamLine *sl) {
 }
 
 static void clStreamPush(clStreamLine *sl, const char *chunk) {
+	hkDeltaPush(chunk);
 	clStreamResume(sl);
 	size_t start = sl->len;
 	for (const char *p = chunk; *p; p++) {
@@ -4016,8 +6348,25 @@ static void aiPushHistoryStore(aiData *data, const char *text, unsigned char rol
 	data->history_count++;
 }
 
+/* A menu opened and closed leaves no trace: its command line is echoed only
+   once something prints, and a pick confirms itself in the bar, not the chat. */
+static const char *hk_echo_pending = NULL;
+static int hk_menu_pick = 0;
+static void hkEchoFlush(aiData *data) {
+	if (!hk_echo_pending) return;
+	const char *l = hk_echo_pending;
+	hk_echo_pending = NULL;
+	clPrintRoleLine(HK_ROLE_USER, l);
+	aiPushHistoryStore(data, l, HK_ROLE_USER);
+}
+/* Every front end can answer a picker: the tty draws it, --pipe and --serve send
+   a choice_request. Only a plain non-tty run (-p, scripts) cannot. */
+static int hkCanPick(void) { return isatty(STDIN_FILENO) || E.pipe_mode || E.serve_mode; }
+
+static int hk_say_secret;
 static void aiAddHistoryRole(aiData *data, const char *text, unsigned char role) {
 	if (!data || !text) return;
+	if (!E.pipe_mode) hkEchoFlush(data);
 	if (E.pipe_mode) {
 		const char *rname = (role == HK_ROLE_USER) ? "user" :
 		                    (role == HK_ROLE_AI)   ? "ai"   : "system";
@@ -4037,6 +6386,8 @@ static void aiAddHistoryRole(aiData *data, const char *text, unsigned char role)
 		return;
 	}
 	int echo = !(role == HK_ROLE_AI && data->suppress_next_echo);
+	if (hs_attached && text[0] != '\x01' && echo && !hk_say_secret)    /* streamed replies reach the phone on their own path */
+		clPipeEmitMsg(role == HK_ROLE_USER ? "user" : role == HK_ROLE_AI ? "ai" : "system", text);
 	data->suppress_next_echo = 0;
 	const char *p = text;
 	while (1) {
@@ -4065,6 +6416,18 @@ static void aiSayf(aiData *data, const char *fmt, ...) {
 	vsnprintf(msg, sizeof(msg), fmt, ap);
 	va_end(ap);
 	aiAddHistory(data, msg);
+}
+
+/* aiSayf for a line that carries a secret: shown here, never logged, never sent to a remote device. */
+static void aiSayfSecret(aiData *data, const char *fmt, ...) {
+	char msg[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+	hk_say_secret = 1;
+	aiAddHistoryRole(data, msg, HK_ROLE_SYSTEM);
+	hk_say_secret = 0;
 }
 
 static void aiClearHistory(aiData *data) {
@@ -5307,28 +7670,7 @@ static char *hkToolAskUser(const char *input_json) {
 	answered = 0;
 #else
 	if (E.pipe_mode) {
-		static long ask_seq = 0;
-		size_t cap = strlen(question) * 6 + 256;
-		for (int i = 0; i < n; i++) cap += strlen(opts[i]) * 6 + 8;
-		char *req = malloc(cap);
-		if (req) {
-			char qe[2048];
-			clPipeEscape(question, qe, sizeof(qe));
-			int off = snprintf(req, cap,
-				"{\"type\":\"choice_request\",\"id\":%ld,\"question\":\"%s\",\"options\":[",
-				++ask_seq, qe);
-			for (int i = 0; i < n && off > 0 && (size_t)off < cap; i++) {
-				char oe[512];
-				clPipeEscape(opts[i], oe, sizeof(oe));
-				int w = snprintf(req + off, cap - off, "%s\"%s\"", i ? "," : "", oe);
-				if (w < 0 || (size_t)(off + w) >= cap) break;
-				off += w;
-			}
-			if (off > 0 && (size_t)off < cap) snprintf(req + off, cap - off, "]}");
-			else snprintf(req, cap, "{\"type\":\"choice_request\",\"id\":%ld,\"options\":[]}", ask_seq);
-			clPipeEmitRaw(req);
-			free(req);
-		}
+		hkEmitChoiceRequest(question, (const char **)opts, n);
 		char ans[64] = {0};
 		if (E.serve_mode) {
 			hkServeAnswer(ans, sizeof(ans));
@@ -5346,8 +7688,7 @@ static char *hkToolAskUser(const char *input_json) {
 				break;
 			}
 		}
-		if (ans[0] >= '1' && ans[0] <= '9') pick = atoi(ans) - 1;
-		else for (int i = 0; i < n; i++) if (!strcasecmp(ans, opts[i])) pick = i;
+		pick = hkChoiceIndex(ans, (const char **)opts, n);
 	} else if (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) {
 		clStopAnim(&G_AI);
 		if (E.color_enabled) printf("\n  %s?%s %s%s%s\n", TH_ACCENT, ANSI_RESET, TH_AI, question, ANSI_RESET);
@@ -5702,10 +8043,58 @@ static char *hkDiffPreview(const char *name, const char *input_json, int color) 
 	return NULL;
 }
 
+#ifndef HAKO_WASM
+/* This machine's tailnet name, or 0 when tailscale is missing or logged out.
+   The macOS app install puts its CLI inside the bundle, not on PATH. With
+   login, also the owner's login name (what tailscale serve sends as
+   Tailscale-User-Login for that person's own devices). */
+static int hkTailscaleName(char *out, size_t cap, char *login, size_t lcap) {
+	static const char *bins[] = { "tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", NULL };
+	out[0] = '\0';
+	for (int i = 0; bins[i] && !out[0]; i++) {
+		char cmd[160];
+#ifdef _WIN32
+		snprintf(cmd, sizeof(cmd), "\"%s\" status --json 2>nul", bins[i]);
+#else
+		snprintf(cmd, sizeof(cmd), "\"%s\" status --json 2>/dev/null", bins[i]);
+#endif
+		FILE *fp = popen(cmd, "r");
+		if (!fp) continue;
+		char *buf = NULL, chunk[4096];
+		size_t len = 0, bcap = 0, n;
+		while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0 && len < (1u << 20))
+			hkSbAdd(&buf, &len, &bcap, chunk, n);
+		pclose(fp);
+		const char *self = buf ? strstr(buf, "\"Self\"") : NULL;
+		char *dns = self ? hkExtractJsonString(self, "DNSName") : NULL;
+		if (dns && *dns) {
+			size_t dl = strlen(dns);
+			if (dns[dl - 1] == '.') dns[dl - 1] = '\0';
+			snprintf(out, cap, "%s", dns);
+		}
+		const char *uid = self ? strstr(self, "\"UserID\":") : NULL;
+		const char *users = buf ? strstr(buf, "\"User\":") : NULL;
+		if (login && lcap) login[0] = '\0';
+		if (login && uid && users && out[0]) {
+			char key[48];
+			snprintf(key, sizeof key, "\"%lld\":", strtoll(uid + 9, NULL, 10));
+			const char *row = strstr(users, key);
+			char *ln = row ? hkExtractJsonString(row, "LoginName") : NULL;
+			if (ln) snprintf(login, lcap, "%s", ln);
+			free(ln);
+		}
+		free(dns);
+		free(buf);
+	}
+	return out[0] != '\0';
+}
+#endif
+
 static int hkToolApprovalInner(const char *name, const char *input_json);
 
+
 static int hkToolApproval(const char *name, const char *input_json) {
-	if (E.ai_auto_approve || strcmp(name, "read_skill") == 0 || strcmp(name, "ask_user") == 0)
+	if ((E.ai_auto_approve && !hs_remote) || strcmp(name, "read_skill") == 0 || strcmp(name, "ask_user") == 0)
 		return hkToolApprovalInner(name, input_json);
 	hkClaimStdin();
 	int r = hkToolApprovalInner(name, input_json);
@@ -5713,8 +8102,55 @@ static int hkToolApproval(const char *name, const char *input_json) {
 	return r;
 }
 
+/* The approval as JSON for whoever is not at this terminal: the Rei pane, the
+   studio, or a phone attached with :remote on. */
+static int hkEmitToolRequest(const char *name, const char *subject, hkAllowKind kind, const char *input_json) {
+	static long ask_seq = 0;
+	char en[128], es[1024];
+	clPipeEscape(name ? name : "", en, sizeof(en));
+	clPipeEscape(subject ? subject : (kind == ALLOW_SHELL ? "(command)" : kind == ALLOW_NET ? "(url)" : "."), es, sizeof(es));
+	/* An extra field: a front end that does not know it drops it, which is
+	   what hake's reader already does with anything unrecognised. */
+	char *dp = (kind == ALLOW_WRITE) ? hkDiffPreview(name, input_json, 0) : NULL;
+	char *ed = NULL;
+	if (dp) {
+		size_t dn = strlen(dp);
+		if (dn > 4000) { dp[4000] = '\0'; dn = 4000; }
+		ed = malloc(dn * 6 + 8);
+		if (ed) clPipeEscape(dp, ed, (int)(dn * 6 + 8));
+		free(dp);
+	}
+	size_t rcap = 1400 + (ed ? strlen(ed) : 0);
+	char *req = malloc(rcap);
+	if (!req) { free(ed); return 0; }
+	snprintf(req, rcap,
+		"{\"type\":\"tool_request\",\"id\":%ld,\"name\":\"%.127s\",\"subject\":\"%.1023s\",\"kind\":\"%s\"%s%s%s}",
+		++ask_seq, en, es,
+		kind == ALLOW_WRITE ? "write" : kind == ALLOW_SHELL ? "shell" :
+		kind == ALLOW_NET   ? "net"   : "read",
+		ed ? ",\"diff\":\"" : "", ed ? ed : "", ed ? "\"" : "");
+	clPipeEmitRaw(req);
+	free(req);
+	free(ed);
+	return 1;
+}
+
+#if HK_ATTACH
+static int hsAttachSettle(int pick);
+static int hsAttachSettleChoice(int pick, const char **items, int n);
+static int hsAttachOn(void);
+static void hsAttachOff(void);
+static int hkInjectTake(char *out, size_t cap);
+static void hsAttachInfo(int *port, const char **token);
+static void hsAttachSetPort(int port);
+static int hrStart(void);
+static int hrLinked(void);
+static const char *hrStudioUrl(void);
+static volatile int hk_line_wait;
+#endif
+
 static int hkToolApprovalInner(const char *name, const char *input_json) {
-	if (E.ai_auto_approve) return 1;
+	if (E.ai_auto_approve && !hs_remote) return 1;
 	if (strcmp(name, "read_skill") == 0) return 1;
 	/* Asking the user a question IS the interaction — gating it behind a
 	   second prompt would ask permission to ask permission. */
@@ -5741,7 +8177,7 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 		subject = hkJsonFirst(input_json, "path", "file_path", "filename", "directory", "dir", NULL);
 	}
 
-	if (hkAllowHas(kind, kind == ALLOW_SHELL ? subject : NULL)) {
+	if (!hs_remote && hkAllowHas(kind, kind == ALLOW_SHELL ? subject : NULL)) {
 		/* Said once per kind: a tool that runs with no prompt in ask mode
 		   otherwise reads as the gate being broken. */
 		static int said[4];
@@ -5757,33 +8193,7 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 	}
 
 	if (E.pipe_mode) {
-		static long ask_seq = 0;
-		char en[128], es[1024];
-		clPipeEscape(name ? name : "", en, sizeof(en));
-		clPipeEscape(subject ? subject : (kind == ALLOW_SHELL ? "(command)" : kind == ALLOW_NET ? "(url)" : "."), es, sizeof(es));
-		/* An extra field: a front end that does not know it drops it, which is
-		   what hake's reader already does with anything unrecognised. */
-		char *dp = (kind == ALLOW_WRITE) ? hkDiffPreview(name, input_json, 0) : NULL;
-		char *ed = NULL;
-		if (dp) {
-			size_t dn = strlen(dp);
-			if (dn > 4000) { dp[4000] = '\0'; dn = 4000; }
-			ed = malloc(dn * 6 + 8);
-			if (ed) clPipeEscape(dp, ed, (int)(dn * 6 + 8));
-			free(dp);
-		}
-		size_t rcap = 1400 + (ed ? strlen(ed) : 0);
-		char *req = malloc(rcap);
-		if (!req) { free(ed); free(subject); return 0; }
-		snprintf(req, rcap,
-			"{\"type\":\"tool_request\",\"id\":%ld,\"name\":\"%.127s\",\"subject\":\"%.1023s\",\"kind\":\"%s\"%s%s%s}",
-			++ask_seq, en, es,
-			kind == ALLOW_WRITE ? "write" : kind == ALLOW_SHELL ? "shell" :
-			kind == ALLOW_NET   ? "net"   : "read",
-			ed ? ",\"diff\":\"" : "", ed ? ed : "", ed ? "\"" : "");
-		clPipeEmitRaw(req);
-		free(req);
-		free(ed);
+		if (!hkEmitToolRequest(name, subject, kind, input_json)) { free(subject); return 0; }
 
 		char ans[8] = {0};
 		if (E.serve_mode) {
@@ -5802,7 +8212,13 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 			}
 		}
 		int decision = (ans[0] == 'y' || ans[0] == 'Y') ? 1 : (ans[0] == 'a' || ans[0] == 'A') ? 2 : 0;
-		if (decision == 2) { hkAllowAdd(kind, kind == ALLOW_SHELL ? subject : NULL); decision = 1; }
+		if (hs_remote) {
+			char lg[256];
+			snprintf(lg, sizeof(lg), "approval (remote): %s %.160s \xE2\x86\x92 %s", name, subject ? subject : "",
+			         decision ? "once" : "denied");
+			hkLogMessage("system", lg);
+		}
+		if (decision == 2) { if (!hs_remote) hkAllowAdd(kind, kind == ALLOW_SHELL ? subject : NULL); decision = 1; }
 		free(subject);
 		return decision;
 	}
@@ -5835,7 +8251,13 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 	int decision = 0;
 	if (isatty(STDOUT_FILENO)) {
 		const char *choices[3] = { "allow once", "no, skip it", always_label };
-		int pick = clPopupSelect("allow?", choices, 3, 0, NULL);
+#if HK_ATTACH
+		if (hs_attached && hkEmitToolRequest(name, subject, kind, input_json)) hs_answer_armed = 1;
+#endif
+		int pick = clPopupSelect("allow?", choices, hs_remote ? 2 : 3, 0, NULL);
+#if HK_ATTACH
+		if (hs_answer_armed) { hs_answer_armed = 0; pick = hsAttachSettle(pick); }
+#endif
 		if      (pick == 0) decision = 1;
 		else if (pick == 2) decision = 2;
 	} else {
@@ -5849,11 +8271,11 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 	}
 	{
 		char lg[256];
-		snprintf(lg, sizeof(lg), "approval: %s %.160s \xE2\x86\x92 %s", name, subject ? subject : "",
-		         decision == 2 ? "always" : decision ? "once" : "denied");
+		snprintf(lg, sizeof(lg), "approval%s: %s %.160s \xE2\x86\x92 %s", hs_remote ? " (remote on)" : "",
+		         name, subject ? subject : "", decision == 2 ? "always" : decision ? "once" : "denied");
 		hkLogMessage("system", lg);
 	}
-	if (decision == 2) { hkAllowAdd(kind, kind == ALLOW_SHELL ? subject : NULL); decision = 1; }
+	if (decision == 2) { if (!hs_remote) hkAllowAdd(kind, kind == ALLOW_SHELL ? subject : NULL); decision = 1; }
 	free(subject);
 	return decision;
 #endif
@@ -6558,17 +8980,17 @@ static void hkAnnounceTool(aiData *data, const char *fname, const char *args_obj
 	snprintf(call, sizeof(call), "%s(%s)", fname, arg_summary);
 	{
 		static int said_auto = 0;
-		if (!said_auto && E.ai_auto_approve && !E.pipe_mode) {
+		if (!said_auto && E.ai_auto_approve && !hs_remote && !E.pipe_mode) {
 			said_auto = 1;
 			aiAddHistory(data, "auto mode: tools run without asking \xC2\xB7 shift+tab to change");
 		}
 	}
 	hkLogMessage("tool", call);
-	if (E.pipe_mode) {
+	if (E.pipe_mode || hs_attached) {
 		char display[320];
 		snprintf(display, sizeof(display), "%s %.300s", hkToolGlyph(fname, 0), call);
 		clPipeEmitDisplay("tool_start", display);
-		return;
+		if (E.pipe_mode) return;
 	}
 	/* Kept in the transcript so a repaint (resize, ctrl-o) still shows it. */
 	if (data && data->history_count < AI_HISTORY_MAX) {
@@ -7006,7 +9428,7 @@ static void hkAnnounceToolResult(aiData *data, const char *result) {
 	int is_summary = result && (strncmp(result, "wrote ", 6) == 0 ||
 	                            strncmp(result, "no change", 9) == 0);
 	hkLogToolResult(result);
-	if (E.pipe_mode) {
+	if (E.pipe_mode || hs_attached) {
 		char display[256];
 		if (is_err || is_summary) snprintf(display, sizeof(display), "%s", result ? result : "error");
 		else snprintf(display, sizeof(display), "%d bytes", len);
@@ -7033,7 +9455,7 @@ static void hkAnnounceToolResult(aiData *data, const char *result) {
 				free(cut);
 			}
 		}
-		return;
+		if (E.pipe_mode) return;
 	}
 	free(hk_last_tool_out);
 	hk_last_tool_out = result ? strdup(result) : NULL;
@@ -7108,8 +9530,8 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 
 	int tools_on = E.ai_tools_enabled;
 	if (E.ai_toolmode == 1) tools_on = 0;
-	if (type == AI_PROVIDER_ANTHROPIC && E.ai_oauth_provider
-	    && !strcmp(E.ai_oauth_provider, "anthropic")) tools_on = 0;
+	if (hkSubProse()) tools_on = 0;
+	int chatgpt = type == AI_PROVIDER_OPENAI && hkOAuthIs("chatgpt");
 	if (type == AI_PROVIDER_MITHRAEUM) tools_on = 0;
 	if (tools_on && E.ai_tool_gate && data->message_count > 0) {
 		aiMessage *last = &data->messages[data->message_count - 1];
@@ -7139,7 +9561,7 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 	}
 
 	char *msgs_with_sys = NULL;
-	if (sys_esc && *sys_esc && type != AI_PROVIDER_ANTHROPIC) {
+	if (sys_esc && *sys_esc && type != AI_PROVIDER_ANTHROPIC && !chatgpt) {
 		size_t mlen = strlen(msgs);
 		size_t elen = strlen(sys_esc);
 		size_t cap = mlen + elen + 64;
@@ -7267,6 +9689,15 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 		break;
 	}
 	case AI_PROVIDER_OPENAI: {
+		if (chatgpt) {
+			/* Responses API: the system prompt is "instructions", and plain
+			   {role, content} messages are valid input items as they are. */
+			snprintf(body, bodycap,
+				"{\"model\":\"%s\",\"instructions\":\"%s\",\"input\":%s,"
+				"\"stream\":true,\"store\":false}",
+				model ? model : "gpt-5.5", sys_esc ? sys_esc : "", msgs);
+			break;
+		}
 		if (!endpoint) endpoint = "https://api.openai.com";
 		if (!model) model = "gpt-4o-mini";
 		const char *reason = "";
@@ -7345,6 +9776,15 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 	}
 	case AI_PROVIDER_OPENAI: {
 		if (!api_key) { free(body); out->body = NULL; return -1; }
+		if (!endpoint) endpoint = chatgpt ? "https://chatgpt.com/backend-api/codex" : "https://api.openai.com";
+		if (chatgpt) {
+			snprintf(url, sizeof(url), "%s/responses", endpoint);
+			out->stream = 1;          /* the codex backend only streams */
+			if (!hkChatGPTHeaders(hdr, sizeof(hdr), api_key, 1)) {
+				free(body); out->body = NULL; return -1;
+			}
+			break;
+		}
 		int copilot = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot");
 		int ghmodels = endpoint && strstr(endpoint, "models.inference.ai.azure.com");
 		size_t elen = endpoint ? strlen(endpoint) : 0;
@@ -7424,10 +9864,10 @@ static char *aiExtractStringValue(const char *p) {
 
 static char *aiExtractApiError(const char *json) {
 	const char *err = strstr(json, "\"error\"");
-	if (!err) return NULL;
-	const char *msg = strstr(err, "\"message\":\"");
-	if (!msg) return NULL;
-	msg += 11;
+	const char *msg = err ? strstr(err, "\"message\":\"") : NULL;
+	if (msg) msg += 11;
+	else if ((msg = strstr(json, "\"detail\":\"")) != NULL) msg += 10;   /* chatgpt.com errors */
+	else return NULL;
 	char *body = aiExtractStringValue(msg);
 	if (!body) return NULL;
 	int blen = strlen(body);
@@ -8647,6 +11087,7 @@ static char *hkMithraeumFirstAvailable(void) {
 static const struct { const char *prov, *models; } HK_MODEL_SUGG[] = {
 	{ "anthropic",      "claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5" },
 	{ "openai",         "gpt-4o, gpt-4o-mini, gpt-5, o1, o1-mini, gpt-4.1" },
+	{ "chatgpt",        "gpt-5.5, gpt-5.4, gpt-5.4-mini" },
 	{ "gemini",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro, gemini-1.5-flash" },
 	{ "google",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro" },
 	{ "groq",           "llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768" },
@@ -8677,6 +11118,7 @@ static const char *hkProviderLabel(void) {
 			{ "generativelanguage",           "gemini"        },
 			{ "models.inference.ai.azure.com","github-models" },
 			{ "githubcopilot",                "copilot"       },
+			{ "/backend-api/codex",           "chatgpt"       },
 		};
 		for (size_t i = 0; i < sizeof(M) / sizeof(M[0]); i++)
 			if (strstr(ep, M[i].host)) return M[i].name;
@@ -8797,6 +11239,16 @@ static char *hkModelListCmd(void) {
 			break;
 		}
 		if (!api_key || !*api_key) { free(cmd); return NULL; }
+		if (hkOAuthIs("chatgpt")) {
+			/* client_version gates the catalog; an old one gets a frozen list */
+			char hdr[6144];
+			char *big = realloc(cmd, 8192);     /* the token alone can be 2 KB */
+			if (!big || !hkChatGPTHeaders(hdr, sizeof(hdr), api_key, 0)
+			    || !hkFmtFits(big, 8192, "curl -s --max-time 8 %s '%s/models?client_version=99.0.0' 2>/dev/null",
+			                  hdr, endpoint)) { free(big ? big : cmd); return NULL; }
+			cmd = big;
+			break;
+		}
 		if (strstr(endpoint, "generativelanguage")) {
 			snprintf(cmd, 2048,
 				"curl -s --max-time 8 '%s/v1beta/models?pageSize=200&key=%s' 2>/dev/null",
@@ -8826,8 +11278,9 @@ static int hkParseModelList(const char *json, char out[][96], int max) {
 	if (!when) return 0;
 	int n = 0;
 
-	for (int pass = 0; pass < 2 && n == 0; pass++) {
-		const char *key = pass == 0 ? "\"id\":\"" : "\"name\":\"";
+	for (int pass = 0; pass < 3 && n == 0; pass++) {
+		/* codex lists "slug"; openai-shaped lists "id"; gemini/ollama "name" */
+		const char *key = pass == 0 ? "\"slug\":\"" : pass == 1 ? "\"id\":\"" : "\"name\":\"";
 		size_t klen = strlen(key);
 		const char *p = json;
 		while (n < max && (p = strstr(p, key)) != NULL) {
@@ -8986,7 +11439,7 @@ static void hkHealModelForProvider(aiData *data) {
 		char mm[192];
 		snprintf(mm, sizeof(mm), "model \xE2\x86\x92 %.60s (prior model not valid for %.40s; :model to change, :models to list)",
 			dm, hkProviderLabel());
-		aiAddHistory(data, mm);
+		if (!hk_menu_pick) aiAddHistory(data, mm);
 		hkSaveSession();
 	} else if (!dm) {
 		aiAddHistory(data, "note: pick a model for this provider — :model <id> (:models to list)");
@@ -9259,6 +11712,7 @@ static char *hkHakmRoundtrip(const char *frame, size_t flen, char **eng) {
 			}
 		}
 		if (quiet) continue;
+		if (E.pipe_mode) { hkDeltaPush(tok); continue; }
 		if (!streamed) { streamed = 1; clStopAnim(&G_AI); }
 		clStreamPush(&sline, tok);
 	}
@@ -9495,6 +11949,15 @@ static void hkPrewarmJoin(void) { }
 static void hkPrewarmStart(aiData *data) { (void)data; }
 #endif
 
+/* :remote on: a streamed reply skips the history echo, so the phone gets its
+   finished text here (tool blocks out). */
+static void hkPhoneFinal(const char *content) {
+	if (!hs_attached || !content) return;
+	char *pd = hkStripToolBlocks(content);
+	if (pd) clPipeEmitMsg("ai", pd);
+	free(pd);
+}
+
 static char *hkMithraeumChat(aiData *data, char **err) {
 #ifdef HAKO_WASM
 	/* The engine is a separate process; a browser tab cannot start one. */
@@ -9560,8 +12023,8 @@ static char *hkMithraeumChat(aiData *data, char **err) {
 	const char *sys = (data->system_prompt && *data->system_prompt) ? data->system_prompt : NULL;
 	int ntok = E.ai_max_tokens > 0 ? E.ai_max_tokens : 1024;
 	if (E.ai_tools_enabled && ntok < 3072) ntok = 3072;
-	hk_local_stream = (!E.pipe_mode && !E.output_json && !hk_bench_mode
-	                   && E.color_enabled && isatty(STDOUT_FILENO)) ? 1 : 0;
+	hk_local_stream = ((!E.pipe_mode && !E.output_json && !hk_bench_mode
+	                   && E.color_enabled && isatty(STDOUT_FILENO)) || E.serve_mode) ? 1 : 0;
 
 #ifndef _WIN32
 	size_t fl = 0;
@@ -10008,6 +12471,7 @@ static void *aiWorkerTurn(void *arg) {
 			pthread_mutex_lock(&data->lock);
 			if (*content) {
 				char *disp = hkHasToolBlock(content) ? NULL : hkStripToolBlocks(content);
+				if (data->suppress_next_echo || !disp || !*disp) hkPhoneFinal(content);
 				if (disp && *disp) aiAddHistoryRole(data, disp, HK_ROLE_AI);
 				free(disp);
 				hkLogMessage("assistant", content);
@@ -10193,9 +12657,11 @@ static void *aiWorkerTurn(void *arg) {
 		}
 
 		int oauth_anth_resp = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
-		int streaming_mode = (E.ai_provider_type == AI_PROVIDER_ANTHROPIC) &&
-			(oauth_anth_resp || (E.ai_stream && !(E.ai_tools_enabled && hkProjectTrusted())));
-		int openai_stream = (E.ai_provider_type == AI_PROVIDER_OPENAI) && E.ai_stream;
+		/* ChatGPT's Responses stream rides the same prose path as Claude's */
+		int chatgpt_resp = E.ai_provider_type == AI_PROVIDER_OPENAI && hkOAuthIs("chatgpt");
+		int streaming_mode = chatgpt_resp || ((E.ai_provider_type == AI_PROVIDER_ANTHROPIC) &&
+			(oauth_anth_resp || (E.ai_stream && !(E.ai_tools_enabled && hkProjectTrusted()))));
+		int openai_stream = (E.ai_provider_type == AI_PROVIDER_OPENAI) && E.ai_stream && !chatgpt_resp;
 
 		char buffer[8192];
 		char *full_response = NULL;
@@ -10222,8 +12688,9 @@ static void *aiWorkerTurn(void *arg) {
 
 				if (strncmp(line, "data: ", 6) != 0) continue;
 				const char *payload = line + 6;
-				if (!strstr(payload, "content_block_delta")) continue;
-				char *raw = hkExtractJsonString(payload, "text");
+				if (!strstr(payload, chatgpt_resp ? "\"response.output_text.delta\"" : "content_block_delta"))
+					continue;
+				char *raw = hkExtractJsonString(payload, chatgpt_resp ? "delta" : "text");
 				if (!raw) continue;
 				char *text = hkJsonUnescape(raw, (int)strlen(raw));
 				free(raw);
@@ -10243,8 +12710,11 @@ static void *aiWorkerTurn(void *arg) {
 				if (!quiet && !E.pipe_mode && !E.output_json) {
 					if (!printed_prefix) { clStopAnim(data); printed_prefix = 1; }
 					clStreamPush(&sline, text);
-				}
+				} else if (!quiet && E.serve_mode) hkDeltaPush(text);
 				free(text);
+				/* no stop sequences on this API: hang up at the call ourselves,
+				   before the model writes on and invents the result */
+				if (chatgpt_resp && quiet && strstr(acc, "</tool>")) break;
 			}
 			free(lheap);
 			hk_http_close(http);
@@ -10252,7 +12722,11 @@ static void *aiWorkerTurn(void *arg) {
 			if (full_response) full_response[total] = '\0';
 
 			int has_tool_call_in_acc = acc_len > 0 && hkHasToolBlock(acc);
-			if (E.pipe_mode && acc_len > 0) {       /* the pane gets the prose, tool blocks stripped */
+			if (!E.pipe_mode && printed_prefix) {
+				if (quiet) { clStreamUnecho(&sline); sline.len = 0; }
+				clStreamEnd(&sline);
+			}
+			if ((E.pipe_mode || hs_attached) && acc_len > 0) {   /* the pane gets the prose, tool blocks stripped */
 				const char *render_start = acc;
 				const char *render_end = acc + acc_len;
 
@@ -10297,9 +12771,6 @@ static void *aiWorkerTurn(void *arg) {
 					clean[ci] = save;
 				}
 				free(clean);
-			} else if (printed_prefix) {
-				if (quiet) { clStreamUnecho(&sline); sline.len = 0; }
-				clStreamEnd(&sline);
 			}
 
 			if (acc_len > 0) {
@@ -10315,7 +12786,7 @@ static void *aiWorkerTurn(void *arg) {
 				pthread_mutex_unlock(&data->lock);
 
 				int prose_active = (E.ai_toolmode == 1)
-					|| (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))
+					|| hkSubProse()
 					|| (E.ai_provider_type == AI_PROVIDER_MITHRAEUM);
 				if (prose_active && hkHasToolBlock(acc)) {
 					int dups = 0;
@@ -10387,7 +12858,7 @@ static void *aiWorkerTurn(void *arg) {
 				if (!E.pipe_mode && !E.output_json) {
 					if (!printed_prefix) { clStopAnim(data); printed_prefix = 1; }
 					clStreamPush(&sline, chunk);
-				}
+				} else if (E.serve_mode) hkDeltaPush(chunk);
 				free(chunk);
 			}
 			free(oheap);
@@ -10439,6 +12910,7 @@ static void *aiWorkerTurn(void *arg) {
 		pthread_mutex_lock(&data->lock);
 		hkUpdateUsage(data, full_response);
 		if (content && *content) {
+			if (data->suppress_next_echo) hkPhoneFinal(content);
 			aiAddHistoryRole(data, content, HK_ROLE_AI);
 			hkLogMessage("assistant", content);
 			free(data->current_response);
@@ -10478,7 +12950,7 @@ static void *aiWorkerTurn(void *arg) {
 		}
 
 		int prose_active = (E.ai_toolmode == 1)
-			|| (E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic"))
+			|| hkSubProse()
 			|| (E.ai_provider_type == AI_PROVIDER_MITHRAEUM);
 		if (content && prose_active && hkHasToolBlock(content)) {
 			pthread_mutex_lock(&data->lock);
@@ -10535,7 +13007,7 @@ static void *aiWorkerTurn(void *arg) {
 	if (g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
 #endif
 
-	if (E.pipe_mode) {
+	if (E.pipe_mode || hs_attached) {
 		if (!hk_turn_spoke && data->current_response && *data->current_response) {
 			char *norm = hkNormalizeToolDialect(data->current_response);
 			clPipeEmitMsg("ai", norm ? norm : data->current_response);
@@ -10562,7 +13034,7 @@ static void *aiWorkerThread(void *arg) {
 #if !defined(_WIN32) && !defined(HAKO_WASM)
 		if (g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
 #endif
-		if (E.pipe_mode) clPipeEmitDone(data);
+		if (E.pipe_mode || hs_attached) clPipeEmitDone(data);
 	}
 	return NULL;
 }
@@ -10587,6 +13059,8 @@ static int hkPickModel(aiData *data, char *out, size_t cap) {
 	if (mn <= 0) {
 		if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM)
 			aiAddHistory(data, "no local models installed. :pull hako-sho to add one.");
+		else
+			aiSayf(data, "no model list for %s. :model <id> sets one", hkProviderLabel());
 		return 0;
 	}
 	int cur = 0;
@@ -10602,13 +13076,13 @@ static int hkPickModel(aiData *data, char *out, size_t cap) {
 
 static int hkPickProvider(char *out, size_t cap) {
 	static const char *provs[] = {
-		"mithraeum", "anthropic", "openai", "gemini", "ollama", "groq",
+		"mithraeum", "anthropic", "chatgpt", "openai", "gemini", "ollama", "groq",
 		"cerebras", "deepseek", "mistral", "together", "fireworks",
 		"openrouter", "xai", "custom"
 	};
 	int pn = (int)(sizeof(provs) / sizeof(provs[0]));
 	int cur = 0;
-	const char *active = hkProviderName(E.ai_provider_type);
+	const char *active = hkProviderLabel();
 	for (int i = 0; i < pn; i++) if (!strcmp(provs[i], active)) { cur = i; break; }
 	int pick = clPopupSelect("provider", provs, pn, cur, NULL);
 	if (pick < 0) return 0;
@@ -10761,7 +13235,116 @@ static int hkInstallSkillDir(const char *owner, const char *repo, const char *pa
 	return wrote;
 }
 
+/* The bare commands that open a menu (tty popup, or choice_request elsewhere). */
+static int hkIsMenuCommand(const char *line) {
+	static const char *menus[] = { "model", "models", "provider", "providers", "theme", "login", "login api", NULL };
+	if (!hkCanPick() || (line[0] != ':' && line[0] != '/')) return 0;
+	const char *c = line + 1;
+	size_t n = strlen(c);
+	while (n && c[n - 1] == ' ') n--;
+	for (int i = 0; menus[i]; i++)
+		if (strlen(menus[i]) == n && !strncmp(c, menus[i], n)) return 1;
+	return 0;
+}
+
+/* :login is the front door: subscription sign-ins first, API keys one level
+   down, each named for who bills you (OpenRouter's GPT is OpenRouter, not ChatGPT). */
+static int hkSignedIn(const char *id) {
+	clCred *c = clCredsFind(id);
+	if (!c) return 0;
+	if (!strcmp(id, "anthropic")) return c->oauth_refresh != NULL;
+	return c->oauth_refresh || c->api_key;
+}
+
+typedef struct { const char *id, *name, *what; } hkLoginRow;
+static const hkLoginRow HK_SIGNIN[] = {
+	{ "anthropic",     "Claude",         "Pro or Max plan" },
+	{ "chatgpt",       "ChatGPT",        "free or paid account" },
+	{ "copilot",       "GitHub Copilot", "Copilot plan" },
+	{ "github-models", "GitHub Models",  "free with a GitHub account" },
+	{ "api",           "API key",        "pay per token, any provider" },
+}, HK_KEYS[] = {
+	{ "anthropic-api", "Anthropic",      "Claude API, billed by Anthropic" },
+	{ "openai",        "OpenAI",         "OpenAI API, separate from ChatGPT" },
+	{ "openrouter",    "OpenRouter",     "many vendors' models, billed by OpenRouter" },
+	{ "gemini",        "Google",         "Gemini API, free tier" },
+	{ "groq",          "Groq",           "open models, free tier" },
+	{ "cerebras",      "Cerebras",       "open models, free tier" },
+	{ "deepseek",      "DeepSeek",       "DeepSeek API" },
+	{ "mistral",       "Mistral",        "Mistral API" },
+	{ "xai",           "xAI",            "Grok API" },
+	{ "together",      "Together",       "open models" },
+	{ "fireworks",     "Fireworks",      "open models" },
+	{ "custom",        "custom",         "any OpenAI-compatible endpoint" },
+};
+#define HK_NSIGNIN ((int)(sizeof HK_SIGNIN / sizeof HK_SIGNIN[0]))
+#define HK_NKEYS   ((int)(sizeof HK_KEYS / sizeof HK_KEYS[0]))
+
+/* A saved API key for this menu id ("anthropic-api" files under "anthropic"),
+   as opposed to a sign-in's token. */
+static int hkKeySaved(const char *id) {
+	char lab[32];
+	snprintf(lab, sizeof lab, "%s", id);
+	char *dash = strstr(lab, "-api");
+	if (dash) *dash = '\0';
+	clCred *c = clCredsFind(lab);
+	return c && c->api_key && !c->oauth_refresh;
+}
+
+/* The menu id a mistyped :login most likely meant: edit distance 2 or less. */
+static const char *hkNearestLogin(const char *typed) {
+	const char *best = NULL;
+	int best_d = 3;
+	size_t tl = strlen(typed);
+	if (tl > 30) return NULL;
+	for (int i = 0; i < HK_NSIGNIN + HK_NKEYS; i++) {
+		const char *id = i < HK_NSIGNIN ? HK_SIGNIN[i].id : HK_KEYS[i - HK_NSIGNIN].id;
+		size_t il = strlen(id);
+		int row[32];
+		for (size_t j = 0; j <= il; j++) row[j] = (int)j;
+		for (size_t a = 1; a <= tl; a++) {
+			int diag = row[0];
+			row[0] = (int)a;
+			for (size_t j = 1; j <= il; j++) {
+				int up = row[j];
+				int sub = diag + (tolower((unsigned char)typed[a - 1]) != id[j - 1]);
+				int d = up + 1 < row[j - 1] + 1 ? up + 1 : row[j - 1] + 1;
+				row[j] = sub < d ? sub : d;
+				diag = up;
+			}
+		}
+		if (row[il] < best_d) { best_d = row[il]; best = id; }
+	}
+	return best;
+}
+
+static const char *hkPickLogin(int api) {
+	const hkLoginRow *T = api ? HK_KEYS : HK_SIGNIN;
+	static char rows[16][112];
+	const char *items[16];
+	int n = api ? HK_NKEYS : HK_NSIGNIN;
+	for (int i = 0; i < n; i++) {
+		const char *mark = "";
+		if (!api && hkSignedIn(T[i].id)) mark = "  · signed in";
+		if (api && hkKeySaved(T[i].id))   mark = "  · key saved";
+		snprintf(rows[i], sizeof rows[i], "%-15s %s%s", T[i].name, T[i].what, mark);
+		items[i] = rows[i];
+	}
+	int pick = clPopupSelect(api ? "API key" : "sign in", items, n, 0, NULL);
+	return pick < 0 ? NULL : T[pick].id;
+}
+
+static int hkHandleSlashCmd(aiData *data, const char *prompt);
+static int hk_slash_depth = 0;
 static int hkHandleSlash(aiData *data, const char *prompt) {
+	if (!hk_slash_depth) hk_menu_pick = 0;
+	hk_slash_depth++;
+	int r = hkHandleSlashCmd(data, prompt);
+	hk_slash_depth--;
+	return r;
+}
+
+static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 	if (prompt[0] != '/' && prompt[0] != ':') return 0;
 	const char *cmd = prompt + 1;
 	const char *arg = strchr(cmd, ' ');
@@ -10769,15 +13352,13 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	if (arg) { while (*arg == ' ') arg++; }
 
 	static char plural_pick[96];
-	if ((!arg || !*arg) && isatty(STDIN_FILENO)) {
+	if ((!arg || !*arg) && hkCanPick()) {
 		if (cmdlen == 6 && !strncmp(cmd, "models", 6)) {
-			if (hkPickModel(data, plural_pick, sizeof plural_pick)) {
-				cmd = "model"; cmdlen = 5; arg = plural_pick;
-			}
+			if (!hkPickModel(data, plural_pick, sizeof plural_pick)) return 1;
+			cmd = "model"; cmdlen = 5; arg = plural_pick; hk_menu_pick = 1;
 		} else if (cmdlen == 9 && !strncmp(cmd, "providers", 9)) {
-			if (hkPickProvider(plural_pick, sizeof plural_pick)) {
-				cmd = "provider"; cmdlen = 8; arg = plural_pick;
-			}
+			if (!hkPickProvider(plural_pick, sizeof plural_pick)) return 1;
+			cmd = "provider"; cmdlen = 8; arg = plural_pick; hk_menu_pick = 1;
 		}
 	}
 
@@ -10798,7 +13379,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			":theme [<name>]              bare = picker",
 			":pull <model>                fetch local weights",
 			"",
-			":login [<provider>]  :logout [<provider>]  :accounts",
+			":login  sign in   :login api  API keys   :logout   :accounts",
 			":history [local|global]      :skills [reload]",
 			":skill install <url>         :skill uninstall <name>",
 			"",
@@ -10910,21 +13491,26 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		return 1;
 	}
 	if (strncmp(cmd, "login", cmdlen) == 0 && cmdlen == 5) {
-		const char *prov = (arg && *arg) ? arg : hkProviderName(E.ai_provider_type);
-		if (!prov || strcmp(prov, "none") == 0) {
-			aiAddHistory(data, "usage: :login <provider>");
-			aiAddHistory(data, "  OAuth (subscription/account-bound):");
-			aiAddHistory(data, "    anthropic          Claude Pro/Max");
-			aiAddHistory(data, "    copilot            GitHub Copilot Pro/Business");
-			aiAddHistory(data, "    github-models      free GitHub Models tier");
-			aiAddHistory(data, "    openrouter         PKCE — auto-issue OR API key");
-			aiAddHistory(data, "  paste API key (input hidden):");
-			aiAddHistory(data, "    anthropic-api, openai, gemini, groq, cerebras,");
-			aiAddHistory(data, "    deepseek, mistral, together, fireworks, xai, openrouter-api, custom");
-			aiAddHistory(data, "  local (no auth):");
-			aiAddHistory(data, "    ollama, ollamacloud");
-			return 1;
+		const char *prov = (arg && *arg) ? arg : NULL;
+		if (!prov || !strcmp(prov, "api")) {
+			if (!hkCanPick()) {
+				aiAddHistory(data, ":login          sign in: anthropic chatgpt copilot github-models");
+				aiAddHistory(data, ":login api      API key: anthropic-api openai openrouter gemini groq");
+				aiAddHistory(data, "                cerebras deepseek mistral xai together fireworks custom");
+				return 1;
+			}
+			const char *id = hkPickLogin(prov != NULL);
+			if (id && !strcmp(id, "api")) id = hkPickLogin(1);
+			if (!id) return 1;                       /* closed: nothing changed, nothing said */
+			hk_menu_pick = 1;
+			if ((!strcmp(id, "anthropic") || !strcmp(id, "chatgpt")) && hkSignedIn(id)) {
+				char sw[48];
+				snprintf(sw, sizeof sw, ":provider %s", id);   /* already signed in: just switch */
+				return hkHandleSlash(data, sw);
+			}
+			prov = id;
 		}
+		hkEchoFlush(data);                           /* a sign-in prints; show what started it */
 		if (strcmp(prov, "ollama") == 0 || strcmp(prov, "local") == 0 || strcmp(prov, "koi") == 0) {
 			hkApplyProviderAlias(prov);
 			hkSaveSession();
@@ -10952,14 +13538,18 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			clOAuthGithubCopilot(data);
 			return 1;
 		}
+		if (strcmp(prov, "chatgpt") == 0 || strcmp(prov, "codex") == 0) {
+			clOAuthChatGPT(data);
+			return 1;
+		}
 		if (strcmp(prov, "github-models") == 0 || strcmp(prov, "ghmodels") == 0) {
 			clOAuthGithubModels(data);
 			return 1;
 		}
 		if (strcmp(prov, "openrouter") == 0) {
 			if (clOAuthOpenRouter(data) == 0) return 1;
-			aiAddHistory(data, "(OAuth aborted — try :login openrouter-api to paste an existing key)");
-			return 1;
+			aiAddHistory(data, "(browser sign-in did not finish; paste a key instead)");
+			prov = "openrouter-api";
 		}
 		if (strcmp(prov, "openrouter-api") == 0) {
 			prov = "openrouter";
@@ -10967,7 +13557,9 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 		}
 		const char *url = clProviderConsoleUrl(prov);
 		if (!url && strcmp(prov, "custom") != 0) {
-			aiSayf(data, "no console URL for '%s'", prov);
+			const char *guess = hkNearestLogin(prov);
+			if (guess) aiSayf(data, "no sign-in called '%s'. did you mean :login %s?", prov, guess);
+			else aiSayf(data, "no sign-in called '%s'. :login lists them", prov);
 			return 1;
 		}
 		if (url) {
@@ -11017,7 +13609,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			clCred *c = &cl_creds[i];
 			if (!c->api_key && !c->oauth_refresh) continue;
 			const char *kind = c->oauth_refresh ? "oauth" : "key";
-			const char *active = !strcmp(c->provider, hkProviderName(E.ai_provider_type)) ? " *" : "";
+			const char *active = !strcmp(c->provider, hkProviderLabel()) ? " *" : "";
 			aiSayf(data, "  %s (%s)%s", c->provider, kind, active);
 		}
 		return 1;
@@ -11031,8 +13623,10 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 	}
 	if (strncmp(cmd, "model", cmdlen) == 0 && cmdlen == 5) {
 		char modelpick[96];
-		if ((!arg || !*arg) && isatty(STDIN_FILENO)
-			&& hkPickModel(data, modelpick, sizeof modelpick)) arg = modelpick;
+		if ((!arg || !*arg) && hkCanPick()) {
+			if (!hkPickModel(data, modelpick, sizeof modelpick)) return 1;
+			arg = modelpick; hk_menu_pick = 1;
+		}
 		if (arg && *arg) {
 			if (!strncmp(arg, "hako-koi-v", 10)) {
 				aiAddHistory(data, "hako-koi-v* is queued — real 14B/32B fine-tune lands after a rented-GPU run.");
@@ -11047,7 +13641,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			free(E.ai_model);
 			E.ai_model = strdup(arg);
 			hkSaveSession();
-			aiSayf(data, "model: %s (saved)", E.ai_model);
+			if (!hk_menu_pick) aiSayf(data, "model: %s (saved)", E.ai_model);
 
 			if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM && isatty(STDIN_FILENO)) {
 				char *p = hkMithraeumModelPath(E.ai_model);
@@ -11172,9 +13766,9 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			} },
 			{ "OAuth (subscription / account-bound):", {
 				{ "anthropic",       "Claude Pro/Max — sign in with claude.ai" },
+				{ "chatgpt",         "ChatGPT account — sign in with chatgpt.com" },
 				{ "copilot",         "GitHub Copilot Pro/Business — device flow" },
 				{ "github-models",   "free GitHub Models tier — device flow" },
-				{ "openrouter",      "PKCE — auto-issue OR API key" },
 				{ NULL, NULL }
 			} },
 			{ "Local (no auth):", {
@@ -11185,18 +13779,18 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 #endif
 			{ "Pay-per-token (API key paste):", {
 				{ "anthropic-api",   "Claude API key (separate from sub)" },
-				{ "openai",          "ChatGPT API" },
+				{ "openai",          "OpenAI API key (separate from ChatGPT)" },
 				{ "gemini",          "Google AI Studio — generous free tier" },
 				{ "groq",            "fastest Llama hosting — free tier" },
 				{ "cerebras",        "ultra-fast inference — free tier" },
 				{ "deepseek",        "DeepSeek API" },
 				{ "xai",             "Grok via xAI API (api.x.ai)" },
-				{ "openrouter-api",  "paste existing OR key (vs PKCE issue)" },
+				{ "openrouter",      "many vendors' models, billed by OpenRouter" },
 				{ "mistral, together, fireworks, custom", "more OpenAI-compat" },
 				{ NULL, NULL }
 			} },
 		};
-		const char *active_prov = hkProviderName(E.ai_provider_type);
+		const char *active_prov = hkProviderLabel();
 		const char *active_oauth = E.ai_oauth_provider;
 		for (size_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
 			aiAddHistory(data, groups[g].header);
@@ -11221,13 +13815,16 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				aiAddHistory(data, line);
 			}
 		}
-		aiAddHistory(data, ":login <provider> to authenticate.  :models for model suggestions.");
+		aiAddHistory(data, ":login to sign in, :login api for a key.  :models for model suggestions.");
 		aiAddHistory(data, "(◎ = active, * = saved login)");
 		return 1;
 	}
 	if (strncmp(cmd, "provider", cmdlen) == 0 && cmdlen == 8) {
 		char provpick[32];
-		if ((!arg || !*arg) && hkPickProvider(provpick, sizeof provpick)) arg = provpick;
+		if ((!arg || !*arg) && hkCanPick()) {
+			if (!hkPickProvider(provpick, sizeof provpick)) return 1;
+			arg = provpick; hk_menu_pick = 1;
+		}
 		if (arg && *arg) {
 			enum aiProviderType t = hkParseProvider(arg);
 			if (t == AI_PROVIDER_NONE) {
@@ -11248,7 +13845,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 					aiFlattenMessages(data);
 					int after = data->message_count;
 					pthread_mutex_unlock(&data->lock);
-					if (before != after) {
+					if (before != after && !hk_menu_pick) {
 						aiSayf(data, "(flattened %d tool turn(s) for swap)", before - after);
 					}
 				}
@@ -11256,15 +13853,17 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 				clCredsRestoreFor(hkProviderLabel());
 				clCredsSave();
 				hkSaveSession();
-				char msg[256];
-				snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
-					hkProviderLabel(),
-					hkProviderDefaultEndpoint(arg) ? " endpoint=" : "",
-					hkProviderDefaultEndpoint(arg) ? hkProviderDefaultEndpoint(arg) : "");
-				aiAddHistory(data, msg);
+				if (!hk_menu_pick) {
+					char msg[256];
+					snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
+						hkProviderLabel(),
+						hkProviderDefaultEndpoint(arg) ? " endpoint=" : "",
+						hkProviderDefaultEndpoint(arg) ? hkProviderDefaultEndpoint(arg) : "");
+					aiAddHistory(data, msg);
+				}
 			}
 		} else {
-			aiSayf(data, "provider: %s", hkProviderName(E.ai_provider_type));
+			aiSayf(data, "provider: %s", hkProviderLabel());
 		}
 		return 1;
 	}
@@ -11473,13 +14072,11 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			if (pick < 0) {
 				clThemeApply(was);
 				hkThemeRefreshBar(data);
-				aiAddHistory(data, "theme: unchanged");
 				return 1;
 			}
 			clThemeApply(names[pick]);
 			hkSaveSession();
 			hkThemeRefreshBar(data);
-			aiSayf(data, "theme: %s (saved)", TH_ACTIVE);
 			return 1;
 		}
 		int found = 0;
@@ -11617,25 +14214,61 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			return 1;
 		}
 
-		const char *tunnel = NULL, *tcmd = NULL;
-		if      (system("command -v cloudflared >/dev/null 2>&1") == 0)
-			{ tunnel = "cloudflared"; tcmd = "cloudflared tunnel --url http://127.0.0.1:8787"; }
-		else if (system("command -v tailscale >/dev/null 2>&1") == 0)
-			{ tunnel = "tailscale";   tcmd = "tailscale funnel 8787"; }
-		else if (system("command -v ngrok >/dev/null 2>&1") == 0)
-			{ tunnel = "ngrok";       tcmd = "ngrok http 8787"; }
-
-		aiAddHistory(data, "remote access — run these in another terminal:");
-		aiSayf(data, "  hako --serve --token %s --web ../hako-studio", tok);
-		if (tunnel) {
-			aiSayf(data, "  %s", tcmd);
-			aiSayf(data, "then open the %s URL with  ?t=%s  on the end.", tunnel, tok);
-		} else {
-			aiAddHistory(data, "  (no cloudflared, tailscale or ngrok found — install one for a public URL)");
-			aiSayf(data, "on the same wifi instead: add --lan and open the printed address with ?t=%s", tok);
+		/* Tailscale serve, never funnel: funnel is the public internet. Other
+		   tunnels end TLS at their company, which then reads everything. */
+		char ts[256];
+		ts[0] = '\0';
+#if HK_ATTACH
+		const char *ra = arg ? arg : "";
+		if (!strcmp(ra, "off")) {
+			if (!hs_attached) { aiAddHistory(data, "remote is not on"); return 1; }
+			hsAttachOff();
+			aiAddHistory(data, "remote: off, the link is closed");
+			hkLogMessage("system", "remote off");
+			return 1;
 		}
+		if (!strncmp(ra, "on", 2) && (!ra[2] || ra[2] == ' ')) {
+			if (E.pipe_mode || E.serve_mode || !isatty(STDIN_FILENO)) {
+				aiAddHistory(data, ":remote on shares a terminal session; run it in one");
+				return 1;
+			}
+			int port; const char *tok;
+			if (ra[2] && !hs_attached) hsAttachSetPort(atoi(ra + 3));
+			hsAttachInfo(&port, &tok);
+			if (!hs_attached && !hsAttachOn()) {
+				aiSayf(data, "remote: could not listen on port %d (is a hako --serve running?)", port);
+				return 1;
+			}
+			hsAttachInfo(&port, &tok);
+			hkLogMessage("system", "remote on");
+			aiAddHistory(data, "remote: on, this session is shared until :remote off");
+			int linked = hrStart() && hrLinked();
+			if (linked) aiSayf(data, "  phone:   %s, signed in to your account", hrStudioUrl());
+			if (linked) aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
+			else if (hkTailscaleName(hs_ts_host, sizeof(hs_ts_host), hs_ts_login, sizeof(hs_ts_login))) {
+				aiSayf(data, "  once:    tailscale serve --bg %d", port);
+				if (hs_ts_login[0])
+					aiSayf(data, "  phone:   https://%s   (signed in as %s, nothing to type)", hs_ts_host, hs_ts_login);
+				else
+					aiSayfSecret(data, "  phone:   https://%s/?t=%s", hs_ts_host, tok);
+				aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
+			} else aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
+			aiAddHistory(data, "  every tool asks, \"always\" counts once, and the phone stays in this folder");
+			return 1;
+		}
+#endif
+		aiAddHistory(data, ":remote on shares this session with your phone. or headless, over tailscale:");
+		aiSayfSecret(data, "  1  hako --serve --token %s      (here, in another terminal)", tok);
+		if (hkTailscaleName(ts, sizeof(ts), NULL, 0)) {
+			aiAddHistory(data, "  2  tailscale serve --bg 8787      (private to your tailnet, real https)");
+			aiSayfSecret(data, "  3  on the phone, tailscale on:  https://%s/?t=%s", ts, tok);
+		} else {
+			aiAddHistory(data, "  2  install tailscale on this computer and the phone, sign both in, then :remote again");
+			aiSayfSecret(data, "on the same wifi instead: add --lan and open the printed address with ?t=%s", tok);
+		}
+		aiAddHistory(data, "the phone can prompt and approve, every tool asks, and it cannot turn on auto or leave this folder");
 #ifdef __APPLE__
-		aiAddHistory(data, "macOS drops inbound LAN to unsigned binaries — run `make sign` if a phone cannot connect.");
+		if (!ts[0]) aiAddHistory(data, "macOS drops wifi connections to unsigned binaries: run `make sign` if the phone cannot connect");
 #endif
 		return 1;
 #endif
@@ -11774,7 +14407,7 @@ static int hkHandleSlash(aiData *data, const char *prompt) {
 			return 1;
 		}
 		char msg[256];
-		aiSayf(data, "provider: %s", hkProviderName(E.ai_provider_type));
+		aiSayf(data, "provider: %s", hkProviderLabel());
 		aiSayf(data, "model:    %s", E.ai_model ? E.ai_model : "(unset)");
 		aiSayf(data, "tools:    %s", E.ai_tools_enabled ? "on" : "off");
 		aiSayf(data, "trust:    %s", hkProjectTrusted() ? "granted" : "not granted");
@@ -12182,7 +14815,7 @@ static char *clGhostSuffix(const char *buf, int len) {
 
 static const char *HK_PROVIDER_WORDS[] = {
 	"mithraeum", "anthropic", "anthropic-api", "claude", "claude-api", "openai",
-	"github-copilot", "copilot", "github-models", "ghmodels",
+	"github-copilot", "copilot", "github-models", "ghmodels", "chatgpt", "codex",
 	"ollama", "ollamacloud", "ocloud", "local", "koi",
 	"gemini", "google", "groq", "cerebras", "deepseek", "mistral",
 	"together", "fireworks", "openrouter", "openrouter-api",
@@ -13120,6 +15753,114 @@ static int clOAuthOpenRouter(aiData *data) {
 #endif
 }
 
+/* A ChatGPT account over the Codex sign-in. OpenAI's device flow, not RFC 8628:
+   the poll answers 403/404 until the user approves, then hands back a PKCE
+   code + verifier that are exchanged like a normal authorization code. */
+#define HAKO_CHATGPT_CLIENT_ID    "app_EMoamEEZ73f0CkXaXp7hrann"
+#define HAKO_CHATGPT_ISSUER       "https://auth.openai.com"
+
+static int hkChatGPTStore(const char *resp) {
+	char *access = hkExtractJsonString(resp, "access_token");
+	if (!access) return -1;
+	char *refresh = hkExtractJsonString(resp, "refresh_token");
+	free(E.ai_api_key); E.ai_api_key = access;
+	if (refresh) { free(E.ai_oauth_refresh); E.ai_oauth_refresh = refresh; }
+	free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("chatgpt");
+	char *pl = hkJwtPayload(access);
+	int exp = pl ? hkExtractJsonInt(pl, "exp") : -1;
+	int ttl = hkExtractJsonInt(resp, "expires_in");
+	free(pl);
+	E.ai_oauth_expires_at = exp > 0 ? exp - 120 : ttl > 0 ? hk_time_unix() + ttl - 120 : 0;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	return 0;
+}
+
+static int clOAuthChatGPT(aiData *data) {
+	char *resp = clCurlPost(HAKO_CHATGPT_ISSUER "/api/accounts/deviceauth/usercode",
+	                        "{\"client_id\":\"" HAKO_CHATGPT_CLIENT_ID "\"}", NULL);
+	if (!resp) { aiAddHistory(data, "ChatGPT: device request failed (network?)"); return -1; }
+	char *dev = hkExtractJsonString(resp, "device_auth_id");
+	char *code = hkExtractJsonString(resp, "user_code");
+	if (!code) code = hkExtractJsonString(resp, "usercode");
+	int interval = hkExtractJsonInt(resp, "interval");
+	if (!dev || !code) {
+		char *err = aiExtractApiError(resp);
+		aiSayf(data, "ChatGPT: %s", err ? err : "unexpected device response");
+		free(err); free(resp); free(dev); free(code);
+		return -1;
+	}
+	free(resp);
+	if (interval < 3) interval = 5;
+
+	aiAddHistory(data, "Visit: " HAKO_CHATGPT_ISSUER "/codex/device");
+	aiSayf(data, "Code:  %s", code);
+	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
+	clOpenUrl(HAKO_CHATGPT_ISSUER "/codex/device");
+
+	char poll[512];
+	snprintf(poll, sizeof(poll), "{\"device_auth_id\":\"%s\",\"user_code\":\"%s\"}", dev, code);
+	free(dev); free(code);
+	long start = hk_time_unix();
+	char *got = NULL;
+	while (!E.interrupt && hk_time_unix() - start < 900) {
+		sleep(interval);
+		char *tr = clCurlPost(HAKO_CHATGPT_ISSUER "/api/accounts/deviceauth/token", poll, NULL);
+		if (tr && strstr(tr, "\"authorization_code\"")) { got = tr; break; }
+		free(tr);
+	}
+	if (!got) { aiAddHistory(data, "ChatGPT: timed out / aborted"); return -1; }
+	char *ac = hkExtractJsonString(got, "authorization_code");
+	char *cv = hkExtractJsonString(got, "code_verifier");
+	free(got);
+	if (!ac || !cv) {
+		aiAddHistory(data, "ChatGPT: approval came back without a code");
+		free(ac); free(cv); return -1;
+	}
+
+	char ac_enc[1024], cv_enc[256], form[2048];
+	clUrlEncodeInto(ac, ac_enc, sizeof(ac_enc));
+	clUrlEncodeInto(cv, cv_enc, sizeof(cv_enc));
+	free(ac); free(cv);
+	if (!hkFmtFits(form, sizeof(form),
+		"grant_type=authorization_code&code=%s"
+		"&redirect_uri=https%%3A%%2F%%2Fauth.openai.com%%2Fdeviceauth%%2Fcallback"
+		"&client_id=" HAKO_CHATGPT_CLIENT_ID "&code_verifier=%s", ac_enc, cv_enc)) {
+		aiAddHistory(data, "ChatGPT: authorization code too long");
+		return -1;
+	}
+	hkHttpReq ex = { .method = "POST", .url = HAKO_CHATGPT_ISSUER "/oauth/token",
+	                 .headers = "-H 'Content-Type: application/x-www-form-urlencoded'", .body = form };
+	char *tok = hk_http_fetch(&ex);
+	hkApplyProviderAlias("chatgpt");
+	if (!tok || hkChatGPTStore(tok) != 0) {
+		char *err = tok ? aiExtractApiError(tok) : NULL;
+		aiSayf(data, "ChatGPT: token exchange failed%s%s", err ? ": " : "", err ? err : "");
+		free(err); free(tok);
+		return -1;
+	}
+	free(tok);
+	aiAddHistory(data, "ChatGPT: signed in. Calls count against your ChatGPT plan's usage limits.");
+	hkHealModelForProvider(data);
+	return 0;
+}
+
+static int clOAuthChatGPTRefresh(aiData *data) {
+	if (!E.ai_oauth_refresh) return -1;
+	size_t cap = strlen(E.ai_oauth_refresh) + 192;
+	char *body = malloc(cap);
+	if (!body) return -1;
+	snprintf(body, cap, "{\"client_id\":\"" HAKO_CHATGPT_CLIENT_ID "\",\"grant_type\":\"refresh_token\","
+		"\"refresh_token\":\"%s\",\"scope\":\"openid profile email\"}", E.ai_oauth_refresh);
+	char *tr = clCurlPost(HAKO_CHATGPT_ISSUER "/oauth/token", body, NULL);
+	free(body);
+	int rc = tr ? hkChatGPTStore(tr) : -1;
+	free(tr);
+	if (rc != 0 && data) aiAddHistory(data, "ChatGPT: sign-in expired; run :login chatgpt again");
+	return rc;
+}
+
 static int clOAuthCopilotExchange(aiData *data) {
 	if (!E.ai_oauth_refresh) return -1;
 	char hdr[512];
@@ -13455,6 +16196,7 @@ static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec) {
 static int clOAuthRefresh(aiData *data) {
 	if (!E.ai_oauth_provider) return -1;
 	if (!strcmp(E.ai_oauth_provider, "github-copilot")) return clOAuthCopilotExchange(data);
+	if (!strcmp(E.ai_oauth_provider, "chatgpt")) return clOAuthChatGPTRefresh(data);
 	if (strcmp(E.ai_oauth_provider, "anthropic") != 0) return -1;
 	if (!E.ai_oauth_refresh) return -1;
 	const char *client_id = clOAuthClientId("anthropic");
@@ -13844,6 +16586,11 @@ static int clPopupSelectLive(const char *title, const char **items, int n,
 	int had_bar = cl_bar_h != 0;
 	if (had_bar) { cl_field_rows = 1; clBarHide(); }
 	int want_bar = (had_bar || cl_bar_want) && clBarUsable();
+#if HK_ATTACH
+	/* :remote on: the phone gets the same menu; an approval arms its own. */
+	int phone_too = hs_attached && !hs_answer_armed && hkEmitChoiceRequest(title, items, n);
+	if (phone_too) hs_answer_armed = 1;
+#endif
 
 	int *vis = malloc(sizeof(int) * (size_t)n);
 	if (!vis) { if (had_bar) clBarShow(&G_AI); return -1; }
@@ -14019,8 +16766,13 @@ static int clPopupSelectLive(const char *title, const char **items, int n,
 	read_key:
 		if (want_bar) { putchar('\n'); fflush(stdout); clBarShow(&G_AI); }
 		char c;
-		ssize_t got = read(STDIN_FILENO, &c, 1);
+		ssize_t got;
+#if HK_ATTACH
+		if (hs_answer_armed && hs_wake[0] >= 0 && hkWaitKeyOrWake()) got = -3; else
+#endif
+		got = read(STDIN_FILENO, &c, 1);
 		if (want_bar) { clBarHide(); fputs("\x1b[A", stdout); fflush(stdout); }   /* back onto the hint row; flushed, the teardown below uses write() */
+		if (got == -3) { result = -3; break; }      /* answered on the phone */
 		if (got != 1) { result = -1; break; }
 		if (c == 3) { result = -1; break; }
 		if (c == '\r' || c == '\n') {
@@ -14070,6 +16822,9 @@ static int clPopupSelectLive(const char *title, const char **items, int n,
 	{ char up[16]; int k = snprintf(up, sizeof up, "\r\x1b[%dA", prev_rows + CHROME); if (write(STDOUT_FILENO, up, k) < 0) {} }
 	for (int i = 0; i < prev_rows + CHROME + 1; i++) { if (write(STDOUT_FILENO, "\x1b[2K\n", 5) < 0) {} }
 	{ char up[16]; int k = snprintf(up, sizeof up, "\x1b[%dA\r", prev_rows + CHROME + 1); if (write(STDOUT_FILENO, up, k) < 0) {} }
+#if HK_ATTACH
+	if (phone_too) { hs_answer_armed = 0; result = hsAttachSettleChoice(result, items, n); }
+#endif
 	return result;
 }
 
@@ -14444,6 +17199,9 @@ static void clComposeWhileBusy(aiData *data, const char *prompt) {
 		cl_bar_want = 1;
 		if (!cl_bar_h) clBarShow(data);
 		int qn = clReadLineRaw(prompt, qline, sizeof(qline));
+		/* it pointed at the reader's own stack buffer, gone now: output printed
+		   before the next read would redraw from dead memory (ASan, harness §queue) */
+		cl_line_buf = NULL;
 		if (qn == -5) break;                        /* the turn finished */
 		if (qn == -6) {                             /* the worker is asking the user */
 			cl_field_rows = 1;
@@ -14520,7 +17278,7 @@ static void clEmitJsonResult(aiData *data, int ok, const char *err) {
 	hkJsonEscapeInto(body, esc, (int)cap);
 	char mesc[256], pesc[64];
 	hkJsonEscapeInto(E.ai_model ? E.ai_model : "", mesc, (int)sizeof(mesc));
-	hkJsonEscapeInto(hkProviderName(E.ai_provider_type), pesc, (int)sizeof(pesc));
+	hkJsonEscapeInto(hkProviderLabel(), pesc, (int)sizeof(pesc));
 	printf("{\"ok\":%s,\"%s\":\"%s\",\"provider\":\"%s\",\"model\":\"%s\","
 	       "\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d},\"session\":\"%s\","
 	       "\"version\":\"%s\"}\n",
@@ -14601,7 +17359,7 @@ static int clBenchMode(aiData *data, const char *suite_path) {
 	int t1 = 0, t2 = 0;
 	long began = hk_time_ms();
 	printf("{\"suite\":\"%s\",\"provider\":\"%s\",\"model\":\"%s\",\"tasks\":[\n",
-	       suite_path, hkProviderName(E.ai_provider_type), E.ai_model ? E.ai_model : "");
+	       suite_path, hkProviderLabel(), E.ai_model ? E.ai_model : "");
 
 	for (int i = 0; i < n; i++) {
 		hk_bench_calls = 0;
@@ -14720,6 +17478,23 @@ static int hkSlashNeedsTerminal(const char *cmd) {
 	return 0;
 }
 
+/* What a remote client may never do: widen permissions or reach past this folder. */
+static int hkSlashRefusedRemote(const char *cmd) {
+	if (!hs_remote) return 0;
+	while (*cmd == ':' || *cmd == '/') cmd++;
+	static const char *widen[] = { "auto", "trust", "mcp", "skill install", "remote", NULL };
+	for (int i = 0; widen[i]; i++) {
+		size_t n = strlen(widen[i]);
+		if (!strncmp(cmd, widen[i], n) && (!cmd[n] || cmd[n] == ' ')) return 1;
+	}
+	if (!strncmp(cmd, "mode", 4) && (!cmd[4] || cmd[4] == ' ')) {
+		const char *a = cmd + 4;
+		while (*a == ' ') a++;
+		return strcmp(a, "ask") != 0 && strcmp(a, "plan") != 0;
+	}
+	return 0;
+}
+
 static void clPipeBegin(aiData *data) {
 	clPipeEmitInit();
 	if (E.session_resumed && data->history_count == 0)
@@ -14763,14 +17538,27 @@ static int clPipeHandleLine(aiData *data, const char *line) {
 			free(type);
 			return 0;
 		}
+		if (cmd && E.serve_mode && hkSlashRefusedRemote(cmd)) {
+			clPipeEmitMsg("system",
+				"not from a remote device: only the desktop terminal can widen what the agent may do");
+			clPipeEmitDone(NULL);
+			free(cmd);
+			free(type);
+			return 0;
+		}
 		if (cmd) {
 			char *pfx = NULL;
 			if (cmd[0] != ':' && cmd[0] != '/') {
 				pfx = malloc(strlen(cmd) + 2);
 				if (pfx) { pfx[0] = ':'; strcpy(pfx + 1, cmd); }
 			}
+			char was_p[48], was_m[160];
+			snprintf(was_p, sizeof was_p, "%s", hkProviderLabel());
+			snprintf(was_m, sizeof was_m, "%s", E.ai_model ? E.ai_model : "");
 			int r = hkHandleSlash(data, pfx ? pfx : cmd);
 			if (!r) clPipeEmitMsg("system", "unknown command");
+			if (strcmp(was_p, hkProviderLabel()) || strcmp(was_m, E.ai_model ? E.ai_model : ""))
+				clPipeEmitState();
 			free(pfx);
 			free(cmd);
 			clPipeEmitDone(NULL);
@@ -15279,8 +18067,27 @@ static void hsServeHistory(int fd, const char *sid) {
 	free(b.buf);
 }
 
+static char hs_root[PATH_MAX];
+static volatile time_t hs_last_seen;      /* last request that was not the event stream */
+
+/* A remote client stays inside the folder hako --serve was started in. */
+static int hsInRoot(const char *path) {
+	if (!hs_remote) return 1;
+	const char *p = path && *path ? path : ".";
+	char real[PATH_MAX];
+	if (!realpath(p, real)) {             /* not made yet (mkdir): judge the name */
+		if (strstr(p, "..")) return 0;
+		if (p[0] != '/') return 1;
+		snprintf(real, sizeof(real), "%s", p);
+	}
+	size_t n = strlen(hs_root);
+	if (n <= 1) return 1;
+	return !strncmp(real, hs_root, n) && (real[n] == '\0' || real[n] == '/');
+}
+
 static void hsServeDirs(int fd, const char *path) {
 	char real[PATH_MAX];
+	if (!hsInRoot(path)) path = hs_root;
 	if (!realpath(path && *path ? path : ".", real)) snprintf(real, sizeof(real), "%s", path ? path : ".");
 
 	hsBuf b = {0};
@@ -15445,7 +18252,7 @@ static void hsServeModels(int fd, const char *search_csv) {
 		}
 	}
 	hsPut(&b, "],\"provider\":\"");
-	hsPutEsc(&b, hkProviderName(E.ai_provider_type));
+	hsPutEsc(&b, hkProviderLabel());
 	hsPut(&b, "\",\"model\":\"");
 	hsPutEsc(&b, E.ai_model ? E.ai_model : "");
 	hsPut(&b, "\"}");
@@ -15507,9 +18314,9 @@ static void hsServeState(int fd) {
 	hsPutEsc(&b, cwd);
 	hsPut(&b, "\",\"home\":\"");
 	const char *home = getenv("HOME") ? getenv("HOME") : "/";
-	hsPutEsc(&b, home);
+	hsPutEsc(&b, hs_remote ? hs_root : home);     /* a phone browses from the project, not ~ */
 	hsPut(&b, "\",\"places\":[");
-	{
+	if (!hs_remote) {
 		static const struct { const char *label, *rel; } PL[] = {
 			{ "home",         ""                                            },
 			{ "iCloud Drive", "/Library/Mobile Documents/com~apple~CloudDocs" },
@@ -15564,8 +18371,8 @@ static void hsServeState(int fd) {
 	hsPutEsc(&b, E.ai_model ? E.ai_model : "");
 	hsPut(&b, "\",\"session\":\"");
 	hsPutEsc(&b, E.session_id ? E.session_id : "");
-	hsPutFmt(&b, "\",\"turns\":%d,\"busy\":%d,\"yolo\":%d,\"awaiting_input\":%d,\"awaiting_answer\":%d,\"input_hidden\":%d,\"input_prompt\":\"",
-	         E.session_turn_count, HS.busy, E.ai_auto_approve, HS.input_waiting, HS.answer_waiting, HS.input_hidden);
+	hsPutFmt(&b, "\",\"turns\":%d,\"busy\":%d,\"remote\":%d,\"yolo\":%d,\"awaiting_input\":%d,\"awaiting_answer\":%d,\"input_hidden\":%d,\"input_prompt\":\"",
+	         E.session_turn_count, HS.busy || (hs_attached && G_AI.streaming), hs_remote, E.ai_auto_approve && !hs_remote, HS.input_waiting, HS.answer_waiting, HS.input_hidden);
 	hsPutEsc(&b, HS.input_prompt);
 	hsPut(&b, "\",\"caps\":[");
 	static const char *caps[] = {
@@ -15573,8 +18380,9 @@ static void hsServeState(int fd) {
 		"dirs", "files", "upload", "models", "providers", "places", "find", "link", "open", "rename", "delete",
 		"mkdir", "shell", NULL
 	};
-	for (int i = 0; caps[i]; i++) {
-		hsPut(&b, i ? ",\"" : "\"");
+	for (int i = 0, n = 0; caps[i]; i++) {
+		if (hs_remote && (!strcmp(caps[i], "places") || !strcmp(caps[i], "find"))) continue;
+		hsPut(&b, n++ ? ",\"" : "\"");
 		hsPut(&b, caps[i]);
 		hsPut(&b, "\"");
 	}
@@ -15583,7 +18391,14 @@ static void hsServeState(int fd) {
 	free(b.buf);
 }
 
+static void hsServeEventsLoop(int fd);
 static void hsServeEvents(int fd) {
+	__sync_fetch_and_add(&hs_streams, 1);
+	hsServeEventsLoop(fd);
+	__sync_fetch_and_sub(&hs_streams, 1);
+}
+
+static void hsServeEventsLoop(int fd) {
 	const char *head =
 		"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
 		"Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
@@ -15602,6 +18417,7 @@ static void hsServeEvents(int fd) {
 			struct timespec ts;
 			clock_gettime(CLOCK_REALTIME, &ts);
 			ts.tv_sec += 15;
+			if (hs_listen_stop) { pthread_mutex_unlock(&HS.ring_lock); return; }
 			if (pthread_cond_timedwait(&HS.ring_cond, &HS.ring_lock, &ts) == ETIMEDOUT) {
 				pthread_mutex_unlock(&HS.ring_lock);
 				if (hsWriteAll(fd, ":ka\n\n", 5) != 0) return;
@@ -15664,7 +18480,105 @@ static void hsServeIndex(int fd) {
 #endif
 }
 
+#if HK_ATTACH
+/* Lines from the phone wait here for the terminal's main loop, which runs them
+   exactly like typed ones. The reader is woken only while it waits for a line. */
+#define HS_INJECT_MAX 16
+static char *hs_inject[HS_INJECT_MAX];
+static int hs_inject_n;
+static pthread_mutex_t hs_inject_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void hsInjectPush(const char *line) {
+	pthread_mutex_lock(&hs_inject_lock);
+	int ok = hs_inject_n < HS_INJECT_MAX;
+	if (ok) hs_inject[hs_inject_n++] = strdup(line);
+	pthread_mutex_unlock(&hs_inject_lock);
+	if (!ok) { clPipeEmitMsg("system", "16 lines are already waiting on the desktop"); return; }
+	if (hk_line_wait && g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
+}
+
+static int hkInjectTake(char *out, size_t cap) {
+	pthread_mutex_lock(&hs_inject_lock);
+	int got = hs_inject_n > 0;
+	if (got) {
+		snprintf(out, cap, "%s", hs_inject[0]);
+		free(hs_inject[0]);
+		memmove(hs_inject, hs_inject + 1, sizeof(hs_inject[0]) * (size_t)(--hs_inject_n));
+	}
+	pthread_mutex_unlock(&hs_inject_lock);
+	return got;
+}
+
+/* The terminal popup closed: say who answered. -3 = the phone did. */
+static int hsAttachSettle(int pick) {
+	char ans[8] = {0};
+	pthread_mutex_lock(&HS.a_lock);
+	if (HS.answer_ready) snprintf(ans, sizeof(ans), "%s", HS.answer);
+	HS.answer_ready = HS.answer_waiting = 0;
+	pthread_mutex_unlock(&HS.a_lock);
+	if (pick == -3) {
+		hkLogMessage("system", "approval answered on a remote device");
+		return (ans[0] == 'y' || ans[0] == 'Y' || ans[0] == 'a' || ans[0] == 'A') ? 0 : 1;
+	}
+	char d[16];
+	while (read(hs_wake[0], d, sizeof(d)) > 0) {}     /* a late phone answer must not close the next popup */
+	if (HS.pending_tool_id) {
+		char line[128];
+		snprintf(line, sizeof(line), "{\"type\":\"tool_decision\",\"id\":%ld,\"answer\":\"%c\"}",
+		         HS.pending_tool_id, pick == 0 ? 'y' : 'n');
+		hkServePush(line);
+		HS.pending_tool_id = 0;
+	}
+	return pick;
+}
+
+/* Same for a menu: -3 = the phone picked (its 1-based index, or 0 = cancel). */
+static int hsAttachSettleChoice(int pick, const char **items, int n) {
+	char ans[8] = {0};
+	pthread_mutex_lock(&HS.a_lock);
+	if (HS.answer_ready) snprintf(ans, sizeof(ans), "%s", HS.answer);
+	HS.answer_ready = HS.answer_waiting = 0;
+	pthread_mutex_unlock(&HS.a_lock);
+	if (pick == -3) {
+		hkLogMessage("system", "choice answered on a remote device");
+		return hkChoiceIndex(ans, items, n);
+	}
+	char d[16];
+	while (read(hs_wake[0], d, sizeof(d)) > 0) {}
+	if (HS.pending_choice_id) {
+		char line[96];
+		snprintf(line, sizeof(line), "{\"type\":\"choice_decision\",\"id\":%ld}", HS.pending_choice_id);
+		hkServePush(line);
+		HS.pending_choice_id = 0;
+	}
+	return pick;
+}
+
+static int hsRouteToTerminal(const char *type, const char *value) {
+	if (!hs_attached) return 0;
+	if (!strcmp(type, "open")) {
+		clPipeEmitMsg("system", "a shared terminal session keeps its folder");
+		return 1;
+	}
+	if (strcmp(type, "prompt") != 0 && strcmp(type, "slash") != 0) return 0;
+	if (!value || !*value) return 1;
+	char line[4096];
+	int cmd = !strcmp(type, "slash") || value[0] == ':' || value[0] == '/';
+	snprintf(line, sizeof(line), "%s%s", cmd && value[0] != ':' && value[0] != '/' ? ":" : "", value);
+	if (cmd && hkSlashRefusedRemote(line))
+		clPipeEmitMsg("system", "not from a remote device: only the desktop terminal can widen what the agent may do");
+	else if (cmd && hkIsMenuCommand(line))
+		clPipeEmitMsg("system", "menus open at the desktop. here, use the studio's menus or give the name (:model <id>)");
+	else
+		hsInjectPush(line);
+	return 1;
+}
+#endif
+
 static void hsEnqueueCmd(const char *type, const char *field, const char *value) {
+#if HK_ATTACH
+	if (hsRouteToTerminal(type, value)) return;
+#endif
 	size_t cap = (value ? strlen(value) : 0) * 6 + 128;
 	char *esc = malloc(cap), *line = NULL;
 	if (!esc) return;
@@ -15711,8 +18625,41 @@ static int hsAuthOk(const char *req) {
 	return 0;
 }
 
+/* The owner's own device through tailscale serve: it connects from loopback,
+   names this machine's tailnet host, and carries the identity header serve
+   sets (and strips from what the client sent). A LAN peer cannot forge it,
+   since it does not come from loopback. */
+static int hsTailnetOwner(int fd, const char *req) {
+	if (!hs_ts_login[0] || !hs_ts_host[0]) return 0;
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof ss;
+	if (getpeername(fd, (struct sockaddr *)&ss, &sl) != 0) return 0;
+	if (ss.ss_family == AF_INET) {
+		if ((ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr) >> 24) != 127) return 0;
+	} else if (ss.ss_family == AF_INET6) {
+		if (!IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)&ss)->sin6_addr)) return 0;
+	} else return 0;
+	const char *h = strcasestr(req, "\r\nHost:");
+	if (!h) return 0;
+	h += 7;
+	while (*h == ' ') h++;
+	size_t hl = strlen(hs_ts_host);
+	if (strncasecmp(h, hs_ts_host, hl) != 0 || (h[hl] != '\r' && h[hl] != ':')) return 0;
+	const char *u = strcasestr(req, "\r\nTailscale-User-Login:");
+	if (!u) return 0;
+	u += 24;
+	while (*u == ' ') u++;
+	size_t ul = strlen(hs_ts_login);
+	return strncmp(u, hs_ts_login, ul) == 0 && u[ul] == '\r';
+}
+
+/* A connection the relay link made (a socketpair end): Noise already proved
+   the sender holds the account key, so the token and host checks do not apply. */
+#define HS_TRUSTED ((intptr_t)1 << 30)
+
 static void *hsConnThread(void *arg) {
-	int fd = (int)(intptr_t)arg;
+	int trusted = ((intptr_t)arg & HS_TRUSTED) != 0;
+	int fd = (int)((intptr_t)arg & ~HS_TRUSTED);
 	char req[8192];
 	size_t used = 0;
 
@@ -15734,7 +18681,7 @@ static void *hsConnThread(void *arg) {
 
 	/* A tunnel makes this reachable from anywhere, and the agent runs tools as
 	   the user. The token is what stands between a URL and a shell. */
-	if (HS.token[0] && !hsAuthOk(req)) {
+	if (!trusted && HS.token[0] && !hsAuthOk(req) && !hsTailnetOwner(fd, req)) {
 		const char *t = strstr(req, "?t=");
 		if (t && !strncmp(req, "GET ", 4) && !strncmp(t + 3, HS.token, strlen(HS.token))) {
 			/* Hand it to the browser as a cookie and get it out of the URL, so
@@ -15761,8 +18708,10 @@ static void *hsConnThread(void *arg) {
 	/* With a token the request already proved itself (its cookie is SameSite=
 	   Strict, so no other site can send it). Without one, only a local page may
 	   write, and only a local name may read. */
+	if (strncmp(req, "GET /api/events", 15) != 0) hs_last_seen = time(NULL);
+
 	int is_post = (strncmp(req, "POST ", 5) == 0);
-	if (!HS.token[0] && ((is_post && !hsOriginOk(req)) || !hsHostOk(req))) {
+	if (!trusted && !HS.token[0] && ((is_post && !hsOriginOk(req)) || !hsHostOk(req))) {
 		hsSend(fd, "403 Forbidden", "text/plain", "cross-origin denied\n", 20);
 		hs_close(fd);
 		return NULL;
@@ -15792,7 +18741,7 @@ static void *hsConnThread(void *arg) {
 		hsQueryParam(req, "child", child, sizeof(child));
 		hsBuf b = {0};
 		hsPut(&b, "{\"candidates\":[");
-		if (name[0] && !strchr(name, '/')) {
+		if (name[0] && !strchr(name, '/') && !hs_remote) {
 			const char *home = getenv("HOME");
 			char cwd[PATH_MAX];
 			if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
@@ -15812,34 +18761,33 @@ static void *hsConnThread(void *arg) {
 		hsSendJson(fd, b.buf ? b.buf : "{\"candidates\":[]}");
 		free(b.buf);
 	} else if (!strncmp(req, "GET /api/providers", 18)) {
-		static const struct { const char *name, *kind, *desc; } P[] = {
-			{ "mithraeum",      "local",  "hako family — runs on this machine" },
-			{ "anthropic",      "oauth",  "Claude Pro/Max — sign in with claude.ai" },
-			{ "copilot",        "oauth",  "GitHub Copilot Pro/Business" },
-			{ "github-models",  "oauth",  "free GitHub Models tier" },
-			{ "openrouter",     "oauth",  "PKCE — auto-issue OR API key" },
-			{ "ollama",         "local",  "run `ollama serve` first" },
-			{ "ollamacloud",    "local",  "hosted Ollama" },
-			{ "anthropic-api",  "key",    "Claude API key" },
-			{ "openai",         "key",    "ChatGPT API" },
-			{ "gemini",         "key",    "Google AI Studio — generous free tier" },
-			{ "groq",           "key",    "fastest Llama hosting — free tier" },
-			{ "cerebras",       "key",    "ultra-fast inference — free tier" },
-			{ "deepseek",       "key",    "DeepSeek API" },
-			{ "xai",            "key",    "Grok via xAI API" },
-			{ "mistral",        "key",    "OpenAI-compat" },
-			{ "together",       "key",    "OpenAI-compat" },
-			{ "fireworks",      "key",    "OpenAI-compat" },
-			{ NULL, NULL, NULL }
+		/* The same rows :login shows, so the studio's menu cannot drift from the CLI's. */
+		static struct { const char *name, *kind; char desc[96]; } P[40];
+		int np = 0;
+		static const char *LOCAL[][2] = {
+			{ "mithraeum", "hako family, runs on this machine" },
+			{ "ollama", "run `ollama serve` first" },
 		};
+		for (int i = 0; i < 2; i++) { P[np].name = LOCAL[i][0]; P[np].kind = "local"; snprintf(P[np].desc, sizeof P[np].desc, "%s", LOCAL[i][1]); np++; }
+		for (int i = 0; i < HK_NSIGNIN; i++) {
+			if (!strcmp(HK_SIGNIN[i].id, "api")) continue;
+			P[np].name = HK_SIGNIN[i].id; P[np].kind = "oauth";
+			snprintf(P[np].desc, sizeof P[np].desc, "%s · %s", HK_SIGNIN[i].name, HK_SIGNIN[i].what); np++;
+		}
+		for (int i = 0; i < HK_NKEYS; i++) {
+			if (!strcmp(HK_KEYS[i].id, "custom")) continue;
+			P[np].name = HK_KEYS[i].id; P[np].kind = "key";
+			snprintf(P[np].desc, sizeof P[np].desc, "%s · %s", HK_KEYS[i].name, HK_KEYS[i].what); np++;
+		}
+		P[np].name = NULL;
 		const char *active = hkProviderLabel();
 		hsBuf b = {0};
 		hsPut(&b, "{\"active\":\"");
 		hsPutEsc(&b, active ? active : "");
 		hsPut(&b, "\",\"providers\":[");
 		for (int i = 0; P[i].name; i++) {
-			clCred *c = clCredsFind(P[i].name);
-			int saved = c && (c->api_key || c->oauth_refresh);
+			int saved = !strcmp(P[i].kind, "oauth") ? hkSignedIn(P[i].name)
+			          : !strcmp(P[i].kind, "key")   ? hkKeySaved(P[i].name) : 0;
 			hsPut(&b, i ? ",{\"name\":\"" : "{\"name\":\"");
 			hsPutEsc(&b, P[i].name);
 			hsPut(&b, "\",\"kind\":\"");
@@ -15877,6 +18825,9 @@ static void *hsConnThread(void *arg) {
 	} else if (!strncmp(req, "POST /api/approve", 17)) {
 		char *body = hsReadBody(fd, req, used);
 		int took = hsAnswerSet(body && *body ? body : "n");
+#if HK_ATTACH
+		if (took && hs_attached && hs_answer_armed && write(hs_wake[1], "x", 1) < 0) {}
+#endif
 		if (took && HS.pending_tool_id) {
 			char line[128];
 			snprintf(line, sizeof(line), "{\"type\":\"tool_decision\",\"id\":%ld,\"answer\":\"%c\"}",
@@ -15912,7 +18863,9 @@ static void *hsConnThread(void *arg) {
 		}
 	} else if (!strncmp(req, "POST /api/mkdir", 15)) {
 		char *body = hsReadBody(fd, req, used);
-		int ok = body && *body && !strstr(body, "..") && hk_fs_mkdirp(body) == 0;
+		int ok = body && *body && !strstr(body, "..")
+		      && hsInRoot(body)
+		      && hk_fs_mkdirp(body) == 0;
 		free(body);
 		hsSendOk(fd, ok);
 	} else if (!strncmp(req, "POST /api/input", 15)) {
@@ -15921,15 +18874,20 @@ static void *hsConnThread(void *arg) {
 		free(body);
 		hsSendOk(fd, 1);
 	} else if (!strncmp(req, "POST /api/stop", 14)) {
-		E.interrupt = 1;
+		hkAbortTurn();                  /* as ^C: a local engine mid-prefill never reads the flag */
 		hsReleaseWaits();
 		hsSendOk(fd, 1);
 	} else if (!strncmp(req, "POST /api/open", 14) || !strncmp(req, "POST /api/restart", 17)) {
 		char *body = hsReadBody(fd, req, used);
-		hsRingReset();
-		hsEnqueueCmd("open", "dir", body ? body : "");
-		free(body);
-		hsSendOk(fd, 1);
+		if (!hsInRoot(body ? body : "")) {
+			free(body);
+			hsSendOk(fd, 0);
+		} else {
+			hsRingReset();
+			hsEnqueueCmd("open", "dir", body ? body : "");
+			free(body);
+			hsSendOk(fd, 1);
+		}
 	} else if (!strncmp(req, "POST /api/reset", 15)) {
 		hsRingReset();
 		hsSendOk(fd, 1);
@@ -15986,10 +18944,44 @@ static void *hsConnThread(void *arg) {
 	return NULL;
 }
 
+/* Remote reach is not left open by accident: two hours with nothing from a
+   device and --serve --token stops. HAKO_REMOTE_IDLE=<minutes>, 0 = never. */
+
+#if HK_ATTACH
+static void hsAttachOff(void);
+#endif
+
+static void *hsIdleThread(void *arg) {
+	long mins = (long)(intptr_t)arg;
+	for (;;) {
+		sleep(30);
+		if (!E.serve_mode && !hs_attached) return NULL;
+		if (HS.busy || G_AI.streaming || HS.answer_waiting || HS.input_waiting) { hs_last_seen = time(NULL); continue; }
+		if (time(NULL) - hs_last_seen >= mins * 60) {
+#if HK_ATTACH
+			if (hs_attached) {
+				hsAttachOff();
+				aiSayf(&G_AI, "remote: idle for %ld min, off. :remote on to share again", mins);
+				return NULL;
+			}
+#endif
+			fprintf(stderr, "\nhako: remote idle for %ld min, stopped. run it again to reconnect\n", mins);
+			fflush(stderr);
+			exit(0);
+		}
+	}
+	return NULL;
+}
+
 static void *hsAcceptThread(void *arg) {
 	int srv = (int)(intptr_t)arg;
 	for (;;) {
 		int fd = (int)accept(srv, NULL, NULL);
+		if (hs_listen_stop) {               /* :remote off woke us with a connect */
+			if (fd >= 0) hs_close(fd);
+			hs_close(srv);
+			return NULL;
+		}
 		if (fd < 0) {
 			int e = hs_errno();
 			if (E.debug) fprintf(stderr, "[serve] accept errno=%d\n", e);
@@ -16004,6 +18996,499 @@ static void *hsAcceptThread(void *arg) {
 	fprintf(stderr, "hako: listener stopped (error %d)\n", hs_errno());
 	return NULL;
 }
+
+static int hsOpenListener(void) {
+	int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
+	if (srv < 0) { fprintf(stderr, "hako: socket failed (error %d)\n", hs_errno()); return -1; }
+	int yes = 1;
+	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port   = htons((uint16_t)HS.port);
+	if (inet_pton(AF_INET, HS.bind_addr, &sa.sin_addr) != 1) {
+		fprintf(stderr, "hako: bad bind address %s\n", HS.bind_addr);
+		hs_close(srv);
+		return -1;
+	}
+	if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		fprintf(stderr, "hako: bind %s:%d failed (error %d)\n", HS.bind_addr, HS.port, hs_errno());
+		hs_close(srv);
+		return -1;
+	}
+	listen(srv, 16);
+	return srv;
+}
+
+static int hsStartThreads(int srv) {
+	pthread_t acc;
+	if (pthread_create(&acc, NULL, hsAcceptThread, (void *)(intptr_t)srv) != 0) {
+		fprintf(stderr, "hako: cannot start listener thread\n");
+		hs_close(srv);
+		return -1;
+	}
+	pthread_detach(acc);
+	if (hs_remote) {
+		const char *iv = getenv("HAKO_REMOTE_IDLE");
+		long mins = iv && *iv ? atol(iv) : 120;
+		pthread_t idle;
+		hs_last_seen = time(NULL);
+		if (mins > 0 && pthread_create(&idle, NULL, hsIdleThread, (void *)(intptr_t)mins) == 0)
+			pthread_detach(idle);
+	}
+	return 0;
+}
+
+#if HK_ATTACH
+static void hsAttachInfo(int *port, const char **token) { *port = HS.port; *token = HS.token; }
+static void hsAttachSetPort(int port) { if (port > 0 && port < 65536) HS.port = port; }
+
+/* :remote on. The same listener and gates as --serve --token, inside this session. */
+static int hsAttachOn(void) {
+	if (hs_attached) return 1;
+	if (!hkRandomToken(HS.token, 24, "abcdefghijklmnopqrstuvwxyz0123456789")) return 0;
+	char cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof(cwd)) || !realpath(cwd, hs_root)) return 0;
+	if (pipe(hs_wake) != 0) return 0;
+	fcntl(hs_wake[0], F_SETFL, O_NONBLOCK);
+	fcntl(hs_wake[1], F_SETFL, O_NONBLOCK);
+	hs_listen_stop = 0;
+	hs_remote = 1;                     /* before the first request can arrive */
+	int srv = hsOpenListener();
+	if (srv < 0) {
+		hs_remote = 0;
+		close(hs_wake[0]); close(hs_wake[1]);
+		hs_wake[0] = hs_wake[1] = -1;
+		return 0;
+	}
+	hsRingReset();
+	hs_attached = 1;
+	if (hsStartThreads(srv) != 0) { hs_attached = hs_remote = 0; return 0; }
+	return 1;
+}
+
+static void hrStop(void);
+
+static void hsAttachOff(void) {
+	if (!hs_attached) return;
+	hrStop();
+	hs_attached = 0;
+	hs_remote = 0;
+	hs_ts_login[0] = '\0';
+	hs_listen_stop = 1;
+	hsReleaseWaits();
+	int s = (int)socket(AF_INET, SOCK_STREAM, 0);    /* wake the accept() so it can exit */
+	if (s >= 0) {
+		struct sockaddr_in sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sin_family = AF_INET;
+		sa.sin_port = htons((uint16_t)HS.port);
+		inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+		if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) != 0) {}
+		hs_close(s);
+	}
+	pthread_mutex_lock(&HS.ring_lock);
+	pthread_cond_broadcast(&HS.ring_cond);
+	pthread_mutex_unlock(&HS.ring_lock);
+	pthread_mutex_lock(&hs_inject_lock);
+	while (hs_inject_n > 0) free(hs_inject[--hs_inject_n]);
+	pthread_mutex_unlock(&hs_inject_lock);
+}
+
+/* ---- :remote over the relay (RELAY.md §4, §7) ----
+   The page links this computer once: it binds this device key to the account
+   and sends the account key K sealed under a secret from the link URL's
+   fragment. Each phone then opens an XXpsk3 session (psk from K); inside it,
+   numbered streams carry plain HTTP into hsConnThread through a socketpair,
+   so the phone speaks the same /api as the LAN page. Two keys: the computer's
+   own (~/.hako/remote, 0600, with K and the account id) is what the page links;
+   each project folder then gets its own (its state dir, "remote"), which the
+   computer's key binds to the account, so every shared folder is its own code
+   session in the list. */
+#define HR_PEERS   8
+#define HR_STREAMS 32
+#define HR_CHUNK   49152
+enum { HR_HS = 1, HR_TP = 2, HR_LINK = 3 };          /* frame kinds, the first byte */
+enum { HR_DATA = 1, HR_EOF = 2, HR_RESET = 3 };      /* stream ops, after the 4-byte id */
+
+typedef struct { int sid, fd; } hrStream;
+typedef struct {
+	int used, ready;
+	unsigned gen;                  /* bumped on every new handshake */
+	char id[33];
+	hkNoise hs;
+	hkNoiseCipher tx, rx;
+	hrStream st[HR_STREAMS];
+} hrPeer;
+
+static hkRelay hr, hrm;            /* this folder's session; the computer itself */
+static hkRelay *volatile hr_cur;    /* whichever is reading, for hrStop */
+static hrPeer hr_peers[HR_PEERS];
+static pthread_mutex_t hr_lock = PTHREAD_MUTEX_INITIALIZER;  /* peers, streams, every send */
+static pthread_t hr_thread;
+static volatile int hr_on;
+static int hr_has_k, hr_linking;
+static uint8_t hr_k[32], hr_secret[32];
+static char hr_acct[17];
+static void hrPostName(void);
+
+static const char *hrRelayUrl(void) {
+	const char *u = getenv("HAKO_RELAY_URL");
+	return u && *u ? u : "https://relay.mithraeum.studio";
+}
+
+static const char *hrStudioUrl(void) {
+	const char *u = getenv("HAKO_STUDIO_URL");
+	return u && *u ? u : "https://hako.mithraeum.studio";
+}
+
+static void hrPath(char *out, size_t cap) {
+	const char *h = getenv("HOME");
+	snprintf(out, cap, "%s/.hako/remote", h ? h : ".");
+}
+
+/* key <hex>, k <hex>, acct <id>. A missing key is made here. */
+static int hrLoad(void) {
+	char path[PATH_MAX], line[160];
+	int has_s = 0;
+	hrPath(path, sizeof path);
+	FILE *f = fopen(path, "r");
+	while (f && fgets(line, sizeof line, f)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		if (!strncmp(line, "key ", 4) && strlen(line) == 68 && !hkHexDec(hrm.s, line + 4, 32)) has_s = 1;
+		else if (!strncmp(line, "k ", 2) && strlen(line) == 66 && !hkHexDec(hr_k, line + 2, 32)) hr_has_k = 1;
+		else if (!strncmp(line, "acct ", 5) && strlen(line) == 21) snprintf(hr_acct, sizeof hr_acct, "%s", line + 5);
+	}
+	if (f) fclose(f);
+	crypto_wipe(line, sizeof line);
+	if (has_s) return 0;
+	return hkRandomBytes(hrm.s, 32) ? 0 : -1;
+}
+
+/* This folder's session key, in its project state dir. new=1 replaces it. */
+static int hrProjectKey(int fresh) {
+	char dir[PATH_MAX], path[PATH_MAX + 16], line[80], hs[65];
+	if (!hkProjectStateDir(dir, sizeof dir) || !hkFmtFits(path, sizeof path, "%s/remote", dir)) return -1;
+	FILE *f = fresh ? NULL : fopen(path, "r");
+	int ok = 0;
+	if (f && fgets(line, sizeof line, f) && !strncmp(line, "key ", 4) && !hkHexDec(hr.s, line + 4, 32)) ok = 1;
+	if (f) fclose(f);
+	crypto_wipe(line, sizeof line);
+	if (ok) return 0;
+	if (!hkRandomBytes(hr.s, 32)) return -1;
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd < 0) return -1;
+	hkHexEnc(hs, hr.s, 32);
+	char out[80];
+	int n = snprintf(out, sizeof out, "key %s\n", hs);
+	ok = write(fd, out, (size_t)n) == n && fsync(fd) == 0;
+	close(fd);
+	crypto_wipe(hs, sizeof hs); crypto_wipe(out, sizeof out);
+	return ok ? 0 : -1;
+}
+
+static int hrSave(void) {
+	char path[PATH_MAX], tmp[PATH_MAX + 8], hs[65], hk[65];
+	hrPath(path, sizeof path);
+	snprintf(tmp, sizeof tmp, "%s.tmp", path);
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+	if (!f) { if (fd >= 0) close(fd); return -1; }
+	hkHexEnc(hs, hrm.s, 32);
+	fprintf(f, "key %s\n", hs);
+	if (hr_has_k) { hkHexEnc(hk, hr_k, 32); fprintf(f, "k %s\nacct %s\n", hk, hr_acct); }
+	crypto_wipe(hs, sizeof hs); crypto_wipe(hk, sizeof hk);
+	int ok = fflush(f) == 0 && fsync(fileno(f)) == 0;
+	ok = fclose(f) == 0 && ok;
+	if (!ok || rename(tmp, path)) { unlink(tmp); return -1; }
+	return 0;
+}
+
+/* One sealed stream frame to p. Caller holds hr_lock. */
+static int hrSendTp(hrPeer *p, int sid, int op, const uint8_t *d, size_t n) {
+	uint8_t *plain = malloc(5 + n), *f = malloc(1 + 5 + n + 16);
+	int r = -1;
+	if (plain && f && p->ready) {
+		plain[0] = (uint8_t)(sid >> 24); plain[1] = (uint8_t)(sid >> 16);
+		plain[2] = (uint8_t)(sid >> 8); plain[3] = (uint8_t)sid; plain[4] = (uint8_t)op;
+		if (n) memcpy(plain + 5, d, n);
+		f[0] = HR_TP;
+		if (!hkNoiseSeal(&p->tx, NULL, 0, plain, 5 + n, f + 1)) r = hkRelaySend(&hr, p->id, f, 1 + 5 + n + 16);
+	}
+	free(plain);
+	free(f);
+	return r;
+}
+
+/* Ends every stream of p (their pumps close the fds) and forgets its session. */
+static void hrPeerReset(hrPeer *p) {
+	for (int i = 0; i < HR_STREAMS; i++) if (p->st[i].fd > 0) shutdown(p->st[i].fd, SHUT_RDWR);
+	crypto_wipe(&p->hs, sizeof p->hs);
+	crypto_wipe(&p->tx, sizeof p->tx);
+	crypto_wipe(&p->rx, sizeof p->rx);
+	p->ready = 0;
+	p->gen++;
+}
+
+typedef struct { int peer; unsigned gen; int sid, fd; } hrPump;
+
+/* hsConnThread's reply, back to the phone in sealed chunks. */
+static void *hrPumpThread(void *arg) {
+	hrPump a = *(hrPump *)arg;
+	free(arg);
+	uint8_t *buf = malloc(HR_CHUNK);
+	ssize_t n;
+	while (buf && (n = read(a.fd, buf, HR_CHUNK)) > 0) {
+		pthread_mutex_lock(&hr_lock);
+		hrPeer *p = &hr_peers[a.peer];
+		int live = p->used && p->gen == a.gen && hrSendTp(p, a.sid, HR_DATA, buf, (size_t)n) == 0;
+		pthread_mutex_unlock(&hr_lock);
+		if (!live) break;
+	}
+	pthread_mutex_lock(&hr_lock);
+	hrPeer *p = &hr_peers[a.peer];
+	if (p->used && p->gen == a.gen) hrSendTp(p, a.sid, HR_EOF, NULL, 0);
+	for (int i = 0; i < HR_STREAMS; i++) if (p->st[i].fd == a.fd) p->st[i].fd = 0;
+	pthread_mutex_unlock(&hr_lock);
+	close(a.fd);
+	free(buf);
+	return NULL;
+}
+
+static hrPeer *hrPeerFor(const char *id, int make) {
+	hrPeer *spare = NULL;
+	for (int i = 0; i < HR_PEERS; i++) {
+		if (hr_peers[i].used && !strcmp(hr_peers[i].id, id)) return &hr_peers[i];
+		if (!hr_peers[i].used && !spare) spare = &hr_peers[i];
+	}
+	if (!make || !spare) return NULL;
+	unsigned gen = spare->gen;
+	memset(spare, 0, sizeof *spare);
+	spare->used = 1;
+	spare->gen = gen + 1;
+	snprintf(spare->id, sizeof spare->id, "%s", id);
+	return spare;
+}
+
+/* XXpsk3, this side answering. Message 1 starts (or restarts) a session; the
+   peer's third message finishes it. */
+static void hrOnHandshake(const char *from, const uint8_t *m, size_t n) {
+	uint8_t out[512], pl[512];
+	pthread_mutex_lock(&hr_lock);
+	hrPeer *p = hrPeerFor(from, 1);
+	if (!p) { pthread_mutex_unlock(&hr_lock); return; }
+	if (!p->ready && p->hs.next == 2) {
+		hkNoise keep = p->hs;
+		if (hkNoiseRead(&p->hs, m, n, pl, sizeof pl) >= 0 && hkNoiseDone(&p->hs)) {
+			hkNoiseSplit(&p->hs, &p->tx, &p->rx);
+			p->ready = 1;
+			pthread_mutex_unlock(&hr_lock);
+			aiAddHistory(&G_AI, "remote: a device on your account connected");
+			hkLogMessage("system", "remote: a device on your account connected");
+			return;
+		}
+		p->hs = keep;                       /* not message 3: maybe a fresh message 1 */
+		crypto_wipe(&keep, sizeof keep);
+	}
+	hrPeerReset(p);
+	memcpy(p->hs.s, hr.s, 32); p->hs.has_s = 1;
+	hkSessionPsk(p->hs.psk, hr_k); p->hs.has_psk = 1;
+	long w = -1;
+	if (hkNoiseInit(&p->hs, "XXpsk3", 0, (const uint8_t *)"hako session", 12) == 0
+	    && hkNoiseRead(&p->hs, m, n, pl, sizeof pl) >= 0)
+		w = hkNoiseWrite(&p->hs, NULL, 0, out + 1, sizeof out - 1);
+	if (w > 0) { out[0] = HR_HS; hkRelaySend(&hr, from, out, (size_t)w + 1); }
+	else hrPeerReset(p);
+	pthread_mutex_unlock(&hr_lock);
+}
+
+static void hrOnTransport(const char *from, const uint8_t *m, size_t n) {
+	uint8_t *pl = malloc(n);
+	pthread_mutex_lock(&hr_lock);
+	hrPeer *p = hrPeerFor(from, 0);
+	long len = p && p->ready && pl ? hkNoiseOpen(&p->rx, NULL, 0, m, n, pl) : -1;
+	if (len < 5) { pthread_mutex_unlock(&hr_lock); free(pl); return; }
+	int sid = (int)((uint32_t)pl[0] << 24 | (uint32_t)pl[1] << 16 | (uint32_t)pl[2] << 8 | pl[3]), op = pl[4];
+	hrStream *st = NULL, *spare = NULL;
+	for (int i = 0; i < HR_STREAMS; i++) {
+		if (p->st[i].fd > 0 && p->st[i].sid == sid) st = &p->st[i];
+		else if (p->st[i].fd <= 0 && !spare) spare = &p->st[i];
+	}
+	if (!st && op == HR_DATA && spare) {
+		int sv[2];
+		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+			pthread_t t;
+			hrPump *a = malloc(sizeof *a);
+			if (a) { a->peer = (int)(p - hr_peers); a->gen = p->gen; a->sid = sid; a->fd = sv[1]; }
+			if (a && pthread_create(&t, NULL, hsConnThread, (void *)((intptr_t)sv[0] | HS_TRUSTED)) == 0) {
+				pthread_detach(t);
+				if (pthread_create(&t, NULL, hrPumpThread, a) == 0) {
+					pthread_detach(t);
+					spare->sid = sid;
+					spare->fd = sv[1];
+					st = spare;
+				} else { free(a); shutdown(sv[1], SHUT_RDWR); close(sv[1]); }
+			} else { free(a); close(sv[0]); close(sv[1]); }
+		}
+	}
+	/* the pump may close its fd once we let go of the lock: write through a dup */
+	int fd = st && op == HR_DATA ? dup(st->fd) : -1;
+	if (st && op != HR_DATA) shutdown(st->fd, op == HR_EOF ? SHUT_WR : SHUT_RDWR);
+	pthread_mutex_unlock(&hr_lock);
+	for (long o = 5; fd >= 0 && o < len; ) {
+		ssize_t w = write(fd, pl + o, (size_t)(len - o));
+		if (w <= 0) { if (w < 0 && errno == EINTR) continue; break; }
+		o += w;
+	}
+	if (fd >= 0) close(fd);
+	free(pl);
+}
+
+/* The page's link frame: nonce(24) mac(16) then K(32) and the account id(16),
+   sealed under a key from the secret in the link URL. */
+static void hrOnLink(const uint8_t *m, size_t n) {
+	if (!hr_linking || n != 24 + 16 + 48) return;
+	uint8_t key[32], pt[48];
+	crypto_blake2b_keyed(key, 32, hr_secret, 32, (const uint8_t *)"hako link key", 13);
+	int bad = crypto_aead_unlock(pt, m + 24, key, m, NULL, 0, m + 40, 48);
+	crypto_wipe(key, sizeof key);
+	if (bad) return;
+	memcpy(hr_k, pt, 32);
+	snprintf(hr_acct, sizeof hr_acct, "%.16s", (const char *)pt + 32);
+	crypto_wipe(pt, sizeof pt);
+	crypto_wipe(hr_secret, sizeof hr_secret);
+	hr_has_k = 1;
+	hr_linking = 0;
+	if (hrSave()) aiAddHistory(&G_AI, "remote: linked, but ~/.hako/remote could not be written");
+	aiSayf(&G_AI, "remote: linked. on your phone, open %s/#signin", hrStudioUrl());
+	hkLogMessage("system", "remote: this computer was linked to an account");
+}
+
+/* This session's name for the account's list, sealed under K:
+   "code:<host>\t<folder>". */
+static void hrPostName(void) {
+	char host[128] = "computer", text[160];
+	memset(text, 0, sizeof text);
+	uint8_t key[32], blob[24 + 16 + 160];
+	if (gethostname(host, sizeof host) != 0) snprintf(host, sizeof host, "computer");
+	host[sizeof host - 1] = '\0';
+	char *dot = strchr(host, '.');
+	if (dot) *dot = '\0';                                             /* "imac.local" -> "imac" */
+	char cwd[PATH_MAX] = "";
+	if (!getcwd(cwd, sizeof cwd)) cwd[0] = '\0';
+	const char *dir = strlen(cwd) > 80 ? cwd + strlen(cwd) - 80 : cwd;     /* the tail names it */
+	int n = snprintf(text, sizeof text, "code:%.60s\t%s", host, dir);
+	if (n <= 0 || !hkRandomBytes(blob, 24)) return;
+	hkNameKey(key, hr_k);
+	crypto_aead_lock(blob + 40, blob + 24, key, blob, NULL, 0, (const uint8_t *)text, (size_t)n);
+	crypto_wipe(key, sizeof key);
+	char *b = clB64Encode(blob, 40 + (size_t)n);
+	if (!b) return;
+	size_t o = 0;
+	for (char *c = b; *c && *c != '='; c++) b[o++] = *c == '+' ? '-' : *c == '/' ? '_' : *c;
+	b[o] = '\0';
+	free(hkRelayCall(&hr, "/v1/name", b));
+	free(b);
+}
+
+/* Shows (and opens) the link page once per :remote on, while not linked. */
+static void hrLinkPrompt(void) {
+	char pub[65], sec[65], url[512];
+	if (hr_linking) return;
+	if (!hkRandomBytes(hr_secret, 32)) return;
+	hkHexEnc(pub, hrm.s_pub, 32);
+	hkHexEnc(sec, hr_secret, 32);
+	if (!hkFmtFits(url, sizeof url, "%s/#link=%s.%s", hrStudioUrl(), pub, sec)) return;
+	hr_linking = 1;
+	aiAddHistory(&G_AI, "remote: link this computer to your account (once). sign in on the page that opened:");
+	aiSayfSecret(&G_AI, "  %s", url);
+	if (!getenv("HAKO_NO_BROWSER")) clOpenUrl(url);
+	crypto_wipe(sec, sizeof sec);
+	crypto_wipe(url, sizeof url);
+}
+
+/* Frames for r until its stream ends (or, on the computer's key, a link). */
+static void hrRead(hkRelay *r, uint8_t *buf, size_t cap) {
+	char from[33];
+	long n;
+	hr_cur = r;
+	while (hr_on && (n = hkRelayRecv(r, from, buf, cap)) != -1) {
+		if (r == &hrm) {
+			if (n > 1 && buf[0] == HR_LINK) hrOnLink(buf + 1, (size_t)n - 1);
+			if (hr_has_k) break;
+		} else if (n == -2) {
+			pthread_mutex_lock(&hr_lock);
+			hrPeer *p = hrPeerFor(from, 0);
+			if (p) { hrPeerReset(p); p->used = 0; }
+			pthread_mutex_unlock(&hr_lock);
+		} else if (n > 1 && buf[0] == HR_HS) hrOnHandshake(from, buf + 1, (size_t)n - 1);
+		else if (n > 1 && buf[0] == HR_TP) hrOnTransport(from, buf + 1, (size_t)n - 1);
+	}
+	hr_cur = NULL;
+	hkRelayClose(r);
+}
+
+static void *hrThread(void *arg) {
+	(void)arg;
+	static uint8_t buf[300 * 1024];
+	int wait = 1, said = 0;
+	while (hr_on) {
+		/* the computer's key links it (once), then vouches for this folder's key */
+		int up = hkRelaySignIn(&hrm) == 0;
+		if (up && (!hr_has_k || !hrm.acct[0])) {
+			if (hkRelayOpen(&hrm) == 0) { hrLinkPrompt(); hrRead(&hrm, buf, sizeof buf); }
+			else hkRelayClose(&hrm);
+			continue;
+		}
+		char pub[65], *r = NULL;
+		if (up) { hkHexEnc(pub, hr.s_pub, 32); r = hkRelayCall(&hrm, "/v1/bind", pub); }
+		int bound = r && !strncmp(r, "ok", 2);
+		if (r && !bound && hrProjectKey(1) == 0) crypto_x25519_public_key(hr.s_pub, hr.s);   /* held by another account */
+		free(r);
+		if (!bound || hkRelaySignIn(&hr) || !hr.acct[0] || hkRelayOpen(&hr)) {
+			hkRelayClose(&hr);
+			if (!said++) aiAddHistory(&G_AI, "remote: can't reach your account right now, still trying (the here link works)");
+			for (int i = 0; i < wait * 10 && hr_on; i++) cl_sleep_ms(100);
+			if (wait < 30) wait *= 2;
+			continue;
+		}
+		wait = 1;
+		hrPostName();
+		hrRead(&hr, buf, sizeof buf);
+		pthread_mutex_lock(&hr_lock);
+		for (int i = 0; i < HR_PEERS; i++) if (hr_peers[i].used) { hrPeerReset(&hr_peers[i]); hr_peers[i].used = 0; }
+		pthread_mutex_unlock(&hr_lock);
+	}
+	return NULL;
+}
+
+static int hrLinked(void) { return hr_has_k; }
+
+static int hrStart(void) {
+	if (hr_on) return 1;
+	memset(&hr, 0, sizeof hr);
+	memset(&hrm, 0, sizeof hrm);
+	snprintf(hr.url, sizeof hr.url, "%s", hrRelayUrl());
+	snprintf(hrm.url, sizeof hrm.url, "%s", hrRelayUrl());
+	if (hrLoad() || hrSave() || hrProjectKey(0)) return 0;
+	crypto_x25519_public_key(hr.s_pub, hr.s);
+	crypto_x25519_public_key(hrm.s_pub, hrm.s);
+	hr_on = 1;
+	if (pthread_create(&hr_thread, NULL, hrThread, NULL) != 0) { hr_on = 0; return 0; }
+	return 1;
+}
+
+static void hrStop(void) {
+	if (!hr_on) return;
+	hr_on = 0;
+	hkRelay *r = hr_cur;
+	if (r) hkRelayStop(r);
+	pthread_join(hr_thread, NULL);
+	crypto_wipe(hr_secret, sizeof hr_secret);
+	hr_linking = 0;
+}
+#endif
 
 static int clServeMode(aiData *data, const char *dir) {
 	static char web_abs[PATH_MAX];
@@ -16029,26 +19514,8 @@ static int clServeMode(aiData *data, const char *dir) {
 		return 1;
 	}
 #endif
-	int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
-	if (srv < 0) { fprintf(stderr, "hako: socket failed (error %d)\n", hs_errno()); return 1; }
-	int yes = 1;
-	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
-
-	struct sockaddr_in sa;
-	memset(&sa, 0, sizeof(sa));
-	sa.sin_family = AF_INET;
-	sa.sin_port   = htons((uint16_t)HS.port);
-	if (inet_pton(AF_INET, HS.bind_addr, &sa.sin_addr) != 1) {
-		fprintf(stderr, "hako: bad bind address %s\n", HS.bind_addr);
-		hs_close(srv);
-		return 1;
-	}
-	if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-		fprintf(stderr, "hako: bind %s:%d failed (error %d)\n", HS.bind_addr, HS.port, hs_errno());
-		hs_close(srv);
-		return 1;
-	}
-	listen(srv, 16);
+	int srv = hsOpenListener();
+	if (srv < 0) return 1;
 
 	if (strcmp(HS.bind_addr, "127.0.0.1") != 0 && !HS.token[0]) {
 		fprintf(stderr,
@@ -16061,13 +19528,19 @@ static int clServeMode(aiData *data, const char *dir) {
 			"  one firewall allow — run `make sign` and follow what it prints.\n\n");
 #endif
 	}
-	if (E.ai_auto_approve)
+	char cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
+	hs_remote = HS.token[0] != '\0';
+	if (hs_remote && !realpath(cwd, hs_root)) snprintf(hs_root, sizeof(hs_root), "%s", cwd);
+	if (hs_remote)
+		fprintf(stderr,
+			"\n  remote: every tool asks%s, \"always\" answers count once, and the\n"
+			"  phone stays inside %s\n\n", E.ai_auto_approve ? " (auto mode is ignored)" : "", hs_root);
+	else if (E.ai_auto_approve)
 		fprintf(stderr,
 			"\n  WARNING: --yolo approves every tool call, including shell and file\n"
 			"  writes, with no prompt.\n\n");
 
-	char cwd[PATH_MAX];
-	if (!getcwd(cwd, sizeof(cwd))) cwd[0] = '\0';
 	printf("hako studio v%s — http://%s:%d\n", HAKO_VERSION, HS.bind_addr, HS.port);
 #ifdef __APPLE__
 	if (strcmp(HS.bind_addr, "127.0.0.1") != 0)
@@ -16076,24 +19549,22 @@ static int clServeMode(aiData *data, const char *dir) {
 #endif
 	printf("  dir      %s\n", cwd);
 	printf("  provider %s · model %s\n",
-	       hkProviderName(E.ai_provider_type), E.ai_model ? E.ai_model : "—");
+	       hkProviderLabel(), E.ai_model ? E.ai_model : "—");
 #ifdef HS_EMBEDDED
 	printf("  ui       %s\n", HS.web_dir ? HS.web_dir : "embedded");
 #else
 	printf("  ui       %s\n", HS.web_dir ? HS.web_dir : "none (API only — make WEB=1, or --web <dir>)");
 #endif
-	if (HS.token[0])
+	if (HS.token[0]) {
 		printf("  open     http://%s:%d/?t=%s\n", HS.bind_addr, HS.port, HS.token);
+		if (hkTailscaleName(hs_ts_host, sizeof(hs_ts_host), hs_ts_login, sizeof(hs_ts_login)) && hs_ts_login[0])
+			printf("  phone    https://%s   (tailscale serve --bg %d; signed in as %s, nothing to type)\n",
+			       hs_ts_host, HS.port, hs_ts_login);
+	}
 	if (strcmp(HS.bind_addr, "127.0.0.1") != 0) hsPrintLanUrls();
 	fflush(stdout);
 
-	pthread_t acc;
-	if (pthread_create(&acc, NULL, hsAcceptThread, (void *)(intptr_t)srv) != 0) {
-		fprintf(stderr, "hako: cannot start listener thread\n");
-		hs_close(srv);
-		return 1;
-	}
-	pthread_detach(acc);
+	if (hsStartThreads(srv) != 0) return 1;
 
 	clPipeBegin(data);
 
@@ -16226,43 +19697,36 @@ static void clFirstRunWizard(aiData *data) {
 	const char *A = E.color_enabled ? TH_ACCENT : "";
 
 	printf("\n  %sfirst run.%s %ssign in:%s\n", A, R, M, R);
-	const char *provs[6] = { "anthropic", "github copilot", "github models", "openrouter", "ollama", "skip for now" };
-	int sel = E.color_enabled ? clPopupSelect("sign in", provs, 6, 0, NULL) : -1;
-	if (sel < 0 && !E.color_enabled) {
-		clPutWrapped2(M, "  ", "  ",
-		              "[1]anthropic [2]copilot [3]gh-models [4]openrouter [5]ollama [6]skip");
-		char buf[32];
-		int n = clReadLineRaw("  pick [1]: ", buf, sizeof(buf));
-		if (n == -2 || n == -1) { E.interrupt = 0; printf("\n"); return; }
-		sel = ((n > 0) ? atoi(buf) : 1) - 1;
+	/* The :login menu's own rows, plus the two ways to start without an account. */
+	char rows[HK_NSIGNIN + 2][112];
+	const char *items[HK_NSIGNIN + 2];
+	int n = 0;
+	for (int i = 0; i < HK_NSIGNIN; i++, n++) {
+		snprintf(rows[n], sizeof rows[n], "%-15s %s", HK_SIGNIN[i].name, HK_SIGNIN[i].what);
+		items[n] = rows[n];
 	}
-	int pick = (sel >= 0 && sel < 6) ? sel + 1 : 6;
-
-	#define _HAKO_PICK_CREDED(prov, oauthfn) do { \
-		hkApplyProviderAlias(prov); \
-		clCred *_c = clCredsFind(prov); \
-		if (_c && (_c->oauth_refresh || _c->api_key)) { \
-			clCredsRestoreFor(prov); hkSaveSession(); \
-			printf("  %srestored saved %s credentials.%s\n", M, prov, R); \
-		} else { oauthfn(data); } \
-	} while (0)
-	switch (pick) {
-	case 1: _HAKO_PICK_CREDED("anthropic",      clOAuthAnthropic); break;
-	case 2: _HAKO_PICK_CREDED("github-copilot", clOAuthGithubCopilot); break;
-	case 3: _HAKO_PICK_CREDED("github-models",  clOAuthGithubModels); break;
-	case 4: _HAKO_PICK_CREDED("openrouter",     clOAuthOpenRouter); break;
-	case 5:
+	snprintf(rows[n], sizeof rows[n], "%-15s %s", "Ollama", "local models, no account"); items[n] = rows[n]; n++;
+	snprintf(rows[n], sizeof rows[n], "%-15s %s", "skip for now", ":login any time"); items[n] = rows[n]; n++;
+	int sel = E.color_enabled ? clPopupSelect("sign in", items, n, 0, NULL) : -1;
+	if (sel < 0 && !E.color_enabled) {
+		for (int i = 0; i < n; i++) printf("  %s[%d] %s%s\n", M, i + 1, items[i], R);
+		char buf[32];
+		int got = clReadLineRaw("  pick [1]: ", buf, sizeof(buf));
+		if (got == -2 || got == -1) { E.interrupt = 0; printf("\n"); return; }
+		sel = ((got > 0) ? atoi(buf) : 1) - 1;
+	}
+	if (sel >= 0 && sel < HK_NSIGNIN) {
+		char cmd[48];
+		snprintf(cmd, sizeof cmd, ":login %s", HK_SIGNIN[sel].id);
+		hkHandleSlash(data, cmd);
+	} else if (sel == HK_NSIGNIN) {
 		hkApplyProviderAlias("ollama");
 		free(E.ai_endpoint); E.ai_endpoint = strdup("http://localhost:11434");
 		if (!E.ai_model) E.ai_model = strdup("llama3.2");
 		hkSaveSession();
 		printf("  %sollama configured. start it: ollama serve%s\n", M, R);
-		break;
-	case 6:
-	default:
-		clPutWrapped2(M, "  ", "  ",
-		              "skipped. :providers to browse \xC2\xB7 :login <name> to authenticate.");
-		break;
+	} else {
+		clPutWrapped2(M, "  ", "  ", "skipped. :login to sign in \xC2\xB7 :login api for a key.");
 	}
 	printf("\n");
 	fflush(stdout);
@@ -16353,7 +19817,19 @@ static int clRepl(aiData *data) {
 		cl_bar_want = 1;
 		if (!cl_bar_h) clBarShow(data);
 		const char *prompt = E.color_enabled ? prompt_color : prompt_plain;
-		int n = clReadLineRaw(prompt, line, sizeof(line));
+		int n;
+#if HK_ATTACH
+		if (hs_attached && hkInjectTake(line, sizeof(line))) {
+			n = (int)strlen(line);
+			hkLogMessage("system", "remote: the next line came from a remote device");
+		} else {
+			hk_line_wait = 1;
+			n = clReadLineRaw(prompt, line, sizeof(line));
+			hk_line_wait = 0;
+		}
+#else
+		n = clReadLineRaw(prompt, line, sizeof(line));
+#endif
 		int input_rows = cl_redraw_oldrows > 0 ? cl_redraw_oldrows : 1;
 		(void)input_rows;
 		if (n == -4) {                       /* shift-tab cycles the mode */
@@ -16388,11 +19864,17 @@ static int clRepl(aiData *data) {
 		if (n == 0) continue;
 
 		if (line[0] == '/' || line[0] == ':') {
-			clPrintRoleLine(HK_ROLE_USER, line);
-			aiPushHistoryStore(data, line, HK_ROLE_USER);    /* on screen ⇒ in history */
+			if (hkIsMenuCommand(line)) hk_echo_pending = line;   /* echoed only if it prints */
+			else {
+				clPrintRoleLine(HK_ROLE_USER, line);
+				aiPushHistoryStore(data, line, HK_ROLE_USER);    /* on screen ⇒ in history */
+				if (hs_attached) clPipeEmitMsg("user", line);
+			}
 			clOutBegin();
 			int r = hkHandleSlash(data, line);
+			hk_echo_pending = NULL;
 			clOutEnd(data);
+			if (hs_attached) { clPipeEmitState(); clPipeEmitDone(NULL); }
 			if (r == 2) break;
 			continue;
 		}
@@ -16401,6 +19883,7 @@ static int clRepl(aiData *data) {
 		   conversation. */
 		clPrintRoleLine(HK_ROLE_USER, line);
 		aiPushHistoryStore(data, line, HK_ROLE_USER);
+		if (hs_attached) clPipeEmitMsg("user", line);
 		hkLogMessage("user", line);
 		E.session_turn_count++;
 		hkSaveSession();
@@ -16429,6 +19912,7 @@ static int clRepl(aiData *data) {
 			memmove(hk_queue, hk_queue + 1, sizeof(hk_queue[0]) * (size_t)(--hk_queue_n));
 			clPrintRoleLine(HK_ROLE_USER, next);
 			aiPushHistoryStore(data, next, HK_ROLE_USER);
+			if (hs_attached) clPipeEmitMsg("user", next);
 			hkLogMessage("user", next);
 			E.session_turn_count++;
 			hkSaveSession();
