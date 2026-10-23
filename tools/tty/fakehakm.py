@@ -4,6 +4,8 @@
 no weights, no model and no GPU. The reply is chosen by the LAST user message:
   "TOOL"        -> one list_dir tool call
   "TWOTOOLS"    -> two tool calls in one reply (tests the approval handover)
+  "ASK"         -> an ask_user question with two options
+  "SLOW"        -> the same short answer after 30 s (a cold local model)
   <observation> -> a one-line wrap-up
   anything else -> a short bulleted answer
 Every frame received is appended to $FAKE_LOG, so a test can see what the
@@ -20,6 +22,9 @@ def reply_for(last):
         # handover used to race and hang the turn
         return ('<tool_call>{"name": "list_dir", "arguments": {"path": "."}}</tool_call>\n'
                 '<tool_call>{"name": "read_file", "arguments": {"path": "alpha.txt"}}</tool_call>')
+    if "ASK" in last:
+        return ('<tool_call>{"name": "ask_user", "arguments": {"question": "which one?", '
+                '"options": "red\\nblue"}}</tool_call>')
     if "TOOL" in last:
         return '<tool_call>{"name": "list_dir", "arguments": {"path": "."}}</tool_call>'
     if "observation" in last:
@@ -39,6 +44,7 @@ while True:
         if role == "user": last = body
     log.write("---\n"); log.flush()
     time.sleep(float(os.environ.get("HAKO_FAKE_DELAY", "0")))   # a slow turn, on demand
+    if "SLOW" in last: time.sleep(30)
     rep = reply_for(last)
     if int(stream):
         for line in rep.split("\n"):

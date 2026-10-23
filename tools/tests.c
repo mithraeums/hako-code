@@ -1357,7 +1357,368 @@ static void fit_tests(void) {
 	free(c);
 }
 
-int main(void) {
+/* --- crypto: monocypher against RFC vectors, noise against cacophony --- */
+static size_t unhex(uint8_t *out, const char *h) {
+	size_t n = 0;
+	for (; h[0] && h[1]; h += 2) { unsigned v; sscanf(h, "%2x", &v); out[n++] = (uint8_t)v; }
+	return n;
+}
+static int eqhex(const uint8_t *b, size_t n, const char *h) {
+	uint8_t w[512];
+	return unhex(w, h) == n && memcmp(w, b, n) == 0;
+}
+
+typedef struct { const char *payload, *cipher; } hkTvMsg;
+typedef struct { const char *pattern, *prologue, *is, *ie, *rs, *re, *hash; int nmsg; hkTvMsg m[8]; const char *psk; } hkTv;
+static const hkTv noise_vectors[] = {
+	{ "XX", "4a6f686e2047616c74", "e61ef9919cde45dd5f82166404bd08e38bceb5dfdfded0a34c8df7ed542214d1", "893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a", "4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893", "bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b", "8cf47d7b3cb5804c0109d48e8bcdbee2cbb65687d8ea2c92994ca361fb86151ad93627b98936cbb32de56e8abb21def3925011ac3e35db9cbeea73ab9a4392c2", 6, {
+		{ "4c756477696720766f6e204d69736573", "ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c79444c756477696720766f6e204d69736573" },
+		{ "4d757272617920526f746862617264", "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f1448088430505b6745ce64a5f33f0e8e3b83f11ce8802bca507f4f2d8b564dbe277e1966116e132faa2dfd70b8b077b9f94b913df5056ae1319469b824a98d54bbaa82c325595587064f978c4b6d104f7596e6f" },
+		{ "462e20412e20486179656b", "99579e1c1ee15e422a57ddd6b16d37087b17558e8369c18991b4b2ca3a824abf904cdcf5458b5431a75af034ca9e9b982de039eaaf156775e2d580cd4e5ebae89c3f8cb2594b556d8a8169" },
+		{ "4361726c204d656e676572", "fc56eea290b3f3a21aac0c70cd5787b5ee99be37d2f4d751329b55" },
+		{ "4a65616e2d426170746973746520536179", "bb31c9da10d5639a4cdb88a12f5c61de41bbc7df09bf75d94f8184fe4157f5c68f" },
+		{ "457567656e2042f6686d20766f6e2042617765726b", "f6199cadb152fb27f82be0a0891ec76a33598ae92a46cab2fb5a8ed5bf48b7f267f8370af7" } }, NULL },
+	{ "XXpsk3", "4a6f686e2047616c74", "e61ef9919cde45dd5f82166404bd08e38bceb5dfdfded0a34c8df7ed542214d1", "893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a", "4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893", "bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b", "46b5997dfa51492ae9be5b611748455e83aebdbc2ea3c47d264ec6dd408cc076e962ff056890c60398fe3e7a430bbe057f34383a84df9ff99391266dcfd638b0", 6, {
+		{ "4c756477696720766f6e204d69736573", "ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c79440aa831d1e3bbd16bd7ffda87e9f7b6eeca2510006499a573ac27af3392ed1b69" },
+		{ "4d757272617920526f746862617264", "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f14480884381a78489d56c9e2ac962826f25684980b25244dbfd505b7d903a94d4f4fd84004a1c7fbe94d686bc4c1f67259364f6f2a41cb40bf5198b9b3975be2cdd49d3e065a554e12c477d82029fabc6555bc1" },
+		{ "462e20412e20486179656b", "291dfeff6eff386e29adb0bdbd5a1ae9e09de4449c8695d109adcb63e80e489555792a3e9150eff75d6d45571f824ed231173cb66e31e7da914241f86d0cbb678335ffe768a7445d2f5bc1" },
+		{ "4361726c204d656e676572", "6579dd60eb5e6a8b29dd60004289f5d3c2f69fcdbf683a869f59a8" },
+		{ "4a65616e2d426170746973746520536179", "24715fd39c3c7606e81b26e69e47b54d043d9d87c512f9417bae51ab48ebb17722" },
+		{ "457567656e2042f6686d20766f6e2042617765726b", "e49194a013d873712318643acbf0e3851086326bb168c500a766439ff543a7a1e2deb3215c" } },
+		"54686973206973206d7920417573747269616e20706572737065637469766521" },
+};
+
+
+static void noise_vector(const hkTv *tv) {
+	hkNoise I, R;
+	uint8_t pro[64], buf[1024], pl[1024];
+	char what[96];
+	memset(&I, 0, sizeof I); memset(&R, 0, sizeof R);
+	size_t pn = unhex(pro, tv->prologue);
+	unhex(I.s, tv->is); I.has_s = 1; unhex(I.e, tv->ie); I.has_e = 1;
+	unhex(R.s, tv->rs); R.has_s = 1; unhex(R.e, tv->re); R.has_e = 1;
+	if (tv->psk) { unhex(I.psk, tv->psk); unhex(R.psk, tv->psk); I.has_psk = R.has_psk = 1; }
+	ck(hkNoiseInit(&I, tv->pattern, 1, pro, pn) == 0 && hkNoiseInit(&R, tv->pattern, 0, pro, pn) == 0, "noise init");
+	hkNoiseCipher itx, irx, rtx, rrx;
+	int split = 0;
+	for (int i = 0; i < tv->nmsg; i++) {
+		hkNoise *snd = (i & 1) ? &R : &I, *rcv = (i & 1) ? &I : &R;
+		size_t n = unhex(pl, tv->m[i].payload);
+		long cl, got;
+		if (!split) {
+			cl = hkNoiseWrite(snd, pl, n, buf, sizeof buf);
+			got = cl < 0 ? -1 : hkNoiseRead(rcv, buf, (size_t)cl, pl, sizeof pl);
+		} else {
+			cl = (long)n + 16;
+			hkNoiseSeal((i & 1) ? &rtx : &itx, NULL, 0, pl, n, buf);
+			got = hkNoiseOpen((i & 1) ? &irx : &rrx, NULL, 0, buf, (size_t)cl, pl);
+		}
+		snprintf(what, sizeof what, "noise %s message %d ciphertext", tv->pattern, i);
+		ck(cl > 0 && eqhex(buf, (size_t)cl, tv->m[i].cipher), what);
+		snprintf(what, sizeof what, "noise %s message %d payload", tv->pattern, i);
+		ck(got == (long)n && eqhex(pl, n, tv->m[i].payload), what);
+		if (!split && hkNoiseDone(&I) && hkNoiseDone(&R)) {
+			snprintf(what, sizeof what, "noise %s handshake hash", tv->pattern);
+			ck(eqhex(I.h, 64, tv->hash) && eqhex(R.h, 64, tv->hash), what);
+			hkNoiseSplit(&I, &itx, &irx);
+			hkNoiseSplit(&R, &rtx, &rrx);
+			split = 1;
+		}
+	}
+	snprintf(what, sizeof what, "noise %s completes", tv->pattern);
+	ck(split, what);
+}
+
+static void crypto_tests(void) {
+	uint8_t a[32], u[32], out[64];
+	/* RFC 7748 5.2 */
+	unhex(a, "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+	unhex(u, "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+	crypto_x25519(out, a, u);
+	ck(eqhex(out, 32, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552"), "x25519 rfc7748");
+	/* BLAKE2b-512("abc"), RFC 7693 appendix A */
+	crypto_blake2b(out, 64, (const uint8_t *)"abc", 3);
+	ck(eqhex(out, 64, "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1"
+	                  "7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923"), "blake2b abc");
+	/* RFC 8439 2.8.2 */
+	{
+		static const char pt[] = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip "
+		                         "for the future, sunscreen would be it.";
+		uint8_t key[32], nonce[12], ad[12], ct[sizeof pt], mac[16];
+		unhex(key, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+		unhex(nonce, "070000004041424344454647");
+		unhex(ad, "50515253c0c1c2c3c4c5c6c7");
+		crypto_aead_ctx c;
+		crypto_aead_init_ietf(&c, key, nonce);
+		crypto_aead_write(&c, ct, mac, ad, 12, (const uint8_t *)pt, sizeof pt - 1);
+		ck(eqhex(mac, 16, "1ae10b594f09e26a7e902ecbd0600691"), "chacha20-poly1305 rfc8439 tag");
+		ck(eqhex(ct, 16, "d31a8d34648e60db7b86afbc53ef7ec2"), "chacha20-poly1305 rfc8439 ciphertext");
+	}
+	for (size_t i = 0; i < sizeof noise_vectors / sizeof noise_vectors[0]; i++) noise_vector(&noise_vectors[i]);
+
+	/* a flipped bit anywhere is refused */
+	{
+		hkNoiseCipher c1 = { {1}, 0, 1 }, c2 = c1;
+		uint8_t m[21], pl[5];
+		hkNoiseSeal(&c1, NULL, 0, (const uint8_t *)"hello", 5, m);
+		m[3] ^= 1;
+		ck(hkNoiseOpen(&c2, NULL, 0, m, sizeof m, pl) < 0, "noise refuses a tampered message");
+		ck(c2.n == 0, "and does not advance the nonce");
+	}
+	/* a low-order point as the peer's key fails the handshake */
+	{
+		hkNoise R;
+		uint8_t m[64] = {0}, pl[64];
+		memset(&R, 0, sizeof R);
+		hkRandomBytes(R.s, 32); R.has_s = 1;
+		hkNoiseInit(&R, "XX", 0, NULL, 0);
+		ck(hkNoiseRead(&R, m, 32, pl, sizeof pl) == 0, "an all-zero ephemeral is read");
+		ck(hkNoiseWrite(&R, NULL, 0, m, sizeof m) < 0, "and the DH with it is refused");
+	}
+	/* the link check: both ends agree, a different nonce changes the digits */
+	{
+		uint8_t h[64] = {7}, ni[32] = {1}, nr[32] = {2}, c1[32], c2[32];
+		char d1[7], d2[7], d3[7];
+		hkLinkDigits(d1, h, ni, nr); hkLinkDigits(d2, h, ni, nr);
+		nr[0] = 3; hkLinkDigits(d3, h, ni, nr);
+		ck(strlen(d1) == 6 && !strcmp(d1, d2), "link digits: six, and stable");
+		ck(strcmp(d1, d3) != 0, "link digits change with the nonce");
+		hkLinkCommit(c1, nr); nr[0] = 2; hkLinkCommit(c2, nr);
+		ck(memcmp(c1, c2, 32) != 0, "link commit binds the nonce");
+	}
+}
+
+/* --- relay: two devices through a running relay (make test-relay) --- */
+static int relay_status(const char *url, const char *extra) {
+	char cmd[512];
+	snprintf(cmd, sizeof cmd, "curl -s -o /dev/null -w '%%{http_code}' %s '%s' 2>/dev/null", extra, url);
+	FILE *fp = popen(cmd, "r");
+	int code = 0;
+	if (fp) { if (fscanf(fp, "%d", &code) != 1) code = 0; pclose(fp); }
+	return code;
+}
+
+static long relay_recv_from(hkRelay *r, const char *want, uint8_t *buf, size_t cap) {
+	char from[33];
+	long n;
+	while ((n = hkRelayRecv(r, from, buf, cap)) == -2) {}
+	if (n >= 0 && strcmp(from, want)) return -3;
+	return n;
+}
+
+static void relay_timeout(int sig) {
+	(void)sig;
+	static const char m[] = "FAIL relay: timed out waiting for a frame\n";
+	if (write(1, m, sizeof m - 1) < 0) {}
+	_exit(1);
+}
+
+/* XXpsk3 between I (on a) and R (on b), the psk from each side's K. Returns 1
+   when both finish; the transport ciphers land in itx/irx, rtx/rrx. */
+static int relay_session(hkRelay *a, hkRelay *b, const uint8_t ka[32], const uint8_t kb[32],
+                         hkNoiseCipher *itx, hkNoiseCipher *irx, hkNoiseCipher *rtx, hkNoiseCipher *rrx) {
+	static uint8_t m[4096], pl[4096];
+	hkNoise I, R;
+	memset(&I, 0, sizeof I); memset(&R, 0, sizeof R);
+	memcpy(I.s, a->s, 32); I.has_s = 1; memcpy(R.s, b->s, 32); R.has_s = 1;
+	hkSessionPsk(I.psk, ka); hkSessionPsk(R.psk, kb); I.has_psk = R.has_psk = 1;
+	hkNoiseInit(&I, "XXpsk3", 1, (const uint8_t *)"hako session", 12);
+	hkNoiseInit(&R, "XXpsk3", 0, (const uint8_t *)"hako session", 12);
+	for (int i = 0; i < 3; i++) {
+		hkRelay *from = (i & 1) ? b : a, *to = (i & 1) ? a : b;
+		long n = hkNoiseWrite((i & 1) ? &R : &I, NULL, 0, m, sizeof m);
+		if (n < 0 || hkRelaySend(from, to->id, m, (size_t)n)) return 0;
+		n = relay_recv_from(to, from->id, m, sizeof m);
+		if (n < 0 || hkNoiseRead((i & 1) ? &I : &R, m, (size_t)n, pl, sizeof pl) < 0) return 0;
+	}
+	if (!hkNoiseDone(&I) || !hkNoiseDone(&R) || memcmp(I.rs, b->s_pub, 32) || memcmp(R.rs, a->s_pub, 32)) return 0;
+	hkNoiseSplit(&I, itx, irx); hkNoiseSplit(&R, rtx, rrx);
+	return 1;
+}
+
+/* invite and log come from `make test-relay`: one invite code, and the --dev
+   relay's log, where it prints the email code. */
+static void relay_tests(const char *url, const char *invite, const char *log) {
+	setvbuf(stdout, NULL, _IONBF, 0);
+	signal(SIGPIPE, SIG_IGN);                     /* as hako's main does */
+	signal(SIGALRM, relay_timeout);
+	alarm(30);                                    /* a lost frame must fail, not hang */
+	hkRelay A, B;
+	memset(&A, 0, sizeof A); memset(&B, 0, sizeof B);
+	snprintf(A.url, sizeof A.url, "%s", url); snprintf(B.url, sizeof B.url, "%s", url);
+	hkRandomBytes(A.s, 32); hkRandomBytes(B.s, 32);
+	ck(hkRelaySignIn(&A) == 0 && hkRelaySignIn(&B) == 0, "relay: both devices sign in");
+	ck(strlen(A.id) == 32 && strcmp(A.id, B.id), "relay: ids are distinct hashes of the keys");
+	ck(!A.acct[0] && !B.acct[0], "relay: neither is on an account yet");
+
+	/* A is the page: signs in by email with the invite, then binds B (the computer) */
+	char *r = hkRelayCall(&A, "/v1/email/start", "me@example.com");
+	ck(r && !strcmp(r, "sent\n"), "relay: the page asks for an email code");
+	free(r);
+	char code[8] = "", line[256], body[96];
+	FILE *lf = fopen(log, "r");
+	while (lf && fgets(line, sizeof line, lf)) { const char *c = strstr(line, "sign-in code "); if (c) snprintf(code, sizeof code, "%.6s", c + 13); }
+	if (lf) fclose(lf);
+	snprintf(body, sizeof body, "%s %s", code, invite);
+	r = hkRelayCall(&A, "/v1/email/verify", body);
+	ck(r && strlen(r) == 21 && !strcmp(r + 16, " new\n"), "relay: code + invite make the account");
+	free(r);
+	char pubh[66];
+	hkHexEnc(pubh, B.s_pub, 32);
+	r = hkRelayCall(&A, "/v1/bind", pubh);
+	ck(r && !strcmp(r, "ok\n"), "relay: the page binds the computer's key");
+	free(r);
+	ck(hkRelaySignIn(&A) == 0 && hkRelaySignIn(&B) == 0 && A.acct[0] && !strcmp(A.acct, B.acct),
+	   "relay: both now sign in to the same account");
+	ck(hkRelayOpen(&A) == 0 && hkRelayOpen(&B) == 0, "relay: streams open");
+	usleep(400000);
+
+	/* a session: XXpsk3, the psk from the account key */
+	uint8_t K[32], K2[32], m[70000], pl[70000];
+	long n;
+	hkRandomBytes(K, 32);
+	memcpy(K2, K, 32); K2[0] ^= 1;
+	hkNoiseCipher itx, irx, rtx, rrx;
+	/* the psk enters at message 3, so the wrong key fails there and nothing is left queued */
+	ck(!relay_session(&A, &B, K, K2, &itx, &irx, &rtx, &rrx), "relay: a different account key cannot open a session");
+	ck(relay_session(&A, &B, K, K, &itx, &irx, &rtx, &rrx), "relay: the same account key opens one, each side knows the other");
+
+	/* a big frame both ways */
+	for (size_t i = 0; i < 60000; i++) pl[i] = (uint8_t)(i * 7);
+	hkNoiseSeal(&itx, NULL, 0, pl, 60000, m);
+	hkRelaySend(&A, B.id, m, 60016);
+	n = relay_recv_from(&B, A.id, m, sizeof m);
+	ck(n == 60016 && hkNoiseOpen(&rrx, NULL, 0, m, 60016, pl) == 60000 && pl[59999] == (uint8_t)(59999 * 7),
+	   "relay: a 60 KB frame crosses intact");
+
+	/* the relay says when nobody is there */
+	{
+		char from[33];
+		uint8_t z[1] = {0};
+		hkRelaySend(&A, "0123456789abcdef0123456789abcdef", z, 1);
+		ck(hkRelayRecv(&A, from, m, sizeof m) == -2 && !strcmp(from, "0123456789abcdef0123456789abcdef"),
+		   "relay: a frame for an offline device comes back as offline");
+	}
+
+	/* the gates */
+	char u[320];
+	snprintf(u, sizeof u, "%s/v1/down", url);
+	ck(relay_status(u, "--max-time 3") == 401, "relay: no token, no stream");
+	ck(relay_status(u, "--max-time 3 -H 'Authorization: Bearer 00000000000000000000000000000000"
+	                   "00000000000000000000000000000000'") == 401, "relay: a made-up token, no stream");
+	{
+		char pubh[66], body[128];
+		hkHexEnc(pubh, A.s_pub, 32);
+		snprintf(u, sizeof u, "%s/v1/auth/challenge", url);
+		char *c = hkRelayPost(u, pubh);
+		ck(c && strlen(c) >= 97, "relay: a challenge is issued");
+		if (c && strlen(c) >= 97) {
+			snprintf(body, sizeof body, "%.32s %064d", c, 0);
+			snprintf(u, sizeof u, "%s/v1/auth/prove", url);
+			char *t = hkRelayPost(u, body);
+			ck(t && !strncmp(t, "no", 2), "relay: a wrong proof is refused");
+			free(t);
+			t = hkRelayPost(u, body);
+			ck(t && !strncmp(t, "no", 2), "relay: and the challenge is spent");
+			free(t);
+		}
+		free(c);
+	}
+	/* the desktop: :remote on over the relay. A plays the page (links it) and
+	   then the phone (a session, one HTTP request through a stream). */
+	{
+		hkRelayClose(&B);
+		char home[] = "/tmp/hakorelayhomeXXXXXX";
+		if (mkdtemp(home)) {
+			char hd[64];
+			snprintf(hd, sizeof hd, "%s/.hako", home);
+			mkdir(hd, 0700);
+			setenv("HOME", home, 1);
+		}
+		setenv("HAKO_RELAY_URL", url, 1);
+		setenv("HAKO_NO_BROWSER", "1", 1);
+		clInitAI(&G_AI);                          /* as main does; the link prints into it */
+		hsAttachSetPort(18797);
+		ck(hsAttachOn() && hrStart(), "desktop: remote on starts the relay link");
+		for (int i = 0; i < 50 && !hr_linking; i++) usleep(100000);
+		ck(hr_linking && !hr_has_k, "desktop: not linked, so it shows the link page");
+		hkHexEnc(pubh, hrm.s_pub, 32);
+		r = hkRelayCall(&A, "/v1/bind", pubh);
+		ck(r && !strcmp(r, "ok\n"), "desktop: the page binds it");
+		free(r);
+		uint8_t lk[32], pt[48], fr[1 + 88];
+		crypto_blake2b_keyed(lk, 32, hr_secret, 32, (const uint8_t *)"hako link key", 13);
+		memcpy(pt, K, 32); memcpy(pt + 32, A.acct, 16);
+		fr[0] = HR_LINK;
+		hkRandomBytes(fr + 1, 24);
+		crypto_aead_lock(fr + 41, fr + 25, lk, fr + 1, NULL, 0, pt, 48);
+		uint8_t bad[sizeof fr];
+		memcpy(bad, fr, sizeof fr); bad[50] ^= 1;
+		char mid[33];
+		hkRelayDeviceId(mid, hrm.s_pub);
+		hkRelaySend(&A, mid, bad, sizeof bad);
+		usleep(300000);
+		ck(!hr_has_k, "desktop: a tampered link frame is ignored");
+		hkRelaySend(&A, mid, fr, sizeof fr);
+		for (int i = 0; i < 50 && !hr_has_k; i++) usleep(100000);
+		for (int i = 0; i < 50 && !(hr.acct[0] && hr_cur == &hr); i++) usleep(100000);
+		ck(hr.acct[0] && !strcmp(hr.acct, A.acct) && strcmp(hr.id, mid), "desktop: this folder gets its own key, bound by the computer's");
+		usleep(300000);
+		ck(hr_has_k && !memcmp(hr_k, K, 32) && !strcmp(hr_acct, A.acct), "desktop: linked, the account key arrives");
+		{
+			char rp[PATH_MAX];
+			hrPath(rp, sizeof rp);
+			struct stat st;
+			ck(stat(rp, &st) == 0 && (st.st_mode & 077) == 0, "desktop: ~/.hako/remote is private");
+		}
+
+		/* the phone's session */
+		hkNoise I;
+		memset(&I, 0, sizeof I);
+		memcpy(I.s, A.s, 32); I.has_s = 1;
+		hkSessionPsk(I.psk, K); I.has_psk = 1;
+		hkNoiseInit(&I, "XXpsk3", 1, (const uint8_t *)"hako session", 12);
+		m[0] = HR_HS;
+		n = hkNoiseWrite(&I, NULL, 0, m + 1, sizeof m - 1);
+		hkRelaySend(&A, hr.id, m, (size_t)n + 1);
+		n = relay_recv_from(&A, hr.id, m, sizeof m);
+		ck(n > 1 && m[0] == HR_HS && hkNoiseRead(&I, m + 1, (size_t)n - 1, pl, sizeof pl) >= 0, "desktop: answers the session");
+		n = hkNoiseWrite(&I, NULL, 0, m + 1, sizeof m - 1);
+		hkRelaySend(&A, hr.id, m, (size_t)n + 1);
+		hkNoiseCipher ptx, prx;
+		hkNoiseSplit(&I, &ptx, &prx);
+		static const char rq[] = "GET /api/state HTTP/1.1\r\nHost: relay\r\n\r\n";
+		uint8_t plain[128];
+		plain[0] = plain[1] = plain[2] = 0; plain[3] = 7; plain[4] = HR_DATA;
+		memcpy(plain + 5, rq, sizeof rq - 1);
+		m[0] = HR_TP;
+		hkNoiseSeal(&ptx, NULL, 0, plain, 5 + sizeof rq - 1, m + 1);
+		hkRelaySend(&A, hr.id, m, 1 + 5 + sizeof rq - 1 + 16);
+		static char resp[65536];
+		size_t rl = 0;
+		int eof = 0;
+		while (!eof && (n = relay_recv_from(&A, hr.id, m, sizeof m)) > 1) {
+			long l = m[0] == HR_TP ? hkNoiseOpen(&prx, NULL, 0, m + 1, (size_t)n - 1, pl) : -1;
+			if (l < 5 || pl[3] != 7) break;
+			if (pl[4] == HR_EOF) eof = 1;
+			else if (rl + (size_t)l - 5 < sizeof resp) { memcpy(resp + rl, pl + 5, (size_t)l - 5); rl += (size_t)l - 5; }
+		}
+		resp[rl] = '\0';
+		ck(eof && !strncmp(resp, "HTTP/1.1 200", 12) && strstr(resp, "\"version\""),
+		   "desktop: /api/state answers through the encrypted stream, no token needed");
+		hsAttachOff();
+		ck(!hr_on, "desktop: remote off ends the link");
+	}
+	hkRelayClose(&A);
+	alarm(0);
+}
+
+int main(int argc, char **argv) {
+	if (argc == 5 && !strcmp(argv[1], "relay")) {
+		relay_tests(argv[2], argv[3], argv[4]);
+		printf(fails ? "%d FAILURES\n" : "relay tests passed\n", fails);
+		return fails ? 1 : 0;
+	}
 	/* A throwaway HOME: the tests grant project trust and write state, and doing
 	   that under the real one left a ~/.hako/projects entry per temp dir, forever. */
 	char home_tmpl[] = "/tmp/hakotesthomeXXXXXX";
@@ -1505,6 +1866,7 @@ int main(void) {
 	trust_prompt_tests();
 	shell_tests();
 	fit_tests();
+	crypto_tests();
 
 	printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
 	if (test_home) {

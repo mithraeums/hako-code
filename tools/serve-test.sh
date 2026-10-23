@@ -69,7 +69,47 @@ pid=$!; i=0; until curl -s -o /dev/null "$U/" || [ $i -ge 50 ]; do sleep 0.1; i=
 	&& ok "a tunnelled page with the token can post" || no "a tunnelled page with the token was refused"
 [ "$(code -X POST -H 'Origin: https://abc.trycloudflare.com' --data ':usage' "$U/api/slash")" = 401 ] \
 	&& ok "and without the token it cannot" || no "a tunnelled page without the token got in"
+[ "$(code -H 'Host: x.ts.net' -H 'Tailscale-User-Login: stranger@example.com' "$U/api/state")" = 401 ] \
+	&& ok "a made-up tailscale identity cannot read" || no "a forged Tailscale-User-Login got in"
 kill $pid 2>/dev/null; wait $pid 2>/dev/null
+
+# --token means reachable from another device (tailscale, LAN): every tool asks,
+# even with auto mode in the rc, an "always" answer counts once, nothing widens
+# permissions, and the folder routes stay inside the folder it was started in.
+FAKE=$(cd "$(dirname "$0")" && pwd)/tty/fakehakm.py
+rm -rf "$T/h" "$T/p"; mkdir -p "$T/h/.hako/models/hako-sho" "$T/p" "$T/out"
+echo fake >"$T/h/.hako/models/hako-sho/hako-sho.mlf2"
+printf 'ai_provider=mithraeum\nai_model=hako-sho\nshow_splash=0\nai_auto_approve=1\n' >"$T/h/.hakorc"
+K='Cookie: hako_token=t0ken42'
+HOME="$T/h" HAKO_HAKM="$FAKE" "$BIN" --serve --port $P --token t0ken42 --dir "$T/p" </dev/null >"$T/serve.out" 2>&1 &
+pid=$!; i=0; until curl -s -o /dev/null -H "$K" "$U/api/state" || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done
+curl -s -N -H "$K" "$U/api/events" >"$T/ev" 2>/dev/null &
+cp=$!; sleep 0.3
+post() { curl -s -H "$K" -X POST --data "$2" "$U/api/$1"; }
+case $(curl -s -H "$K" "$U/api/state") in *'"remote":1'*'"yolo":0'*) ok "state says remote, auto off";; *) no "state did not report remote";; esac
+post prompt 'TOOL list it' >/dev/null; sleep 1.2
+[ "$(grep -c '"type":"tool_request"' "$T/ev")" = 1 ] && ok "auto mode from the rc still asks" || no "a tool ran without asking"
+post approve a >/dev/null; sleep 1.2
+post prompt 'TOOL again' >/dev/null; sleep 1.2
+[ "$(grep -c '"type":"tool_request"' "$T/ev")" = 2 ] && ok "\"always\" counted once" || no "\"always\" was remembered for a remote device"
+post approve n >/dev/null; sleep 0.8
+for c in ':auto on' ':mode auto' ':mode' ':trust' ':remote'; do
+	n0=$(grep -c 'only the desktop terminal' "$T/ev"); post slash "$c" >/dev/null; sleep 0.4
+	[ "$(grep -c 'only the desktop terminal' "$T/ev")" -gt "$n0" ] && ok "refused: $c" || no "a remote device ran $c"
+done
+case $(curl -s -H "$K" "$U/api/state") in *'"yolo":0'*) ok "still not auto";; *) no "auto mode came on";; esac
+st=$(curl -s -H "$K" "$U/api/state")
+case $st in *'"places","'*|*'"find","'*) no "a remote device is offered places or find";;
+	*'"places":[]'*) ok "no places or find offered remotely";; *) no "places listed for a remote device";; esac
+case $(post open "$T") in *false*) ok "cannot open a folder outside";; *) no "opened a folder outside the root";; esac
+case $(post mkdir "$T/out/x") in *false*) ok "cannot mkdir outside";; *) no "made a folder outside the root";; esac
+case $(post mkdir "sub") in *true*) ok "can mkdir inside";; *) no "mkdir inside was refused";; esac
+case $(curl -s -H "$K" "$U/api/dirs?path=/") in *"\"path\":\"$(cd "$T/p" && pwd -P)\""*) ok "listing / shows the root instead";; *) no "listed outside the root";; esac
+post prompt 'hello' >/dev/null; sleep 1.5
+grep -q '"type":"delta"' "$T/ev" && ok "a headless reply streams as deltas" || no "no deltas from a headless turn"
+d=$(grep -n '"type":"delta"' "$T/ev" | tail -1 | cut -d: -f1); m=$(grep -n '"role":"ai"' "$T/ev" | tail -1 | cut -d: -f1)
+[ -n "$d" ] && [ -n "$m" ] && [ "$d" -lt "$m" ] && ok "and the finished message follows them" || no "a delta arrived after the finished message"
+kill $cp $pid 2>/dev/null; wait $cp $pid 2>/dev/null
 
 rm -rf "$T"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

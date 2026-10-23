@@ -79,7 +79,7 @@ ifeq ($(PLATFORM),macos)
     endif
 endif
 
-.PHONY: all hakm clean asan icons install uninstall sign win-check wasm-check themes-check test test-tty test-serve fuzz
+.PHONY: test-relay all hakm clean asan icons install uninstall sign win-check wasm-check themes-check test test-tty test-serve fuzz
 # make deletes a target when its recipe is interrupted — which, with signing in
 # the recipe, meant Ctrl-C (or a hung codesign) destroyed a perfectly good binary.
 .PRECIOUS: $(BIN)
@@ -220,8 +220,19 @@ themes-check:
 	@if [ -n "$(THEMES_PY)" ]; then python3 $(THEMES_PY) --check; else echo "themes: no ../hako-edit checkout — skipped"; fi
 
 test: tools/tests.c $(SRC) themes-check
-	$(CC) -O1 -Wall -Wextra -Dmain=hako_cli_main -I. tools/tests.c -o /tmp/hako_tests $(LDLIBS)
+	$(CC) -O1 -Wall -Wextra -DHAKO_RELAY -Dmain=hako_cli_main -I. tools/tests.c -o /tmp/hako_tests $(LDLIBS)
 	@/tmp/hako_tests
+
+# Two devices through a real relay on loopback: sign-in, Noise XX + the six
+# digits, a big frame, offline notices, refused tokens and proofs.
+RELAY      ?= ../hako-studio/relay/relay
+RELAY_PORT ?= 18790
+test-relay: tools/tests.c $(SRC)
+	@[ -x "$(RELAY)" ] || $(MAKE) -C $(dir $(RELAY)) relay
+	$(CC) -O1 -Wall -Wextra -DHAKO_RELAY -Dmain=hako_cli_main -I. tools/tests.c -o /tmp/hako_tests $(LDLIBS)
+	@d=$$(mktemp -d /tmp/hako-relay.XXXXXX); inv=$$($(RELAY) invite 1 -d $$d); \
+	$(RELAY) -p $(RELAY_PORT) -d $$d --dev 2>$$d/log & rp=$$!; sleep 0.3; \
+	/tmp/hako_tests relay http://127.0.0.1:$(RELAY_PORT) $$inv $$d/log; r=$$?; kill $$rp; wait $$rp 2>/dev/null; rm -rf $$d; exit $$r
 
 asan: $(SRC)
 	$(CC) -fsanitize=address,undefined -g -O1 -Wall $< -o hako_asan $(LDLIBS)
