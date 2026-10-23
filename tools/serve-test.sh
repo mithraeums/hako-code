@@ -73,7 +73,7 @@ pid=$!; i=0; until curl -s -o /dev/null "$U/" || [ $i -ge 50 ]; do sleep 0.1; i=
 	&& ok "a made-up tailscale identity cannot read" || no "a forged Tailscale-User-Login got in"
 kill $pid 2>/dev/null; wait $pid 2>/dev/null
 
-# --token means reachable from another device (tailscale, LAN): every tool asks,
+# --token means reachable from another device (the relay, LAN): every tool asks,
 # even with auto mode in the rc, an "always" answer counts once, nothing widens
 # permissions, and the folder routes stay inside the folder it was started in.
 FAKE=$(cd "$(dirname "$0")" && pwd)/tty/fakehakm.py

@@ -3,6 +3,19 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.6] - 2026-10-23
+
+### changed
+- **`:remote` is the relay only, tailscale is gone.** `:remote on` always goes through your account (invite beta) and links this computer the first time; bare `:remote` explains that and the headless way on the same wifi (`hako --serve --lan --token`). the tailscale identity login (`Tailscale-User-Login`) went with it, so from another device the token is the only way into `--serve`
+- **a device connecting is said once, at the desk only.** it used to land in the chat and the session log on every reconnect (a phone coming back to the page); now it shows in the terminal the first time each device connects per `:remote on`, and never reaches a device or the log
+- **signing in without a browser next to you (iSh, a server) is less fiddly.** the Claude sign-in link, and the ChatGPT / Copilot / GitHub Models device code, go on your clipboard (`/dev/clipboard` on iSh, pbcopy on macOS), so nothing has to be selected out of a wrapped, indented line. a pasted code or key loses any whitespace it picked up, and enter on an empty prompt takes the clipboard (only something token-shaped: one word, 20+ characters, not a link). device sign-ins say they are asking OpenAI or GitHub before the request, so a slow network is not silence
+
+### fixed
+- the `--serve` / `:remote` listener and its connections are close-on-exec: a curl hako started (every relay request) inherited the listening socket and could keep the port after hako quit
+
+### added
+- `POST /api/theme <name>` (and a `theme` pipe message): a front end's settings pick, applied and saved with nothing in the chat. the studio uses it; a typed `:theme <name>` still answers
+
 ## [v0.2.5] - 2026-10-22
 
 ### added

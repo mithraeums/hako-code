@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.2.5"
+#define HAKO_VERSION "0.2.6"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -2858,12 +2858,11 @@ static int cl_in_vp = 0;
 
 static volatile sig_atomic_t cl_winch = 0;
 static int hk_queue_n;           /* messages typed during a turn, waiting to run */
-/* --serve --token or :remote on: reachable from another device (tailscale, LAN),
+/* --serve --token or :remote on: reachable from another device (the relay, LAN),
    so every tool asks: no auto mode, no "always" rules, set only at the desktop. */
 static int hs_remote = 0;
 static volatile int hs_attached = 0;       /* :remote on, inside this terminal session */
 static volatile int hs_streams = 0;        /* devices watching (open event streams) */
-static char hs_ts_host[128], hs_ts_login[128];  /* this machine on its tailnet, and its owner */
 static void hkAllowSummary(char *out, size_t cap);
 
 /* A drag sends resizes faster than a bar can be drawn: one drawn at one width
@@ -4232,6 +4231,76 @@ static const char *clProviderConsoleUrl(const char *name) {
 	return NULL;
 }
 
+/* The clipboard where it is a file or a command away: iSh's /dev/clipboard, macOS pbcopy.
+   A link or code copied for you beats selecting it out of a wrapped, indented line. */
+static int hkClipCopy(const char *s) {
+#if defined(HAKO_WASM) || defined(_WIN32)
+	(void)s;
+	return 0;
+#else
+	int ok = 0;
+	FILE *f = fopen("/dev/clipboard", "w");
+	if (f) { ok = fputs(s, f) >= 0; return (fclose(f) == 0) && ok; }
+#ifdef __APPLE__
+	if ((f = popen("pbcopy", "w")) != NULL) { ok = fputs(s, f) >= 0; ok = (pclose(f) == 0) && ok; }
+#endif
+	return ok;
+#endif
+}
+
+static int hkClipAvailable(void) {
+#if defined(HAKO_WASM) || defined(_WIN32)
+	return 0;
+#elif defined(__APPLE__)
+	return 1;
+#else
+	return access("/dev/clipboard", R_OK) == 0;
+#endif
+}
+
+/* Codes and keys never hold whitespace: drop all of it, which also undoes a paste
+   that picked up a wrapped line's indent. */
+static void hkSqueezeSpace(char *s) {
+	char *w = s;
+	for (; *s; s++) if (!isspace((unsigned char)*s)) *w++ = *s;
+	*w = '\0';
+}
+
+/* One word of 20+ chars, not a link: what a code or key looks like. */
+static int hkLooksLikeToken(const char *a, size_t n) {
+	if (n < 20) return 0;
+	for (size_t i = 0; i < n; i++) {
+		if (isspace((unsigned char)a[i])) return 0;
+		if (i + 2 < n && a[i] == ':' && a[i + 1] == '/' && a[i + 2] == '/') return 0;
+	}
+	return 1;
+}
+
+/* Enter on an empty prompt: the clipboard, if what is there looks like a token,
+   so a stray clipboard never becomes an API key. */
+static void hkClipToken(char *buf, size_t cap) {
+	buf[0] = '\0';
+#if !defined(HAKO_WASM) && !defined(_WIN32)
+	int piped = 0;
+	FILE *f = fopen("/dev/clipboard", "r");
+#ifdef __APPLE__
+	if (!f) { f = popen("pbpaste", "r"); piped = 1; }
+#endif
+	if (!f) return;
+	size_t n = fread(buf, 1, cap - 1, f);
+	buf[n] = '\0';
+	if (piped) pclose(f); else fclose(f);
+	char *a = buf, *e = buf + strlen(buf);
+	while (*a && isspace((unsigned char)*a)) a++;
+	while (e > a && isspace((unsigned char)e[-1])) e--;
+	if (!hkLooksLikeToken(a, (size_t)(e - a))) { buf[0] = '\0'; return; }
+	memmove(buf, a, (size_t)(e - a));
+	buf[e - a] = '\0';
+#else
+	(void)cap; (void)hkLooksLikeToken;
+#endif
+}
+
 static void clOpenUrl(const char *url) {
 #ifdef HAKO_WASM
 	(void)url;      /* the front end opens links; there is no launcher to call */
@@ -4259,7 +4328,7 @@ static void clReadHidden(char *buf, size_t cap) {
 	hkServeInput("paste the value", 1, buf, cap);
 	return;
 #else
-	if (E.serve_mode) { hkServeInput("paste the code", 1, buf, cap); return; }
+	if (E.serve_mode) { hkServeInput("paste the code", 1, buf, cap); hkSqueezeSpace(buf); return; }
 #ifndef _WIN32
 	struct termios old, neu;
 	int isterm = (tcgetattr(STDIN_FILENO, &old) == 0);
@@ -4276,6 +4345,8 @@ static void clReadHidden(char *buf, size_t cap) {
 #endif
 	char *nl = strchr(buf, '\n'); if (nl) *nl = '\0';
 #endif
+	hkSqueezeSpace(buf);
+	if (!buf[0] && hkClipAvailable()) hkClipToken(buf, cap);
 }
 
 static void clEnvApplyOpenAIKey(const char *envname) {
@@ -8044,52 +8115,6 @@ static char *hkDiffPreview(const char *name, const char *input_json, int color) 
 	return NULL;
 }
 
-#ifndef HAKO_WASM
-/* This machine's tailnet name, or 0 when tailscale is missing or logged out.
-   The macOS app install puts its CLI inside the bundle, not on PATH. With
-   login, also the owner's login name (what tailscale serve sends as
-   Tailscale-User-Login for that person's own devices). */
-static int hkTailscaleName(char *out, size_t cap, char *login, size_t lcap) {
-	static const char *bins[] = { "tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale", NULL };
-	out[0] = '\0';
-	for (int i = 0; bins[i] && !out[0]; i++) {
-		char cmd[160];
-#ifdef _WIN32
-		snprintf(cmd, sizeof(cmd), "\"%s\" status --json 2>nul", bins[i]);
-#else
-		snprintf(cmd, sizeof(cmd), "\"%s\" status --json 2>/dev/null", bins[i]);
-#endif
-		FILE *fp = popen(cmd, "r");
-		if (!fp) continue;
-		char *buf = NULL, chunk[4096];
-		size_t len = 0, bcap = 0, n;
-		while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0 && len < (1u << 20))
-			hkSbAdd(&buf, &len, &bcap, chunk, n);
-		pclose(fp);
-		const char *self = buf ? strstr(buf, "\"Self\"") : NULL;
-		char *dns = self ? hkExtractJsonString(self, "DNSName") : NULL;
-		if (dns && *dns) {
-			size_t dl = strlen(dns);
-			if (dns[dl - 1] == '.') dns[dl - 1] = '\0';
-			snprintf(out, cap, "%s", dns);
-		}
-		const char *uid = self ? strstr(self, "\"UserID\":") : NULL;
-		const char *users = buf ? strstr(buf, "\"User\":") : NULL;
-		if (login && lcap) login[0] = '\0';
-		if (login && uid && users && out[0]) {
-			char key[48];
-			snprintf(key, sizeof key, "\"%lld\":", strtoll(uid + 9, NULL, 10));
-			const char *row = strstr(users, key);
-			char *ln = row ? hkExtractJsonString(row, "LoginName") : NULL;
-			if (ln) snprintf(login, lcap, "%s", ln);
-			free(ln);
-		}
-		free(dns);
-		free(buf);
-	}
-	return out[0] != '\0';
-}
-#endif
 
 static int hkToolApprovalInner(const char *name, const char *input_json);
 
@@ -13569,7 +13594,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		} else {
 			aiAddHistory(data, "custom provider — set ai_endpoint via /provider or .hakorc");
 		}
-		printf("  paste API key (input hidden): ");
+		printf("  paste API key (input hidden%s): ", hkClipAvailable() ? ", enter alone uses the clipboard" : "");
 		fflush(stdout);
 		char key[1024];
 		clReadHidden(key, sizeof(key));
@@ -14215,10 +14240,6 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			return 1;
 		}
 
-		/* Tailscale serve, never funnel: funnel is the public internet. Other
-		   tunnels end TLS at their company, which then reads everything. */
-		char ts[256];
-		ts[0] = '\0';
 #if HK_ATTACH
 		const char *ra = arg ? arg : "";
 		if (!strcmp(ra, "off")) {
@@ -14245,31 +14266,16 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			aiAddHistory(data, "remote: on, this session is shared until :remote off");
 			int linked = hrStart() && hrLinked();
 			if (linked) aiSayf(data, "  phone:   %s, signed in to your account", hrStudioUrl());
-			if (linked) aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
-			else if (hkTailscaleName(hs_ts_host, sizeof(hs_ts_host), hs_ts_login, sizeof(hs_ts_login))) {
-				aiSayf(data, "  once:    tailscale serve --bg %d", port);
-				if (hs_ts_login[0])
-					aiSayf(data, "  phone:   https://%s   (signed in as %s, nothing to type)", hs_ts_host, hs_ts_login);
-				else
-					aiSayfSecret(data, "  phone:   https://%s/?t=%s", hs_ts_host, tok);
-				aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
-			} else aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
+			aiSayfSecret(data, "  here:    http://127.0.0.1:%d/?t=%s", port, tok);
 			aiAddHistory(data, "  every tool asks, \"always\" counts once, and the phone stays in this folder");
 			return 1;
 		}
 #endif
-		aiAddHistory(data, ":remote on shares this session with your phone. or headless, over tailscale:");
-		aiSayfSecret(data, "  1  hako --serve --token %s      (here, in another terminal)", tok);
-		if (hkTailscaleName(ts, sizeof(ts), NULL, 0)) {
-			aiAddHistory(data, "  2  tailscale serve --bg 8787      (private to your tailnet, real https)");
-			aiSayfSecret(data, "  3  on the phone, tailscale on:  https://%s/?t=%s", ts, tok);
-		} else {
-			aiAddHistory(data, "  2  install tailscale on this computer and the phone, sign both in, then :remote again");
-			aiSayfSecret(data, "on the same wifi instead: add --lan and open the printed address with ?t=%s", tok);
-		}
+		aiAddHistory(data, ":remote on shares this session through your account, from any signed-in browser (invite beta)");
+		aiSayfSecret(data, "headless on the same wifi: hako --serve --lan --token %s, and open the printed address with ?t=%s", tok, tok);
 		aiAddHistory(data, "the phone can prompt and approve, every tool asks, and it cannot turn on auto or leave this folder");
 #ifdef __APPLE__
-		if (!ts[0]) aiAddHistory(data, "macOS drops wifi connections to unsigned binaries: run `make sign` if the phone cannot connect");
+		aiAddHistory(data, "macOS drops wifi connections to unsigned binaries: run `make sign` if the phone cannot connect");
 #endif
 		return 1;
 #endif
@@ -15579,6 +15585,7 @@ static int clOAuthGithubCopilot(aiData *data) {
 
 	char body[256];
 	snprintf(body, sizeof(body), "{\"client_id\":\"%s\",\"scope\":\"read:user\"}", client_id);
+	aiAddHistory(data, "asking GitHub for a sign-in code");   /* a slow network (iSh) is not silence */
 	char *resp = clCurlPost(HAKO_COPILOT_DEVICE_URL, body, NULL);
 	if (!resp) { aiAddHistory(data, "OAuth: device request failed"); return -1; }
 	char *device_code = hkExtractJsonString(resp, "device_code");
@@ -15597,6 +15604,7 @@ static int clOAuthGithubCopilot(aiData *data) {
 	char line[512];
 	snprintf(line, sizeof(line), "Visit: %s", verify_uri); aiAddHistory(data, line);
 	snprintf(line, sizeof(line), "Code:  %s", user_code); aiAddHistory(data, line);
+	if (hkClipCopy(user_code)) aiAddHistory(data, "the code is on your clipboard");
 	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
 	clOpenUrl(verify_uri);
 
@@ -15646,6 +15654,7 @@ static int clOAuthGithubModels(aiData *data) {
 
 	char body[256];
 	snprintf(body, sizeof(body), "{\"client_id\":\"%s\",\"scope\":\"read:user\"}", client_id);
+	aiAddHistory(data, "asking GitHub for a sign-in code");   /* a slow network (iSh) is not silence */
 	char *resp = clCurlPost(HAKO_COPILOT_DEVICE_URL, body, NULL);
 	if (!resp) { aiAddHistory(data, "OAuth: device request failed"); return -1; }
 	char *device_code = hkExtractJsonString(resp, "device_code");
@@ -15664,6 +15673,7 @@ static int clOAuthGithubModels(aiData *data) {
 	char line[512];
 	snprintf(line, sizeof(line), "Visit: %s", verify_uri); aiAddHistory(data, line);
 	snprintf(line, sizeof(line), "Code:  %s", user_code); aiAddHistory(data, line);
+	if (hkClipCopy(user_code)) aiAddHistory(data, "the code is on your clipboard");
 	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
 	clOpenUrl(verify_uri);
 
@@ -15779,6 +15789,7 @@ static int hkChatGPTStore(const char *resp) {
 }
 
 static int clOAuthChatGPT(aiData *data) {
+	aiAddHistory(data, "asking OpenAI for a sign-in code");
 	char *resp = clCurlPost(HAKO_CHATGPT_ISSUER "/api/accounts/deviceauth/usercode",
 	                        "{\"client_id\":\"" HAKO_CHATGPT_CLIENT_ID "\"}", NULL);
 	if (!resp) { aiAddHistory(data, "ChatGPT: device request failed (network?)"); return -1; }
@@ -15797,6 +15808,7 @@ static int clOAuthChatGPT(aiData *data) {
 
 	aiAddHistory(data, "Visit: " HAKO_CHATGPT_ISSUER "/codex/device");
 	aiSayf(data, "Code:  %s", code);
+	if (hkClipCopy(code)) aiAddHistory(data, "the code is on your clipboard");
 	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
 	clOpenUrl(HAKO_CHATGPT_ISSUER "/codex/device");
 
@@ -16053,9 +16065,10 @@ static int clOAuthAnthropic(aiData *data) {
 	aiAddHistory(data, "Sign in at this URL, then paste the code shown:");
 	aiAddHistory(data, url);
 	aiAddHistory(data, "(format: <code>#<state>  — copy the whole string)");
+	if (hkClipCopy(url)) aiAddHistory(data, "the link is on your clipboard: paste it into a browser");
 	clOpenUrl(url);
 
-	printf("  paste code (input hidden): ");
+	printf("  paste code (input hidden%s): ", hkClipAvailable() ? ", enter alone uses the clipboard" : "");
 	fflush(stdout);
 	char paste[512];
 	clReadHidden(paste, sizeof(paste));
@@ -16118,6 +16131,14 @@ static int clOAuthAnthropicExchange(aiData *data, char *paste, const char *verif
 	return 0;
 }
 
+/* A socket no child should inherit: a curl or shell left holding the listener keeps the port after hako quits. */
+static int hkCloexec(int fd) {
+#if defined(F_SETFD) && defined(FD_CLOEXEC)
+	if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+	return fd;
+}
+
 static char *clOAuthRandomVerifier(void) {
 	static const char alpha[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 	char *out = malloc(48);
@@ -16135,7 +16156,7 @@ static int clOAuthLoopbackListen(int *out_port) {
 	(void)out_port;
 	return -1;
 #else
-	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	int fd = hkCloexec(socket(AF_INET, SOCK_STREAM, 0));
 	if (fd < 0) return -1;
 	int yes = 1;
 	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
@@ -16163,7 +16184,7 @@ static char *clOAuthLoopbackWait(int srv_fd, int timeout_sec) {
 	fd_set r; FD_ZERO(&r); FD_SET(srv_fd, &r);
 	int n = select(srv_fd + 1, &r, NULL, NULL, &tv);
 	if (n <= 0) return NULL;
-	int c = accept(srv_fd, NULL, NULL);
+	int c = hkCloexec(accept(srv_fd, NULL, NULL));
 	if (c < 0) return NULL;
 	char buf[4096];
 	int got = (int)read(c, buf, sizeof(buf) - 1);
@@ -17578,6 +17599,11 @@ static int clPipeHandleLine(aiData *data, const char *line) {
 		}
 		free(dir);
 		clPipeEmitDone(NULL);
+	} else if (strcmp(type, "theme") == 0) {          /* a settings pick: applied and saved, nothing said */
+		char *name = hkExtractJsonString(line, "name");
+		for (int i = 0; name && i < TH_PRESET_COUNT; i++)
+			if (!strcmp(TH_PRESETS[i].name, name)) { clThemeApply(name); hkSaveSession(); break; }
+		free(name);
 	}
 
 	free(type);
@@ -18626,34 +18652,6 @@ static int hsAuthOk(const char *req) {
 	return 0;
 }
 
-/* The owner's own device through tailscale serve: it connects from loopback,
-   names this machine's tailnet host, and carries the identity header serve
-   sets (and strips from what the client sent). A LAN peer cannot forge it,
-   since it does not come from loopback. */
-static int hsTailnetOwner(int fd, const char *req) {
-	if (!hs_ts_login[0] || !hs_ts_host[0]) return 0;
-	struct sockaddr_storage ss;
-	socklen_t sl = sizeof ss;
-	if (getpeername(fd, (struct sockaddr *)&ss, &sl) != 0) return 0;
-	if (ss.ss_family == AF_INET) {
-		if ((ntohl(((struct sockaddr_in *)&ss)->sin_addr.s_addr) >> 24) != 127) return 0;
-	} else if (ss.ss_family == AF_INET6) {
-		if (!IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *)&ss)->sin6_addr)) return 0;
-	} else return 0;
-	const char *h = strcasestr(req, "\r\nHost:");
-	if (!h) return 0;
-	h += 7;
-	while (*h == ' ') h++;
-	size_t hl = strlen(hs_ts_host);
-	if (strncasecmp(h, hs_ts_host, hl) != 0 || (h[hl] != '\r' && h[hl] != ':')) return 0;
-	const char *u = strcasestr(req, "\r\nTailscale-User-Login:");
-	if (!u) return 0;
-	u += 24;
-	while (*u == ' ') u++;
-	size_t ul = strlen(hs_ts_login);
-	return strncmp(u, hs_ts_login, ul) == 0 && u[ul] == '\r';
-}
-
 /* A connection the relay link made (a socketpair end): Noise already proved
    the sender holds the account key, so the token and host checks do not apply. */
 #define HS_TRUSTED ((intptr_t)1 << 30)
@@ -18682,7 +18680,7 @@ static void *hsConnThread(void *arg) {
 
 	/* A tunnel makes this reachable from anywhere, and the agent runs tools as
 	   the user. The token is what stands between a URL and a shell. */
-	if (!trusted && HS.token[0] && !hsAuthOk(req) && !hsTailnetOwner(fd, req)) {
+	if (!trusted && HS.token[0] && !hsAuthOk(req)) {
 		const char *t = strstr(req, "?t=");
 		if (t && !strncmp(req, "GET ", 4) && !strncmp(t + 3, HS.token, strlen(HS.token))) {
 			/* Hand it to the browser as a cookie and get it out of the URL, so
@@ -18821,6 +18819,11 @@ static void *hsConnThread(void *arg) {
 		int slash = !strncmp(req, "POST /api/slash", 15);
 		char *body = hsReadBody(fd, req, used);
 		if (body && *body) hsEnqueueCmd(slash ? "slash" : "prompt", slash ? "cmd" : "text", body);
+		free(body);
+		hsSendOk(fd, 1);
+	} else if (!strncmp(req, "POST /api/theme", 15)) {
+		char *body = hsReadBody(fd, req, used);
+		if (body && *body) hsEnqueueCmd("theme", "name", body);
 		free(body);
 		hsSendOk(fd, 1);
 	} else if (!strncmp(req, "POST /api/approve", 17)) {
@@ -18977,7 +18980,7 @@ static void *hsIdleThread(void *arg) {
 static void *hsAcceptThread(void *arg) {
 	int srv = (int)(intptr_t)arg;
 	for (;;) {
-		int fd = (int)accept(srv, NULL, NULL);
+		int fd = hkCloexec((int)accept(srv, NULL, NULL));
 		if (hs_listen_stop) {               /* :remote off woke us with a connect */
 			if (fd >= 0) hs_close(fd);
 			hs_close(srv);
@@ -18999,7 +19002,7 @@ static void *hsAcceptThread(void *arg) {
 }
 
 static int hsOpenListener(void) {
-	int srv = (int)socket(AF_INET, SOCK_STREAM, 0);
+	int srv = hkCloexec((int)socket(AF_INET, SOCK_STREAM, 0));
 	if (srv < 0) { fprintf(stderr, "hako: socket failed (error %d)\n", hs_errno()); return -1; }
 	int yes = 1;
 	setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
@@ -19076,7 +19079,6 @@ static void hsAttachOff(void) {
 	hrStop();
 	hs_attached = 0;
 	hs_remote = 0;
-	hs_ts_login[0] = '\0';
 	hs_listen_stop = 1;
 	hsReleaseWaits();
 	int s = (int)socket(AF_INET, SOCK_STREAM, 0);    /* wake the accept() so it can exit */
@@ -19115,7 +19117,7 @@ enum { HR_DATA = 1, HR_EOF = 2, HR_RESET = 3 };      /* stream ops, after the 4-
 
 typedef struct { int sid, fd; } hrStream;
 typedef struct {
-	int used, ready;
+	int used, ready, said;         /* said: the desk was told this device connected */
 	unsigned gen;                  /* bumped on every new handshake */
 	char id[33];
 	hkNoise hs;
@@ -19284,9 +19286,10 @@ static void hrOnHandshake(const char *from, const uint8_t *m, size_t n) {
 		if (hkNoiseRead(&p->hs, m, n, pl, sizeof pl) >= 0 && hkNoiseDone(&p->hs)) {
 			hkNoiseSplit(&p->hs, &p->tx, &p->rx);
 			p->ready = 1;
+			int first = !p->said;
+			p->said = 1;
 			pthread_mutex_unlock(&hr_lock);
-			aiAddHistory(&G_AI, "remote: a device on your account connected");
-			hkLogMessage("system", "remote: a device on your account connected");
+			if (first) aiSayfSecret(&G_AI, "remote: a device on your account connected");   /* the desk's to know, not the chat's */
 			return;
 		}
 		p->hs = keep;                       /* not message 3: maybe a fresh message 1 */
@@ -19319,6 +19322,7 @@ static void hrOnTransport(const char *from, const uint8_t *m, size_t n) {
 	if (!st && op == HR_DATA && spare) {
 		int sv[2];
 		if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0) {
+			hkCloexec(sv[0]); hkCloexec(sv[1]);
 			pthread_t t;
 			hrPump *a = malloc(sizeof *a);
 			if (a) { a->peer = (int)(p - hr_peers); a->gen = p->gen; a->sid = sid; a->fd = sv[1]; }
@@ -19468,6 +19472,7 @@ static int hrLinked(void) { return hr_has_k; }
 
 static int hrStart(void) {
 	if (hr_on) return 1;
+	for (int i = 0; i < HR_PEERS; i++) hr_peers[i].said = 0;
 	memset(&hr, 0, sizeof hr);
 	memset(&hrm, 0, sizeof hrm);
 	snprintf(hr.url, sizeof hr.url, "%s", hrRelayUrl());
@@ -19558,9 +19563,6 @@ static int clServeMode(aiData *data, const char *dir) {
 #endif
 	if (HS.token[0]) {
 		printf("  open     http://%s:%d/?t=%s\n", HS.bind_addr, HS.port, HS.token);
-		if (hkTailscaleName(hs_ts_host, sizeof(hs_ts_host), hs_ts_login, sizeof(hs_ts_login)) && hs_ts_login[0])
-			printf("  phone    https://%s   (tailscale serve --bg %d; signed in as %s, nothing to type)\n",
-			       hs_ts_host, HS.port, hs_ts_login);
 	}
 	if (strcmp(HS.bind_addr, "127.0.0.1") != 0) hsPrintLanUrls();
 	fflush(stdout);

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.5-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.5"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.6-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.6"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-13-2636c4?style=flat-square&labelColor=14130f" alt="13 providers"/>
@@ -111,7 +111,7 @@ being small enough to live anywhere is the whole point.
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
 - **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `~/.hako/skills` and `~/.claude/skills`, nearest first. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
-- **Drive it from your phone.** `:remote on` shares the session you are in. Sign in at hako.mithraeum.studio on any device and ☰ → code lists your sessions, one per folder; open one and you are in the same chat as the terminal, end to end encrypted (Noise XXpsk3) through a relay that only routes ciphertext and keeps no chats. Tools still ask, and the phone gets less than the desk: no `:auto`, no `:trust`, nothing outside the folder. Invite beta; without an account `:remote` sets up `tailscale serve` instead.
+- **Drive it from your phone.** `:remote on` shares the session you are in. Sign in at hako.mithraeum.studio on any device and ☰ → code lists your sessions, one per folder; open one and you are in the same chat as the terminal, end to end encrypted (Noise XXpsk3) through a relay that only routes ciphertext and keeps no chats. Tools still ask, and the phone gets less than the desk: no `:auto`, no `:trust`, nothing outside the folder. Invite beta: the first `:remote on` links this computer to your account.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
 - **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON — *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
 - **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
@@ -355,12 +355,11 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.2.5
-- **Drive a session from your phone, from anywhere.** `:remote on` links this computer to your account once; after that hako.mithraeum.studio on any device lists your code sessions by folder and opens them, end to end encrypted through a relay that routes ciphertext and stores no chats. Stop, approvals and questions work from either side. Invite beta.
-- **Sign in with ChatGPT.** `:login chatgpt` uses your ChatGPT plan, free included, with OpenAI's device sign-in: open the link, type the code, nothing to paste.
-- **`:login` is a menu**, and menus leave no trace: open `:model`, `:theme` or `:login` and close it, and nothing lands in the chat or the session log.
-- **Without an account `:remote` is tailscale:** private to your tailnet, real https, no funnel, no third-party tunnel.
-- Ships with **hako-edit v0.1.8** and **hako studio v0.0.4**.
+### Latest — v0.2.6
+- **`:remote` is the relay only.** Tailscale is gone: `:remote on` always goes through your account (invite beta), and links this computer the first time.
+- **Signing in on iSh, or anywhere without a browser beside you, is less fiddly.** The sign-in link or device code goes on your clipboard, a pasted code loses any stray whitespace, and enter on an empty prompt takes the clipboard.
+- **Quieter.** A device reconnecting is said once, at the desk only; a theme picked in the studio says nothing in the chat.
+- Ships with **hako studio v0.0.5**.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -368,7 +367,7 @@ Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)
 
 ## Roadmap
 
-**Shipped through v0.2.5** — `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
+**Shipped through v0.2.6** — `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
 termios line editor · `--update` · directory skills + `read_skill` · PKCE without openssl ·
 universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
 local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
