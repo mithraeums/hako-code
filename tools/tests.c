@@ -1429,6 +1429,20 @@ static void noise_vector(const hkTv *tv) {
 	ck(split, what);
 }
 
+/* A pasted code or key: whitespace from a wrapped, indented line is dropped,
+   and only something token-shaped is taken off the clipboard. */
+static void paste_tests(void) {
+	char b[96];
+	snprintf(b, sizeof b, "  abc123\n   def#456 \t\r\n");
+	hkSqueezeSpace(b);
+	ck(!strcmp(b, "abc123def#456"), "a wrapped, indented paste comes back as one code");
+	ck(hkLooksLikeToken("sk-ant-api03-abcdefghijklmnop", 29), "an API key is token-shaped");
+	ck(hkLooksLikeToken("Xy12abcdefghij#state0123456789", 30), "a <code>#<state> is token-shaped");
+	ck(!hkLooksLikeToken("https://example.com/abcdefghijkl", 32), "a link is not taken as a key");
+	ck(!hkLooksLikeToken("two words, both long enough", 27), "a sentence is not taken as a key");
+	ck(!hkLooksLikeToken("short", 5), "a short word is not taken as a key");
+}
+
 static void crypto_tests(void) {
 	uint8_t a[32], u[32], out[64];
 	/* RFC 7748 5.2 */
@@ -1866,6 +1880,7 @@ int main(int argc, char **argv) {
 	trust_prompt_tests();
 	shell_tests();
 	fit_tests();
+	paste_tests();
 	crypto_tests();
 
 	printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
