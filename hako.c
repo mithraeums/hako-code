@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.2.7"
+#define HAKO_VERSION "0.2.8"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -416,7 +416,9 @@ static int   hk_fs_mkdirp(const char *path);
 static int   hk_fs_remove(const char *path);
 static char *hk_fs_list(const char *path);
 
+#if defined(_WIN32) || defined(HAKO_WASM)
 static char *hk_shell_capture(const char *cmd, long max_bytes, int *exit_code);
+#endif
 static int hkSbAdd(char **buf, size_t *len, size_t *cap, const char *s, size_t n);
 
 /* Format into a fixed buffer and say whether it FIT. */
@@ -2739,6 +2741,7 @@ static int clOAuthGithubModels(aiData *data);
 static int clOAuthOpenRouter(aiData *data);
 static int clOAuthChatGPT(aiData *data);
 static int clOAuthChatGPTRefresh(aiData *data);
+static int clOAuthNous(aiData *data);
 static void hkHealModelForProvider(aiData *data);
 static int clOAuthRefresh(aiData *data);
 static void clOAuthEnsureFresh(aiData *data);
@@ -3116,7 +3119,7 @@ static void clWinchInstall(void) {
 }
 
 static char *cl_preset_input = NULL;
-static char *aiExtractResponse(const char *json, enum aiProviderType type);
+static char *aiExtractResponse(const char *json, enum aiProviderType type, int *is_err);
 static char *hkExecTool(const char *name, const char *input_json);
 static char *hkExtractContentArray(const char *response);
 static char *hkExtractRawJsonArray(const char *src, const char *key);
@@ -3165,8 +3168,40 @@ static char *hk_slurp(FILE *fp, size_t cap_max) {
 	return buf;
 }
 
-static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_cap) {
+/* Headers carry keys and tokens; on curl's argv any local user could read them with ps.
+   Each -H '...' goes to a 0600 file passed as -H @file; anything else stays on the line. */
+static char *hkHeadersToFile(const char *hdrs, char *path, size_t cap) {
+	path[0] = '\0';
+	size_t n = strlen(hdrs);
+	char *rest = malloc(n + cap + 8);
+	if (!rest) return NULL;
+	size_t r = 0;
+	int fd = -1;
+	const char *p = hdrs;
+	while (*p) {
+		if (!strncmp(p, "-H '", 4)) {
+			const char *v = p + 4, *e = strchr(v, '\'');
+			if (!e) break;
+			if (fd < 0) {
+				snprintf(path, cap, "/tmp/hako_hdr_XXXXXX");
+				if ((fd = mkstemp(path)) < 0) { path[0] = '\0'; free(rest); return NULL; }
+			}
+			if (write(fd, v, (size_t)(e - v)) < 0 || write(fd, "\n", 1) < 0) {
+				close(fd); unlink(path); path[0] = '\0'; free(rest); return NULL;
+			}
+			p = e + 1;
+			continue;
+		}
+		rest[r++] = *p++;
+	}
+	if (fd >= 0) { close(fd); r += (size_t)snprintf(rest + r, cap + 8, " -H @%s ", path); }
+	rest[r] = '\0';
+	return rest;
+}
+
+static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_cap, char *hdr_tmp) {
 	body_tmp[0] = '\0';
+	hdr_tmp[0] = '\0';
 	if (req->body) {
 		snprintf(body_tmp, tmp_cap, "/tmp/hako_req_XXXXXX");
 		int fd = mkstemp(body_tmp);
@@ -3174,9 +3209,14 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 		if (write(fd, req->body, strlen(req->body)) < 0) { close(fd); unlink(body_tmp); return NULL; }
 		close(fd);
 	}
-	size_t cap = strlen(req->url) + (req->headers ? strlen(req->headers) : 0) + 576;
+	char *hdrs = NULL;
+	if (req->headers && *req->headers) {
+		hdrs = hkHeadersToFile(req->headers, hdr_tmp, tmp_cap);
+		if (!hdrs) { if (body_tmp[0]) unlink(body_tmp); return NULL; }
+	}
+	size_t cap = strlen(req->url) + (hdrs ? strlen(hdrs) : 0) + 576;
 	char *cmd = malloc(cap);
-	if (!cmd) { if (body_tmp[0]) unlink(body_tmp); return NULL; }
+	if (!cmd) { free(hdrs); if (body_tmp[0]) unlink(body_tmp); if (hdr_tmp[0]) unlink(hdr_tmp); return NULL; }
 	int has_accept = req->headers && (strstr(req->headers, "accept:") || strstr(req->headers, "Accept:"));
 	int has_ctype = req->headers && strstr(req->headers, "Content-Type:");
 	char limits[64];
@@ -3191,7 +3231,7 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 		req->stream ? "N" : "", limits,
 		req->method ? req->method : "GET", req->url, HAKO_VERSION,
 		has_accept ? "" : "-H 'Accept: application/json' ",
-		req->headers ? req->headers : "",
+		hdrs ? hdrs : "",
 		req->body ? (has_ctype ? " --data @" : " -H 'Content-Type: application/json' --data @") : "",
 		req->body ? body_tmp : "",
 		"");
@@ -3202,28 +3242,30 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 	for (const char *p = cmd; *p; p++) if (*p == '\'') quotes++;
 	if (quotes & 1) {
 		fprintf(stderr, "hako: refusing a malformed request (credential too long or corrupt)\n");
-		free(cmd);
+		free(cmd); free(hdrs);
 		if (body_tmp[0]) unlink(body_tmp);
+		if (hdr_tmp[0]) unlink(hdr_tmp);
 		return NULL;
 	}
+	free(hdrs);
 	return cmd;
 }
 
 static char *hk_http_fetch(const hkHttpReq *req) {
 	if (!req || !req->url) return NULL;
-	char tmp[64];
-	char *cmd = hk_http_curl_cmd(req, tmp, sizeof(tmp));
+	char tmp[64], htmp[64];
+	char *cmd = hk_http_curl_cmd(req, tmp, sizeof(tmp), htmp);
 	if (!cmd) return NULL;
 	FILE *fp = popen(cmd, "r");
 	free(cmd);
-	if (!fp) { if (tmp[0]) unlink(tmp); return NULL; }
-	char *out = hk_slurp(fp, 0);
-	pclose(fp);
+	char *out = fp ? hk_slurp(fp, 0) : NULL;
+	if (fp) pclose(fp);
 	if (tmp[0]) unlink(tmp);
+	if (htmp[0]) unlink(htmp);
 	return out;
 }
 
-typedef struct { FILE *fp; char tmp[64]; } hkHttpNative;
+typedef struct { FILE *fp; char tmp[64], htmp[64]; } hkHttpNative;
 
 static void *hk_http_open(const hkHttpReq *req) {
 	if (!req || !req->url) return NULL;
@@ -3232,11 +3274,11 @@ static void *hk_http_open(const hkHttpReq *req) {
 	                     req->body ? strlen(req->body) : (size_t)0);
 	hkHttpNative *h = calloc(1, sizeof(*h));
 	if (!h) return NULL;
-	char *cmd = hk_http_curl_cmd(req, h->tmp, sizeof(h->tmp));
+	char *cmd = hk_http_curl_cmd(req, h->tmp, sizeof(h->tmp), h->htmp);
 	if (!cmd) { free(h); return NULL; }
 	h->fp = popen(cmd, "r");
 	free(cmd);
-	if (!h->fp) { if (h->tmp[0]) unlink(h->tmp); free(h); return NULL; }
+	if (!h->fp) { if (h->tmp[0]) unlink(h->tmp); if (h->htmp[0]) unlink(h->htmp); free(h); return NULL; }
 	return h;
 }
 
@@ -3251,6 +3293,7 @@ static void hk_http_close(void *handle) {
 	if (!h) return;
 	if (h->fp) pclose(h->fp);
 	if (h->tmp[0]) unlink(h->tmp);
+	if (h->htmp[0]) unlink(h->htmp);
 	free(h);
 }
 
@@ -3302,6 +3345,7 @@ static int hk_fs_mkdirp(const char *path) {
 
 static int hk_fs_remove(const char *path) { return unlink(path); }
 
+#ifdef _WIN32
 static char *hk_shell_capture(const char *cmd, long max_bytes, int *exit_code) {
 	if (exit_code) *exit_code = -1;
 	FILE *fp = popen(cmd, "r");
@@ -3311,6 +3355,7 @@ static char *hk_shell_capture(const char *cmd, long max_bytes, int *exit_code) {
 	if (exit_code) *exit_code = WEXITSTATUS(rc);
 	return out;
 }
+#endif
 
 
 #endif
@@ -4118,7 +4163,7 @@ static enum aiProviderType hkParseProvider(const char *s) {
 		|| strcmp(s, "fireworks") == 0 || strcmp(s, "openrouter") == 0
 		|| strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0
 		|| strcmp(s, "gemini") == 0 || strcmp(s, "google") == 0
-		|| strcmp(s, "cerebras") == 0
+		|| strcmp(s, "cerebras") == 0 || strcmp(s, "nous") == 0
 		|| strcmp(s, "github-copilot") == 0 || strcmp(s, "copilot") == 0
 		|| strcmp(s, "github-models") == 0 || strcmp(s, "ghmodels") == 0
 		|| strcmp(s, "chatgpt") == 0 || strcmp(s, "codex") == 0
@@ -4151,6 +4196,7 @@ static const char *hkProviderDefaultEndpoint(const char *s) {
 	if (strcmp(s, "xai") == 0 || strcmp(s, "grok") == 0) return "https://api.x.ai";
 	if (strcmp(s, "gemini") == 0 || strcmp(s, "google") == 0) return "https://generativelanguage.googleapis.com/v1beta/openai";
 	if (strcmp(s, "cerebras") == 0)   return "https://api.cerebras.ai";
+	if (strcmp(s, "nous") == 0)       return "https://inference-api.nousresearch.com";
 	if (strcmp(s, "github-copilot") == 0 || strcmp(s, "copilot") == 0)
 		return "https://api.githubcopilot.com";
 	if (strcmp(s, "github-models") == 0 || strcmp(s, "ghmodels") == 0)
@@ -4185,6 +4231,7 @@ static const struct {
 	{ "copilot",       "gpt-4o-mini",               NULL       },
 	{ "chatgpt",       "gpt-5.5",                   "gpt"      },
 	{ "openrouter",    NULL,                        NULL       },
+	{ "nous",          "anthropic/claude-haiku-5.5", NULL       },
 	{ "together",      NULL,                        NULL       },
 	{ "fireworks",     NULL,                        NULL       },
 };
@@ -4226,6 +4273,7 @@ static const char *clProviderConsoleUrl(const char *name) {
 	if (!strcmp(name, "xai") || !strcmp(name, "grok")) return "https://console.x.ai/";
 	if (!strcmp(name, "gemini") || !strcmp(name, "google")) return "https://aistudio.google.com/apikey";
 	if (!strcmp(name, "cerebras")) return "https://cloud.cerebras.ai/?tab=api-keys";
+	if (!strcmp(name, "nous"))     return "https://portal.nousresearch.com";
 	if (!strcmp(name, "ollamacloud") || !strcmp(name, "ocloud") || !strcmp(name, "ollama-cloud"))
 		return "https://ollama.com/settings/keys";
 	return NULL;
@@ -4512,7 +4560,7 @@ typedef struct {
 	char *line;                 /* getline buffer for down */
 	size_t line_cap;
 	pthread_mutex_t up_lock;
-	time_t up_kept;             /* the relay drops an upload idle for 15 min */
+	time_t up_kept;             /* the proxy in front of the relay drops an upload idle for a minute */
 } hkRelay;
 
 static void hkHexEnc(char *out, const uint8_t *b, size_t n) {
@@ -4641,6 +4689,11 @@ static int hkRelayOpen(hkRelay *r) {
 	return r->down && r->up ? 0 : -1;
 }
 
+/* Wakes a thread blocked in hkRelayRecv (its stream ends); it then closes. */
+static void hkRelayStop(hkRelay *r) {
+	if (r->down_pid > 0) kill(r->down_pid, SIGTERM);
+}
+
 static int hkRelaySend(hkRelay *r, const char to[33], const uint8_t *b, size_t n) {
 	if (n == 0 || n > 256 * 1024) return -1;                         /* the relay's frame limit */
 	char *enc = clB64Encode(b, n);
@@ -4649,6 +4702,7 @@ static int hkRelaySend(hkRelay *r, const char to[33], const uint8_t *b, size_t n
 	int ok = r->up && fprintf(r->up, "%s %s\n", to, enc) > 0 && fflush(r->up) == 0;
 	pthread_mutex_unlock(&r->up_lock);
 	free(enc);
+	if (!ok) hkRelayStop(r);                                         /* ends the download too, so the link reconnects */
 	return ok ? 0 : -1;
 }
 
@@ -4660,8 +4714,12 @@ static long hkRelayRecv(hkRelay *r, char from[33], uint8_t *out, size_t cap) {
 		if (n < 0) return -1;
 		while (n > 0 && (r->line[n - 1] == '\n' || r->line[n - 1] == '\r')) r->line[--n] = '\0';
 		if (n == 0) {                                                /* keepalive: answer it now and then */
+			if (r->up_pid > 0 && waitpid(r->up_pid, NULL, WNOHANG) == r->up_pid) {
+				r->up_pid = 0;                                       /* the upload died: replies would vanish, so start over */
+				return -1;
+			}
 			time_t now = time(NULL);
-			if (now - r->up_kept > 300) {
+			if (now - r->up_kept >= 20) {                           /* the relay sends one every 25 s */
 				pthread_mutex_lock(&r->up_lock);
 				if (r->up && fputc('\n', r->up) != EOF) fflush(r->up);
 				pthread_mutex_unlock(&r->up_lock);
@@ -4681,11 +4739,6 @@ static long hkRelayRecv(hkRelay *r, char from[33], uint8_t *out, size_t cap) {
 		free(d);
 		return (long)dl;
 	}
-}
-
-/* Wakes a thread blocked in hkRelayRecv (its stream ends); it then closes. */
-static void hkRelayStop(hkRelay *r) {
-	if (r->down_pid > 0) kill(r->down_pid, SIGTERM);
 }
 
 static void hkRelayClose(hkRelay *r) {
@@ -4905,6 +4958,15 @@ static void clCredsRestoreFor(const char *provider) {
 	E.ai_oauth_expires_at = c->oauth_expires_at;
 	hkTrimSecret(&E.ai_api_key);
 	hkTrimSecret(&E.ai_oauth_refresh);
+}
+
+/* A pasted key replaces any sign-in: a ChatGPT one left set sent the key down the codex route (nous 404). */
+static void hkUsePastedKey(const char *prov, const char *key) {
+	free(E.ai_api_key); E.ai_api_key = strdup(key);
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = NULL;
+	E.ai_oauth_expires_at = 0;
+	hkApplyProviderAlias(prov);
 }
 
 static void hkWriteSessionFile(const char *path, int include_secrets) {
@@ -9725,6 +9787,7 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 			break;
 		}
 		if (!endpoint) endpoint = "https://api.openai.com";
+		if (!model) model = hkProviderDefaultModel(E.ai_provider_type);
 		if (!model) model = "gpt-4o-mini";
 		const char *reason = "";
 		if (endpoint && strstr(endpoint, "generativelanguage") && strstr(model, "2.5"))
@@ -9815,7 +9878,7 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 		int ghmodels = endpoint && strstr(endpoint, "models.inference.ai.azure.com");
 		size_t elen = endpoint ? strlen(endpoint) : 0;
 		int has_v1 = elen >= 3 && !strcmp(endpoint + elen - 3, "/v1");
-		int compat_base = elen >= 7 && !strcmp(endpoint + elen - 7, "/openai");
+		int compat_base = elen >= 14 && !strcmp(endpoint + elen - 14, "/v1beta/openai");   /* groq's /openai still wants /v1 */
 		snprintf(url, sizeof(url), "%s%s", endpoint,
 		         (copilot || ghmodels || has_v1 || compat_base)
 		             ? "/chat/completions" : "/v1/chat/completions");
@@ -9926,21 +9989,24 @@ static char *aiExtractAnthropicText(const char *json) {
 	return out;
 }
 
-static char *aiExtractResponse(const char *json, enum aiProviderType type) {
+static char *aiExtractResponse(const char *json, enum aiProviderType type, int *is_err) {
+	*is_err = 0;
 	if (!json) return NULL;
 
 	if (type == AI_PROVIDER_ANTHROPIC) {
 		char *t = aiExtractAnthropicText(json);
 		if (t && *t) return t;
 		free(t);
-		return aiExtractApiError(json);
+		char *e = aiExtractApiError(json);
+		*is_err = e != NULL;
+		return e;
 	}
 
 	const char *start = strstr(json, "\"content\":\"");
 	if (!start) {
 		char *e = aiExtractApiError(json);
-		if (e) return e;
-		return NULL;
+		*is_err = e != NULL;
+		return e;
 	}
 	start += strlen("\"content\":\"");
 	return aiExtractStringValue(start);
@@ -11123,6 +11189,7 @@ static const struct { const char *prov, *models; } HK_MODEL_SUGG[] = {
 	{ "together",       "meta-llama/Llama-3.3-70B-Instruct-Turbo, Qwen/Qwen2.5-72B-Instruct-Turbo" },
 	{ "fireworks",      "accounts/fireworks/models/llama-v3p1-70b-instruct, accounts/fireworks/models/qwen2p5-72b-instruct" },
 	{ "openrouter",     "anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.3-70b-instruct:free, deepseek/deepseek-chat:free" },
+	{ "nous",           "anthropic/claude-haiku-5.5, anthropic/claude-sonnet-5.5, deepseek/deepseek-v4-flash, moonshotai/kimi-k3.1-pro" },
 	{ "xai",            "grok-2, grok-2-mini, grok-beta" },
 	{ "grok",           "grok-2, grok-2-mini, grok-beta" },
 };
@@ -11140,6 +11207,7 @@ static const char *hkProviderLabel(void) {
 			{ "together",                     "together"      },
 			{ "fireworks",                    "fireworks"     },
 			{ "cerebras",                     "cerebras"      },
+			{ "nousresearch",                 "nous"          },
 			{ "x.ai",                         "xai"           },
 			{ "generativelanguage",           "gemini"        },
 			{ "models.inference.ai.azure.com","github-models" },
@@ -11189,6 +11257,11 @@ static void hkModelsCachePath(char *buf, size_t n) {
 }
 
 /* The catalog request as a curl command is fine where a shell exists. */
+/* catalogs anyone can read, so the picker works before a key is pasted */
+static int hkCatalogPublic(const char *ep) {
+	return strstr(ep, "openrouter") || strstr(ep, "nousresearch");
+}
+
 #ifdef HAKO_WASM
 static char *hkModelListFetch(void) {
 	const char *endpoint = E.ai_endpoint;
@@ -11213,13 +11286,13 @@ static char *hkModelListFetch(void) {
 		break;
 	default: {
 		if (!api_key || !*api_key) {
-			if (!strstr(endpoint, "openrouter")) return NULL;
+			if (!hkCatalogPublic(endpoint)) return NULL;
 			snprintf(url, sizeof(url), "%s/v1/models", endpoint);
 			break;
 		}
 		size_t elen = strlen(endpoint);
 		int has_v1 = elen >= 3 && !strcmp(endpoint + elen - 3, "/v1");
-		int compat = elen >= 7 && !strcmp(endpoint + elen - 7, "/openai");
+		int compat = elen >= 14 && !strcmp(endpoint + elen - 14, "/v1beta/openai");
 		snprintf(url, sizeof(url), "%s%s", endpoint,
 		         (has_v1 || compat) ? "/models" : "/v1/models");
 		snprintf(hdr, sizeof(hdr), "-H 'Authorization: Bearer %s'", api_key);
@@ -11232,70 +11305,53 @@ static char *hkModelListFetch(void) {
 }
 #endif
 
-static char *hkModelListCmd(void) {
+/* The listing request for the current provider: url + headers, sent through hk_http_fetch so keys stay off argv. */
+static int hkModelListReq(char *url, size_t ucap, char *hdr, size_t hcap) {
 	const char *endpoint = E.ai_endpoint;
 	const char *api_key = E.ai_api_key;
-	if (!endpoint || !*endpoint) return NULL;
-	char *cmd = malloc(2048);
-	if (!cmd) return NULL;
+	int keyed = api_key && *api_key;
+	hdr[0] = '\0';
+	if (!endpoint || !*endpoint) return -1;
 	switch (E.ai_provider_type) {
 	case AI_PROVIDER_OLLAMA:
-		if (api_key && *api_key)
-			snprintf(cmd, 2048, "curl -s --max-time 8 -H 'Authorization: Bearer %s' %s/api/tags 2>/dev/null",
-				api_key, endpoint);
-		else
-			snprintf(cmd, 2048, "curl -s --max-time 8 %s/api/tags 2>/dev/null", endpoint);
-		break;
-	case AI_PROVIDER_ANTHROPIC: {
-		if (!api_key || !*api_key) { free(cmd); return NULL; }
-		int oauth = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
-		snprintf(cmd, 2048, oauth
-			? "curl -s --max-time 8 -H 'Authorization: Bearer %s' "
-			  "-H 'anthropic-beta: oauth-2025-04-20' "
+		snprintf(url, ucap, "%s/api/tags", endpoint);
+		if (keyed) snprintf(hdr, hcap, "-H 'Authorization: Bearer %s'", api_key);
+		return 0;
+	case AI_PROVIDER_ANTHROPIC:
+		if (!keyed) return -1;
+		snprintf(url, ucap, "%s/v1/models?limit=200", endpoint);
+		snprintf(hdr, hcap, hkOAuthIs("anthropic")
+			? "-H 'Authorization: Bearer %s' -H 'anthropic-beta: oauth-2025-04-20' "
 			  "-H 'User-Agent: claude-cli/1.0.40 (external, cli)' -H 'x-app: cli' "
-			  "-H 'anthropic-version: 2023-06-01' '%s/v1/models?limit=200' 2>/dev/null"
-			: "curl -s --max-time 8 -H 'x-api-key: %s' "
-			  "-H 'anthropic-version: 2023-06-01' '%s/v1/models?limit=200' 2>/dev/null",
-			api_key, endpoint);
-		break;
-	}
+			  "-H 'anthropic-version: 2023-06-01'"
+			: "-H 'x-api-key: %s' -H 'anthropic-version: 2023-06-01'", api_key);
+		return 0;
 	case AI_PROVIDER_OPENAI: {
-		if ((!api_key || !*api_key) && strstr(endpoint, "openrouter")) {
-			snprintf(cmd, 2048, "curl -s --max-time 8 %s/v1/models 2>/dev/null", endpoint);
-			break;
+		if (!keyed) {
+			if (!hkCatalogPublic(endpoint)) return -1;
+			snprintf(url, ucap, "%s/v1/models", endpoint);
+			return 0;
 		}
-		if (!api_key || !*api_key) { free(cmd); return NULL; }
 		if (hkOAuthIs("chatgpt")) {
 			/* client_version gates the catalog; an old one gets a frozen list */
-			char hdr[6144];
-			char *big = realloc(cmd, 8192);     /* the token alone can be 2 KB */
-			if (!big || !hkChatGPTHeaders(hdr, sizeof(hdr), api_key, 0)
-			    || !hkFmtFits(big, 8192, "curl -s --max-time 8 %s '%s/models?client_version=99.0.0' 2>/dev/null",
-			                  hdr, endpoint)) { free(big ? big : cmd); return NULL; }
-			cmd = big;
-			break;
+			snprintf(url, ucap, "%s/models?client_version=99.0.0", endpoint);
+			return hkChatGPTHeaders(hdr, hcap, api_key, 0) ? 0 : -1;
 		}
 		if (strstr(endpoint, "generativelanguage")) {
-			snprintf(cmd, 2048,
-				"curl -s --max-time 8 '%s/v1beta/models?pageSize=200&key=%s' 2>/dev/null",
-				endpoint, api_key);
-			break;
+			snprintf(url, ucap, "%s/v1beta/models?pageSize=200", endpoint);
+			snprintf(hdr, hcap, "-H 'x-goog-api-key: %s'", api_key);
+			return 0;
 		}
-		int copilot = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "github-copilot");
+		int copilot = hkOAuthIs("github-copilot");
 		int ghmodels = strstr(endpoint, "models.inference.ai.azure.com") != NULL;
-		const char *path = (copilot || ghmodels) ? "/models" : "/v1/models";
-		const char *copilot_hdrs = copilot
-			? "-H 'Editor-Version: " HAKO_COPILOT_EDITOR_VER "' "
-			  "-H 'Copilot-Integration-Id: vscode-chat' "
-			: "";
-		snprintf(cmd, 2048,
-			"curl -s --max-time 8 -H 'Authorization: Bearer %s' %s%s%s 2>/dev/null",
-			api_key, copilot_hdrs, endpoint, path);
-		break;
+		snprintf(url, ucap, "%s%s", endpoint, (copilot || ghmodels) ? "/models" : "/v1/models");
+		snprintf(hdr, hcap, "-H 'Authorization: Bearer %s' %s", api_key, copilot
+			? "-H 'Editor-Version: " HAKO_COPILOT_EDITOR_VER "' -H 'Copilot-Integration-Id: vscode-chat'"
+			: "");
+		return 0;
 	}
-	default: free(cmd); return NULL;
+	default: return -1;
 	}
-	return cmd;
 }
 
 static int hkParseModelList(const char *json, char out[][96], int max) {
@@ -11351,10 +11407,6 @@ static int hkParseModelList(const char *json, char out[][96], int max) {
 	return n;
 }
 
-static char *hkPopenCapture(const char *cmd, size_t cap_max) {
-	return hk_shell_capture(cmd, (long)cap_max, NULL);
-}
-
 static int hkModelsLive(char out[][96], int max, int force, long *age) {
 	if (age) *age = -1;
 	char path[1024];
@@ -11384,25 +11436,25 @@ static int hkModelsLive(char out[][96], int max, int force, long *age) {
 		n = hkParseModelList(wresp, out, max);
 		free(wresp);
 	}
-	char *cmd = NULL;
 #else
-	char *cmd = hkModelListCmd();
-	if (!cmd && E.debug)
+	static char lurl[1024], lhdr[8192];
+	int routed = hkModelListReq(lurl, sizeof lurl, lhdr, sizeof lhdr) == 0;
+	if (!routed && E.debug)
 		fprintf(stderr, "[models] no listing route for %s (no key?)\n", hkProviderLabel());
-#endif
-	if (cmd) {
-		char *resp = hkPopenCapture(cmd, 1u << 22);
+	if (routed) {
+		hkHttpReq lr = { .method = "GET", .url = lurl, .headers = lhdr, .timeout_s = 8 };
+		char *resp = hk_http_fetch(&lr);
 		if (E.debug) {
-			fprintf(stderr, "[models] GET %s\n", strstr(cmd, "http") ? strstr(cmd, "http") : cmd);
+			fprintf(stderr, "[models] GET %s\n", lurl);
 			fprintf(stderr, "[models] %zu bytes back: %.200s\n",
 				resp ? strlen(resp) : (size_t)0, resp ? resp : "(nothing)");
 		}
-		free(cmd);
 		if (resp) {
 			n = hkParseModelList(resp, out, max);
 			free(resp);
 		}
 	}
+#endif
 	if (n > 0) {
 		const char *home = getenv("HOME"); if (home) {
 			char dir[1024];
@@ -12931,7 +12983,9 @@ static void *aiWorkerTurn(void *arg) {
 			&& full_response
 			&& strstr(full_response, "\"tool_calls\":[");
 
-		char *content = aiExtractResponse(full_response, E.ai_provider_type);
+		int api_err;
+		char *content = aiExtractResponse(full_response, E.ai_provider_type, &api_err);
+		if (api_err) { free(content); content = NULL; }   /* not the model's answer: hkReportEmpty says it */
 
 		pthread_mutex_lock(&data->lock);
 		hkUpdateUsage(data, full_response);
@@ -13104,7 +13158,7 @@ static int hkPickProvider(char *out, size_t cap) {
 	static const char *provs[] = {
 		"mithraeum", "anthropic", "chatgpt", "openai", "gemini", "ollama", "groq",
 		"cerebras", "deepseek", "mistral", "together", "fireworks",
-		"openrouter", "xai", "custom"
+		"openrouter", "nous", "xai", "custom"
 	};
 	int pn = (int)(sizeof(provs) / sizeof(provs[0]));
 	int cur = 0;
@@ -13288,11 +13342,13 @@ static const hkLoginRow HK_SIGNIN[] = {
 	{ "chatgpt",       "ChatGPT",        "free or paid account" },
 	{ "copilot",       "GitHub Copilot", "Copilot plan" },
 	{ "github-models", "GitHub Models",  "free with a GitHub account" },
+	{ "nous",          "Nous Portal",    "Nous account or subscription" },
 	{ "api",           "API key",        "pay per token, any provider" },
 }, HK_KEYS[] = {
 	{ "anthropic-api", "Anthropic",      "Claude API, billed by Anthropic" },
 	{ "openai",        "OpenAI",         "OpenAI API, separate from ChatGPT" },
 	{ "openrouter",    "OpenRouter",     "many vendors' models, billed by OpenRouter" },
+	{ "nous-api",      "Nous Portal",    "many vendors' models, billed by Nous" },
 	{ "gemini",        "Google",         "Gemini API, free tier" },
 	{ "groq",          "Groq",           "open models, free tier" },
 	{ "cerebras",      "Cerebras",       "open models, free tier" },
@@ -13522,7 +13578,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			if (!hkCanPick()) {
 				aiAddHistory(data, ":login          sign in: anthropic chatgpt copilot github-models");
 				aiAddHistory(data, ":login api      API key: anthropic-api openai openrouter gemini groq");
-				aiAddHistory(data, "                cerebras deepseek mistral xai together fireworks custom");
+				aiAddHistory(data, "                nous cerebras deepseek mistral xai together fireworks custom");
 				return 1;
 			}
 			const char *id = hkPickLogin(prov != NULL);
@@ -13577,6 +13633,12 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			aiAddHistory(data, "(browser sign-in did not finish; paste a key instead)");
 			prov = "openrouter-api";
 		}
+		if (strcmp(prov, "nous") == 0) {
+			if (clOAuthNous(data) == 0) return 1;
+			aiAddHistory(data, "(browser sign-in did not finish; paste a key instead)");
+			prov = "nous-api";
+		}
+		if (strcmp(prov, "nous-api") == 0) prov = "nous";
 		if (strcmp(prov, "openrouter-api") == 0) {
 			prov = "openrouter";
 			hkApplyProviderAlias("openrouter");
@@ -13599,9 +13661,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		char key[1024];
 		clReadHidden(key, sizeof(key));
 		if (!key[0]) { aiAddHistory(data, "(empty key, not saved)"); return 1; }
-		free(E.ai_api_key);
-		E.ai_api_key = strdup(key);
-		hkApplyProviderAlias(prov);
+		hkUsePastedKey(prov, key);
 		clCredsCaptureCurrent();
 		clCredsSave();
 		hkSaveSession();
@@ -13781,7 +13841,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 	}
 	if (strncmp(cmd, "providers", cmdlen) == 0 && cmdlen == 9) {
 		struct row { const char *name; const char *desc; };
-		struct group { const char *header; struct row rows[10]; };
+		struct group { const char *header; struct row rows[12]; };
 		struct group groups[] = {
 #ifndef HAKO_WASM
 			/* A browser can spawn nothing and its OAuth token endpoints refuse
@@ -13812,6 +13872,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 				{ "deepseek",        "DeepSeek API" },
 				{ "xai",             "Grok via xAI API (api.x.ai)" },
 				{ "openrouter",      "many vendors' models, billed by OpenRouter" },
+				{ "nous",            "Nous Portal, billed by Nous" },
 				{ "mistral, together, fireworks, custom", "more OpenAI-compat" },
 				{ NULL, NULL }
 			} },
@@ -13820,7 +13881,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		const char *active_oauth = E.ai_oauth_provider;
 		for (size_t g = 0; g < sizeof(groups) / sizeof(groups[0]); g++) {
 			aiAddHistory(data, groups[g].header);
-			for (size_t r = 0; r < 10 && groups[g].rows[r].name; r++) {
+			for (size_t r = 0; r < 12 && groups[g].rows[r].name; r++) {
 				const char *n = groups[g].rows[r].name;
 				int logged_in = 0, is_active = 0;
 				char namebuf[64]; namebuf[0] = '\0';
@@ -13856,7 +13917,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			if (t == AI_PROVIDER_NONE) {
 				aiAddHistory(data, "unknown. valid: ollama, anthropic, openai, gemini/google,");
 				aiAddHistory(data, "  groq, cerebras, deepseek, mistral, together, fireworks,");
-				aiAddHistory(data, "  openrouter, xai/grok, custom");
+				aiAddHistory(data, "  openrouter, nous, xai/grok, custom");
 			} else {
 				enum aiProviderType prev = E.ai_provider_type;
 				clCredsCaptureCurrent();
@@ -14825,7 +14886,7 @@ static const char *HK_PROVIDER_WORDS[] = {
 	"github-copilot", "copilot", "github-models", "ghmodels", "chatgpt", "codex",
 	"ollama", "ollamacloud", "ocloud", "local", "koi",
 	"gemini", "google", "groq", "cerebras", "deepseek", "mistral",
-	"together", "fireworks", "openrouter", "openrouter-api",
+	"together", "fireworks", "openrouter", "openrouter-api", "nous", "nous-api",
 	"xai", "grok", "github", "custom", NULL
 };
 
@@ -15874,6 +15935,123 @@ static int clOAuthChatGPTRefresh(aiData *data) {
 	return rc;
 }
 
+/* Nous Portal: Hermes's public device-code client (as hako uses Codex's and Claude Code's); HAKO_NOUS_CLIENT_ID swaps it. */
+#define HAKO_NOUS_PORTAL          "https://portal.nousresearch.com"
+
+static const char *hkNousClientId(void) {
+	const char *k = getenv("HAKO_NOUS_CLIENT_ID");
+	return k && *k ? k : "hermes-cli";
+}
+
+static int hkNousStore(const char *resp) {
+	char *access = hkExtractJsonString(resp, "access_token");
+	if (!access) return -1;
+	char *refresh = hkExtractJsonString(resp, "refresh_token");
+	free(E.ai_api_key); E.ai_api_key = access;
+	if (refresh) { free(E.ai_oauth_refresh); E.ai_oauth_refresh = refresh; }
+	free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("nous");
+	char *pl = hkJwtPayload(access);
+	int exp = pl ? hkExtractJsonInt(pl, "exp") : -1;
+	int ttl = hkExtractJsonInt(resp, "expires_in");
+	free(pl);
+	E.ai_oauth_expires_at = exp > 0 ? exp - 120 : ttl > 0 ? hk_time_unix() + ttl - 120 : 0;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	hkSaveSession();
+	return 0;
+}
+
+static int clOAuthNous(aiData *data) {
+	const char *cid = hkNousClientId();
+	const char *form_hdr = "-H 'Content-Type: application/x-www-form-urlencoded'";
+	char form[1024];
+	snprintf(form, sizeof form, "client_id=%s&scope=inference%%3Ainvoke", cid);
+	aiAddHistory(data, "asking Nous for a sign-in code");
+	hkHttpReq dr = { .method = "POST", .url = HAKO_NOUS_PORTAL "/api/oauth/device/code",
+	                 .headers = form_hdr, .body = form };
+	char *resp = hk_http_fetch(&dr);
+	if (!resp) { aiAddHistory(data, "Nous: device request failed (network?)"); return -1; }
+	char *dev = hkExtractJsonString(resp, "device_code");
+	char *code = hkExtractJsonString(resp, "user_code");
+	char *uri = hkExtractJsonString(resp, "verification_uri_complete");
+	if (!uri) uri = hkExtractJsonString(resp, "verification_uri");
+	int interval = hkExtractJsonInt(resp, "interval");
+	int expires_in = hkExtractJsonInt(resp, "expires_in");
+	if (!dev || !code || !uri) {
+		char *err = aiExtractApiError(resp);
+		aiSayf(data, "Nous: %s", err ? err : "unexpected device response");
+		free(err); free(resp); free(dev); free(code); free(uri);
+		return -1;
+	}
+	free(resp);
+	if (interval < 1) interval = 5;
+	if (interval > 30) interval = 30;
+	if (expires_in <= 0) expires_in = 900;
+
+	aiSayf(data, "Visit: %s", uri);
+	aiSayf(data, "Code:  %s", code);
+	if (hkClipCopy(code)) aiAddHistory(data, "the code is on your clipboard");
+	aiAddHistory(data, "Polling... (Ctrl+C to abort)");
+	clOpenUrl(uri);
+	free(uri); free(code);
+
+	char dev_enc[512];
+	clUrlEncodeInto(dev, dev_enc, sizeof dev_enc);
+	free(dev);
+	snprintf(form, sizeof form, "grant_type=urn%%3Aietf%%3Aparams%%3Aoauth%%3Agrant-type%%3Adevice_code"
+		"&client_id=%s&device_code=%s", cid, dev_enc);
+	hkHttpReq tq = { .method = "POST", .url = HAKO_NOUS_PORTAL "/api/oauth/token",
+	                 .headers = form_hdr, .body = form };
+	long start = hk_time_unix();
+	char *got = NULL;
+	while (!E.interrupt && hk_time_unix() - start < expires_in) {
+		sleep(interval);
+		char *tr = hk_http_fetch(&tq);
+		if (!tr) continue;
+		if (strstr(tr, "\"access_token\"")) { got = tr; break; }
+		char *err = hkExtractJsonString(tr, "error");
+		if (err && strcmp(err, "authorization_pending") && strcmp(err, "slow_down")) {
+			char *desc = hkExtractJsonString(tr, "error_description");
+			aiSayf(data, "Nous: %s%s%s", err, desc ? ": " : "", desc ? desc : "");
+			free(err); free(desc); free(tr);
+			return -1;
+		}
+		if (err && !strcmp(err, "slow_down") && interval < 30) interval += 5;
+		free(err); free(tr);
+	}
+	if (!got) { aiAddHistory(data, "Nous: timed out / aborted"); return -1; }
+	hkApplyProviderAlias("nous");
+	int rc = hkNousStore(got);
+	free(got);
+	if (rc != 0) { aiAddHistory(data, "Nous: approval came back without a token"); return -1; }
+	aiAddHistory(data, "Nous Portal: signed in. Calls bill against your Nous account.");
+	hkHealModelForProvider(data);
+	return 0;
+}
+
+/* Nous refresh tokens are single-use and a reused one revokes the session, so take a newer one another hako saved first. */
+static int clOAuthNousRefresh(aiData *data) {
+	for (int i = 0; i < cl_creds_n; i++) { free(cl_creds[i].api_key); free(cl_creds[i].oauth_refresh); }
+	cl_creds_n = 0; cl_creds_loaded = 0;
+	clCredsLoad();
+	clCred *c = clCredsFind("nous");
+	if (c && c->oauth_refresh && c->api_key && c->oauth_expires_at > hk_time_unix()) {
+		clCredsRestoreFor("nous");
+		return 0;
+	}
+	if (!E.ai_oauth_refresh) return -1;
+	char hdr[4096], form[256];
+	if (!hkFmtFits(hdr, sizeof hdr, "-H 'Content-Type: application/x-www-form-urlencoded' "
+		"-H 'x-nous-refresh-token: %s'", E.ai_oauth_refresh)) return -1;
+	snprintf(form, sizeof form, "grant_type=refresh_token&client_id=%s", hkNousClientId());
+	hkHttpReq rq = { .method = "POST", .url = HAKO_NOUS_PORTAL "/api/oauth/token", .headers = hdr, .body = form };
+	char *tr = hk_http_fetch(&rq);
+	int rc = tr ? hkNousStore(tr) : -1;
+	free(tr);
+	if (rc != 0 && data) aiAddHistory(data, "Nous: sign-in expired; run :login nous again");
+	return rc;
+}
+
 static int clOAuthCopilotExchange(aiData *data) {
 	if (!E.ai_oauth_refresh) return -1;
 	char hdr[512];
@@ -16219,6 +16397,7 @@ static int clOAuthRefresh(aiData *data) {
 	if (!E.ai_oauth_provider) return -1;
 	if (!strcmp(E.ai_oauth_provider, "github-copilot")) return clOAuthCopilotExchange(data);
 	if (!strcmp(E.ai_oauth_provider, "chatgpt")) return clOAuthChatGPTRefresh(data);
+	if (!strcmp(E.ai_oauth_provider, "nous")) return clOAuthNousRefresh(data);
 	if (strcmp(E.ai_oauth_provider, "anthropic") != 0) return -1;
 	if (!E.ai_oauth_refresh) return -1;
 	const char *client_id = clOAuthClientId("anthropic");

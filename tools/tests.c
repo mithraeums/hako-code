@@ -281,8 +281,15 @@ static void sse_tests(void) {
 	ckstr(body, "\"content\":\"Hello \\\"you\\\"\"", "sse re-escapes text for the rebuilt body");
 	ckstr(body, "\"finish_reason\":\"stop\"", "sse marks a plain answer as stop");
 	ckstr(body, "\"prompt_tokens\":11", "sse keeps usage");
-	char *extracted = aiExtractResponse(body, AI_PROVIDER_OPENAI);
+	int api_err;
+	char *extracted = aiExtractResponse(body, AI_PROVIDER_OPENAI, &api_err);
 	ckstr(extracted, "Hello \"you\"", "the existing extractor reads the rebuilt body");
+	ck(!api_err, "an answer is not an api error");
+	free(extracted);
+	/* groq's 401: was stored as the model's answer and reported ok */
+	extracted = aiExtractResponse("{\"error\":{\"message\":\"Invalid API Key\",\"code\":\"invalid_api_key\"}}",
+	                              AI_PROVIDER_OPENAI, &api_err);
+	ck(api_err, "a provider error body is flagged as an error");
 	free(extracted); free(body); free(seen); hkSseFree(&a);
 
 	/* a tool call, with arguments split across chunks the way they really arrive */
@@ -1167,6 +1174,42 @@ static void catalog_tests(void) {
 			ckstr(HK_MODEL_SUGG[i].models, "claude-sonnet-5", "Sonnet 5 is in the curated list");
 			cknot(HK_MODEL_SUGG[i].models, "-2025", "no date-suffixed ids in the curated list");
 		}
+
+	/* nous: a named openai-compat provider with its own default and a public catalog */
+	char *saved_ep = E.ai_endpoint;
+	E.ai_endpoint = NULL;
+	hkApplyProviderAlias("nous");
+	ck(E.ai_provider_type == AI_PROVIDER_OPENAI, "nous is openai-compatible");
+	ck(E.ai_endpoint && !strcmp(E.ai_endpoint, "https://inference-api.nousresearch.com"), "nous endpoint");
+	ck(!strcmp(hkProviderLabel(), "nous"), "the endpoint names nous");
+	const char *dm = hkProviderDefaultModel(E.ai_provider_type);
+	ck(dm && !strcmp(dm, "anthropic/claude-haiku-5.5"), "nous has its own default model, not gpt-4o-mini");
+	ck(hkCatalogPublic(E.ai_endpoint), "nous lists models without a key");
+	E.ai_oauth_provider = strdup("chatgpt"); E.ai_oauth_refresh = strdup("r");
+	hkUsePastedKey("nous", "sk-test");
+	ck(!E.ai_oauth_provider && !E.ai_oauth_refresh, "a pasted key drops an earlier sign-in");
+	ck(!hkOAuthIs("chatgpt") && E.ai_api_key && !strcmp(E.ai_api_key, "sk-test"), "the nous key is the one sent");
+
+	/* keys never reach curl's argv: headers go to a 0600 file */
+	{
+		char hp[64];
+		char *rest = hkHeadersToFile("-H 'Authorization: Bearer sekrit' -H 'x-a: 1' --compressed", hp, sizeof hp);
+		ck(rest && !strstr(rest, "sekrit") && strstr(rest, "-H @") && strstr(rest, "--compressed"), "headers leave the command line");
+		struct stat hs;
+		ck(hp[0] && stat(hp, &hs) == 0 && (hs.st_mode & 077) == 0, "the header file is private");
+		char *body = hp[0] ? hkReadFileAll(hp, 4096) : NULL;
+		ck(body && !strcmp(body, "Authorization: Bearer sekrit\nx-a: 1\n"), "one header per line, unquoted");
+		free(body); free(rest);
+		if (hp[0]) unlink(hp);
+		hkHttpReq hr = { .method = "GET", .url = "https://x.test/v1/models", .headers = "-H 'x-api-key: sekrit'" };
+		char bt[64], ht[64];
+		char *cmd = hk_http_curl_cmd(&hr, bt, sizeof bt, ht);
+		ck(cmd && !strstr(cmd, "sekrit"), "a provider request carries no key on argv");
+		free(cmd);
+		if (ht[0]) unlink(ht);
+	}
+	free(E.ai_endpoint);
+	E.ai_endpoint = saved_ep;
 
 	E.ai_provider_type = saved_p;
 	E.ai_model = saved_m;

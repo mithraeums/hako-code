@@ -3,6 +3,23 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.2.8] - 2026-10-25
+
+### added
+- **nous portal**: `:login nous` signs in with your Nous account in the browser (a device code, like `:login chatgpt`), using Hermes's public client id the way `:login chatgpt` uses Codex's (`HAKO_NOUS_CLIENT_ID` swaps it); `:login nous-api` pastes a key from portal.nousresearch.com instead. openai-compatible, so streaming and tools work as they do for openrouter; the model list is public, so `:models` fills before sign-in. default model `anthropic/claude-haiku-5.5`, `:model` picks any other
+
+### fixed
+- **groq answered every turn with an error**: its endpoint ends in `/openai`, and a rule meant for gemini's `/v1beta/openai` dropped the `/v1`, so requests went to a route groq does not have
+- a provider's error (a bad key, no credits) was kept as the model's answer: it went into the chat as an assistant line, into the session log, and `-p --output-format json` reported `"ok":true`. it is an error line now, named by provider, and `ok` is false
+- pasting a key with `:login` after a browser sign-in (chatgpt, claude, copilot) kept that sign-in, so the key went down the old route: a nous key after chatgpt hit `/responses` and got `404 Not Found`, and the key was never filed under the new provider; a pasted key now replaces the sign-in
+- an openai-compatible provider with no model set sent `gpt-4o-mini` whatever the provider was; it now sends that provider's own default
+- `:remote on` went quiet after about a minute: the proxy in front of the relay drops an upload with nothing on it for 60 s, so the phone found the session but the computer's replies vanished ("that computer is not answering"). the upload now answers every relay keepalive (one byte every 25 s)
+- a dead upload is noticed on the next keepalive and the link reconnects, instead of staying half connected
+- the studio built into `--serve` / `:remote` is v0.0.7
+
+### security
+- keys and sign-in tokens were on curl's command line, where any user on the same machine could read them with `ps` while a request ran. every header now goes to curl in a file only you can read (`-H @file`, mode 0600, deleted after the request); the model-list requests go the same way, and the gemini key moved out of the url into a header
+
 ## [v0.2.7] - 2026-10-23
 
 ### fixed

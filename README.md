@@ -9,10 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.7-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.7"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.8-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.8"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
-  <img src="https://img.shields.io/badge/providers-13-2636c4?style=flat-square&labelColor=14130f" alt="13 providers"/>
+  <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
   <img src="https://img.shields.io/badge/platforms-5-2636c4?style=flat-square&labelColor=14130f" alt="5 platforms"/>
 </p>
 
@@ -52,7 +52,7 @@
   <tr>
     <td width="33%" valign="top"><b>Local first.</b><br/><sub>Auto-defaults to any installed <a href="https://github.com/mithraeums/hako">hako</a> model — <code>hako-sho</code> (3B) or <code>hako-koi</code> (7B), runs on your device, no key, no cloud. The agent detects it and just works.</sub></td>
     <td width="33%" valign="top"><b>Single binary.</b><br/><sub>One C file. Builds with <code>gcc -lpthread</code>. Curl on PATH for HTTP. Nothing else linked.</sub></td>
-    <td width="33%" valign="top"><b>13 cloud providers when you want them.</b><br/><sub>Anthropic OAuth (Claude Pro/Max sub), GitHub Copilot, GH Models (free), OpenRouter, plus 9 more over OpenAI-compat. Set a key or run a one-line <code>:login</code> — your call.</sub></td>
+    <td width="33%" valign="top"><b>14 cloud providers when you want them.</b><br/><sub>Anthropic OAuth (Claude Pro/Max sub), GitHub Copilot, GH Models (free), OpenRouter, plus 9 more over OpenAI-compat. Set a key or run a one-line <code>:login</code> — your call.</sub></td>
   </tr>
 </table>
 
@@ -104,7 +104,7 @@ being small enough to live anywhere is the whole point.
   models speak their native Qwen `<tool_call>` dialect, and the harness repairs the
   shapes they get wrong. (ollama is also supported as a *separate* optional
   provider — `:login ollama` — for non-hako models.)
-- **13 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), ChatGPT sign-in (any ChatGPT plan, free included), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. Bare `:login` is a menu: sign-ins first, API keys one level down in `:login api`; `:login <name>` goes straight there.
+- **14 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), ChatGPT sign-in (any ChatGPT plan, free included), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), Nous Portal (device code), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. Bare `:login` is a menu: sign-ins first, API keys one level down in `:login api`; `:login <name>` goes straight there.
 - **An input bar that stays out of the way.** Drawn in the normal flow of the terminal — no absolute cursor moves, no scroll region — so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager.
 - **The editor's 19 themes + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a picker and the whole screen recolours as you move through it — enter keeps it, esc puts the old one back. The same names as hake and hako studio. Same picker on bare `:provider` and `:model`. `:theme` saves to `~/.hako/state`; `theme=` in `~/.hakorc` sets it for both tools. Truecolor where supported, 256-colour fallback otherwise.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
@@ -279,8 +279,8 @@ wins inside that project.
 
 **Three auth paths:**
 
-- **OAuth (subscription / account-bound)** — `:login anthropic` (Claude Pro/Max), `:login copilot` (GitHub Copilot Pro/Business), `:login github-models` (free for any GitHub user), `:login openrouter` (PKCE, auto-issue an OR API key). Inference bills against your subscription where applicable; no per-token API key needed.
-- **API-key paste** — `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
+- **OAuth (subscription / account-bound)** — `:login anthropic` (Claude Pro/Max), `:login copilot` (GitHub Copilot Pro/Business), `:login github-models` (free for any GitHub user), `:login openrouter` (PKCE, auto-issue an OR API key), `:login nous` (Nous Portal, device code). Inference bills against your subscription where applicable; no per-token API key needed.
+- **API-key paste** — `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login nous-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
 - **Local** — hako's own models need no login: `hakm pull hako-sho`, then `:provider mithraeum`. Ollama works too: `:login ollama` (ensure `ollama serve` is running) or `:login ollamacloud` (paste an Ollama key).
 
 Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists the active provider's live catalog (its own listing endpoint, cached 24h — `:models refresh` refetches; installed `.mlf2` weights for **mithraeum**), falling back to a built-in list when offline. Bare `:model` opens the picker, where `/` filters as you type. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
@@ -300,6 +300,8 @@ First run in any directory asks for trust. Untrusted = no tool access at all.
 | GitHub Models     | `github-models` · `ghmodels`    | OAuth         | free     | OpenAI-compat     | rate-limited; any GH account                 |
 | OpenRouter        | `openrouter`                     | OAuth (PKCE)  | $/tok    | OpenAI-compat     | auto-issues user-scoped key; `:free` tier    |
 | OpenRouter API    | `openrouter-api`                 | paste         | $/tok    | OpenAI-compat     | paste existing key                           |
+| Nous Portal       | `nous`                           | device code   | $/tok    | OpenAI-compat     | many vendors' models; public catalog         |
+| Nous Portal API   | `nous-api`                       | paste         | $/tok    | OpenAI-compat     | paste a key from portal.nousresearch.com     |
 | OpenAI            | `openai` · `gpt`                 | paste         | $/tok    | function-calling  |                                              |
 | Gemini            | `gemini` · `google`              | paste         | free/$   | OpenAI-compat     | generous free tier on AI Studio              |
 | Groq              | `groq`                           | paste         | free     | OpenAI-compat     | fastest hosting for Llama family             |
@@ -355,12 +357,12 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.2.7
-- **A patch:** the built-in studio page fills an iOS home-screen app (studio v0.0.6). The rest is v0.2.6:
-- **`:remote` is the relay only.** Tailscale is gone: `:remote on` always goes through your account (invite beta), and links this computer the first time.
-- **Signing in on iSh, or anywhere without a browser beside you, is less fiddly.** The sign-in link or device code goes on your clipboard, a pasted code loses any stray whitespace, and enter on an empty prompt takes the clipboard.
-- **Quieter.** A device reconnecting is said once, at the desk only; a theme picked in the studio says nothing in the chat.
-- Ships with **hako studio v0.0.6**.
+### Latest — v0.2.8
+- **Nous Portal.** `:login nous` signs in with your Nous account in the browser; `:login nous-api` takes a key. Its whole catalog shows in `:models`.
+- **Provider fixes that matter.** groq works again; a provider's error (bad key, no credits) is an error, not the model's answer; a key pasted after a browser sign-in is actually used; a provider with no model set gets its own default, not `gpt-4o-mini`.
+- **`:remote on` stays up.** It answers the relay's keepalive and reconnects a dead link, so the phone no longer loses the computer after a minute.
+- **Keys stay off the command line.** Headers go to curl in a private file, so `ps` on a shared machine shows no key or token.
+- Ships with **hako studio v0.0.7**.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -368,7 +370,7 @@ Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)
 
 ## Roadmap
 
-**Shipped through v0.2.7** — `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
+**Shipped through v0.2.8** — Nous Portal sign-in · `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
 termios line editor · `--update` · directory skills + `read_skill` · PKCE without openssl ·
 universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
 local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
