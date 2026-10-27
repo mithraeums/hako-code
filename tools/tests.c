@@ -1486,6 +1486,70 @@ static void paste_tests(void) {
 	ck(!hkLooksLikeToken("short", 5), "a short word is not taken as a key");
 }
 
+/* :remote pair's QR. Every version was decoded by zxing when this was written;
+   here: what a reader looks for, and that the half-block lines the terminal
+   prints carry exactly the modules. Then the seal its answer travels in. */
+static void qr_tests(void) {
+	static hkQr q;
+	const char *url = "https://hako.mithraeum.studio/#pair=0123456789abcdef0123456789abcdef."
+	                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	char big[215];
+	memset(big, 'x', 214);
+	big[214] = '\0';
+	ck(!hkQrEncode(&q, big), "qr: past version 10 is refused");
+	ck(hkQrEncode(&q, "A") == 21, "qr: one byte is version 1");
+	ck(q.m[0][0] && q.m[3][3] && !q.m[1][1] && q.m[0][20] && q.m[20][0] && !q.m[7][7], "qr: finder patterns");
+	ck(q.m[13][8], "qr: the dark module");
+	int ok = 1;
+	for (int i = 8; i < 13; i++) ok &= q.m[6][i] == (i % 2 == 0) && q.m[i][6] == (i % 2 == 0);
+	ck(ok, "qr: timing patterns");
+	ck(hkQrEncode(&q, "https://hako.mithraeum.studio/#link="
+	                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef."
+	                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == 53, "qr: a link url is version 9");
+	ck(hkQrEncode(&q, url) == 49, "qr: a pair url is version 8");
+	if (!G_AI.history) clInitAI(&G_AI);       /* the lines land in the history, as on screen */
+	aiClearHistory(&G_AI);
+	ck(hkQrShow(&G_AI, url), "qr: shows");
+	int lines = G_AI.history_count;
+	ok = lines == (q.n + 8 + 1) / 2;
+	for (int l = 0; l < lines && ok; l++) {
+		const unsigned char *c = (const unsigned char *)G_AI.history[l];
+		int x = -4, y = -4 + 2 * l;
+		while (*c && ok) {
+			if (*c == 27) { while (*c && *c != 'm') c++; if (*c) c++; continue; }
+			int top = 0, bot = 0;
+			if (*c == ' ') c++;
+			else if (c[0] == 0xe2 && c[1] == 0x96) { top = c[2] == 0x88 || c[2] == 0x80; bot = c[2] == 0x88 || c[2] == 0x84; c += 3; }
+			else { ok = 0; break; }
+			int wt = x >= 0 && x < q.n && y >= 0 && y < q.n && q.m[y][x];
+			int wb = x >= 0 && x < q.n && y + 1 >= 0 && y + 1 < q.n && q.m[y + 1][x];
+			ok &= top == wt && bot == wb;
+			x++;
+		}
+		ok &= x == q.n + 4;
+	}
+	ck(ok, "qr: the terminal lines carry the modules, quiet zone included");
+	aiClearHistory(&G_AI);
+	cl_cols_pinned = q.n + 7;
+	ck(!hkQrShow(&G_AI, url) && G_AI.history_count == 0, "qr: a terminal too narrow for it gets no half code");
+	cl_cols_pinned = 0;
+	const char *ssh = getenv("SSH_TTY");
+	char keep[256];
+	snprintf(keep, sizeof keep, "%s", ssh ? ssh : "");
+	setenv("SSH_TTY", "/dev/pts/0", 1);
+	ck(!hkHasDesktop(), "open url: not over ssh (the page would open on the far screen)");
+	if (ssh) setenv("SSH_TTY", keep, 1); else unsetenv("SSH_TTY");
+	uint8_t sec[32], pt[48], m[88], back[48];
+	for (int i = 0; i < 32; i++) sec[i] = (uint8_t)i;
+	for (int i = 0; i < 48; i++) pt[i] = (uint8_t)(200 - i);
+	ck(!hkLinkSeal(m, sec, pt) && !hkLinkOpen(back, sec, m) && !memcmp(back, pt, 48), "link seal: opens with its secret");
+	m[50] ^= 1;
+	ck(hkLinkOpen(back, sec, m) != 0, "link seal: a changed byte is refused");
+	m[50] ^= 1;
+	sec[0] ^= 1;
+	ck(hkLinkOpen(back, sec, m) != 0, "link seal: another secret is refused");
+}
+
 static void crypto_tests(void) {
 	uint8_t a[32], u[32], out[64];
 	/* RFC 7748 5.2 */
@@ -1925,6 +1989,7 @@ int main(int argc, char **argv) {
 	fit_tests();
 	paste_tests();
 	crypto_tests();
+	qr_tests();
 
 	printf(fails ? "\n%d FAILURES\n" : "\nall tests passed\n", fails);
 	if (test_home) {

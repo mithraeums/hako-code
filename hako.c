@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.2.8"
+#define HAKO_VERSION "0.2.9"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -2284,6 +2284,204 @@ static void hkNameKey(uint8_t key[32], const uint8_t k[32]) {
 	crypto_blake2b_keyed(key, 32, k, 32, (const uint8_t *)"hako device name", 16);
 }
 
+/* The link seal: K and the account id (48 bytes) under a key from a one-time
+   secret that only travels in a URL fragment or a QR code, never via a server.
+   out: nonce(24) mac(16) sealed(48). */
+static int hkLinkSeal(uint8_t out[88], const uint8_t secret[32], const uint8_t pt[48]) {
+	uint8_t key[32];
+	if (!hkRandomBytes(out, 24)) return -1;
+	crypto_blake2b_keyed(key, 32, secret, 32, (const uint8_t *)"hako link key", 13);
+	crypto_aead_lock(out + 40, out + 24, key, out, NULL, 0, pt, 48);
+	crypto_wipe(key, sizeof key);
+	return 0;
+}
+
+static int hkLinkOpen(uint8_t pt[48], const uint8_t secret[32], const uint8_t m[88]) {
+	uint8_t key[32];
+	crypto_blake2b_keyed(key, 32, secret, 32, (const uint8_t *)"hako link key", 13);
+	int bad = crypto_aead_unlock(pt, m + 24, key, m, NULL, 0, m + 40, 48);
+	crypto_wipe(key, sizeof key);
+	return bad ? -1 : 0;
+}
+
+/* ---- QR code (ISO 18004), for :remote pair and the studio page ----
+   Byte mode, error correction M, versions 1-10 (up to 213 bytes): a link URL
+   fits, and a phone camera reads it off the terminal. The layout follows the
+   standard step by step: data + Reed-Solomon blocks, function patterns, the
+   zigzag fill, then the mask with the lowest penalty. */
+#define HK_QR_MAX 57                                  /* version 10: 4*10+17 modules */
+typedef struct { int n; uint8_t m[HK_QR_MAX][HK_QR_MAX], fn[HK_QR_MAX][HK_QR_MAX]; } hkQr;
+
+static uint8_t hkQrMul(uint8_t x, uint8_t y) {         /* GF(256), x^8+x^4+x^3+x^2+1 */
+	int z = 0;
+	for (int i = 7; i >= 0; i--) { z = (z << 1) ^ ((z >> 7) * 0x11D); z ^= ((y >> i) & 1) * x; }
+	return (uint8_t)z;
+}
+
+static void hkQrSet(hkQr *q, int x, int y, int dark) { q->m[y][x] = (uint8_t)dark; q->fn[y][x] = 1; }
+
+static void hkQrFormat(hkQr *q, int mask) {           /* level M = 00 */
+	int d = mask, r = d;
+	for (int i = 0; i < 10; i++) r = (r << 1) ^ ((r >> 9) * 0x537);
+	int b = ((d << 10) | r) ^ 0x5412, n = q->n;
+	for (int i = 0; i <= 5; i++) hkQrSet(q, 8, i, (b >> i) & 1);
+	hkQrSet(q, 8, 7, (b >> 6) & 1); hkQrSet(q, 8, 8, (b >> 7) & 1); hkQrSet(q, 7, 8, (b >> 8) & 1);
+	for (int i = 9; i < 15; i++) hkQrSet(q, 14 - i, 8, (b >> i) & 1);
+	for (int i = 0; i < 8; i++) hkQrSet(q, n - 1 - i, 8, (b >> i) & 1);
+	for (int i = 8; i < 15; i++) hkQrSet(q, 8, n - 15 + i, (b >> i) & 1);
+	hkQrSet(q, 8, n - 8, 1);
+}
+
+static int hkQrMasked(int mask, int x, int y) {
+	switch (mask) {
+	case 0: return (x + y) % 2 == 0;
+	case 1: return y % 2 == 0;
+	case 2: return x % 3 == 0;
+	case 3: return (x + y) % 3 == 0;
+	case 4: return (x / 3 + y / 2) % 2 == 0;
+	case 5: return x * y % 2 + x * y % 3 == 0;
+	case 6: return (x * y % 2 + x * y % 3) % 2 == 0;
+	default: return ((x + y) % 2 + x * y % 3) % 2 == 0;
+	}
+}
+
+static void hkQrApply(hkQr *q, int mask) {
+	for (int y = 0; y < q->n; y++)
+		for (int x = 0; x < q->n; x++)
+			if (!q->fn[y][x] && hkQrMasked(mask, x, y)) q->m[y][x] ^= 1;
+}
+
+static long hkQrPenalty(const hkQr *q) {
+	int n = q->n;
+	long p = 0, dark = 0;
+	for (int t = 0; t < 2; t++)                       /* rows, then columns */
+		for (int a = 0; a < n; a++) {
+			int run = 0, prev = -1;
+			unsigned hist = 0;
+			for (int b = 0; b < n; b++) {
+				int v = t ? q->m[b][a] : q->m[a][b];
+				run = v == prev ? run + 1 : 1;
+				prev = v;
+				if (run == 5) p += 3; else if (run > 5) p++;
+				hist = ((hist << 1) | (unsigned)v) & 0x7FF;   /* 1:1:3:1:1 with four light on a side */
+				if (b >= 10 && (hist == 0x5D0 || hist == 0x05D)) p += 40;
+			}
+		}
+	for (int y = 0; y < n; y++)
+		for (int x = 0; x < n; x++) {
+			dark += q->m[y][x];
+			if (x + 1 < n && y + 1 < n && q->m[y][x] == q->m[y][x + 1] && q->m[y][x] == q->m[y + 1][x] && q->m[y][x] == q->m[y + 1][x + 1]) p += 3;
+		}
+	long k = (labs(dark * 20 - (long)n * n * 10) + (long)n * n - 1) / ((long)n * n) - 1;
+	return p + (k > 0 ? k : 0) * 10;
+}
+
+/* The symbol for text, or 0 when it does not fit version 10. */
+static int hkQrEncode(hkQr *q, const char *text) {
+	static const uint8_t ecc[11] = { 0, 10, 16, 26, 18, 24, 16, 18, 22, 22, 26 };
+	static const uint8_t blocks[11] = { 0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5 };
+	size_t len = strlen(text);
+	int ver, raw = 0, data = 0;
+	for (ver = 1; ver <= 10; ver++) {
+		raw = (16 * ver + 128) * ver + 64;
+		if (ver >= 2) { int na = ver / 7 + 2; raw -= (25 * na - 10) * na - 55; if (ver >= 7) raw -= 36; }
+		raw /= 8;
+		data = raw - ecc[ver] * blocks[ver];
+		if ((int)len * 8 + 4 + (ver < 10 ? 8 : 16) <= data * 8) break;
+	}
+	if (ver > 10) return 0;
+	uint8_t buf[HK_QR_MAX * HK_QR_MAX / 8 + 8] = { 0 }, out[sizeof buf] = { 0 };
+	int bit = 0;
+#define HK_QR_PUT(v, nb) for (int i_ = (nb) - 1; i_ >= 0; i_--, bit++) buf[bit >> 3] |= (uint8_t)((((v) >> i_) & 1) << (7 - (bit & 7)))
+	HK_QR_PUT(4, 4);
+	HK_QR_PUT((int)len, ver < 10 ? 8 : 16);
+	for (size_t i = 0; i < len; i++) HK_QR_PUT((uint8_t)text[i], 8);
+	int term = data * 8 - bit < 4 ? data * 8 - bit : 4;
+	HK_QR_PUT(0, term);
+	bit = (bit + 7) & ~7;
+	for (int pad = 0xEC; bit < data * 8; pad ^= 0xEC ^ 0x11) HK_QR_PUT(pad, 8);
+#undef HK_QR_PUT
+	/* split into blocks, each with its Reed-Solomon remainder, then interleave */
+	int nb = blocks[ver], ne = ecc[ver], shortn = nb - raw % nb, slen = raw / nb;
+	uint8_t div[32] = { 0 }, blk[5][160];
+	div[ne - 1] = 1;
+	for (int i = 0, root = 1; i < ne; i++, root = hkQrMul((uint8_t)root, 2))
+		for (int j = 0; j < ne; j++) { div[j] = hkQrMul(div[j], (uint8_t)root); if (j + 1 < ne) div[j] ^= div[j + 1]; }
+	for (int b = 0, k = 0; b < nb; b++) {
+		int dl = slen - ne + (b < shortn ? 0 : 1);
+		uint8_t *r = blk[b] + slen + 1 - ne;
+		memset(blk[b], 0, sizeof blk[b]);
+		memcpy(blk[b], buf + k, (size_t)dl);
+		k += dl;
+		for (int i = 0; i < dl; i++) {
+			uint8_t f = blk[b][i] ^ r[0];
+			memmove(r, r + 1, (size_t)ne - 1);
+			r[ne - 1] = 0;
+			for (int j = 0; j < ne; j++) r[j] ^= hkQrMul(div[j], f);
+		}
+		if (b < shortn) memmove(blk[b] + dl + 1, r, (size_t)ne);   /* short blocks skip one data column */
+	}
+	int o = 0;
+	for (int i = 0; i <= slen; i++)
+		for (int b = 0; b < nb; b++)
+			if (i != slen - ne || b >= shortn) out[o++] = blk[b][i];
+	/* function patterns */
+	int n = q->n = 4 * ver + 17;
+	memset(q->m, 0, sizeof q->m);
+	memset(q->fn, 0, sizeof q->fn);
+	for (int i = 0; i < n; i++) { hkQrSet(q, 6, i, i % 2 == 0); hkQrSet(q, i, 6, i % 2 == 0); }
+	const int fc[3][2] = { { 3, 3 }, { n - 4, 3 }, { 3, n - 4 } };
+	for (int f = 0; f < 3; f++)
+		for (int dy = -4; dy <= 4; dy++)
+			for (int dx = -4; dx <= 4; dx++) {
+				int x = fc[f][0] + dx, y = fc[f][1] + dy, d = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+				if (x >= 0 && x < n && y >= 0 && y < n) hkQrSet(q, x, y, d != 2 && d != 4);
+			}
+	if (ver >= 2) {
+		int na = ver / 7 + 2, step = (ver * 4 + na * 2 + 1) / (na * 2 - 2) * 2, pos[7];
+		pos[0] = 6;
+		for (int i = na - 1, p = ver * 4 + 10; i >= 1; i--, p -= step) pos[i] = p;
+		for (int i = 0; i < na; i++)
+			for (int j = 0; j < na; j++) {
+				if ((i == 0 && j == 0) || (i == 0 && j == na - 1) || (i == na - 1 && j == 0)) continue;
+				for (int dy = -2; dy <= 2; dy++)
+					for (int dx = -2; dx <= 2; dx++)
+						hkQrSet(q, pos[i] + dx, pos[j] + dy, (abs(dx) > abs(dy) ? abs(dx) : abs(dy)) != 1);
+			}
+	}
+	hkQrFormat(q, 0);
+	if (ver >= 7) {
+		int r = ver;
+		for (int i = 0; i < 12; i++) r = (r << 1) ^ ((r >> 11) * 0x1F25);
+		long v = (long)ver << 12 | r;
+		for (int i = 0; i < 18; i++) {
+			int a = n - 11 + i % 3, b = i / 3, d = (v >> i) & 1;
+			hkQrSet(q, a, b, d); hkQrSet(q, b, a, d);
+		}
+	}
+	/* the zigzag fill, two columns at a time from the right */
+	for (int right = n - 1, i = 0; right >= 1; right -= 2) {
+		if (right == 6) right = 5;
+		for (int v = 0; v < n; v++)
+			for (int j = 0; j < 2; j++) {
+				int x = right - j, y = ((right + 1) & 2) == 0 ? n - 1 - v : v;
+				if (!q->fn[y][x] && i < o * 8) { q->m[y][x] = (out[i >> 3] >> (7 - (i & 7))) & 1; i++; }
+			}
+	}
+	int best = 0;
+	long low = -1;
+	for (int mask = 0; mask < 8; mask++) {
+		hkQrApply(q, mask);
+		hkQrFormat(q, mask);
+		long p = hkQrPenalty(q);
+		if (low < 0 || p < low) { low = p; best = mask; }
+		hkQrApply(q, mask);
+	}
+	hkQrApply(q, best);
+	hkQrFormat(q, best);
+	return n;
+}
+
 #ifdef HAKO_WASM
 /* ---- the studio page's crypto (RELAY.md §5): the desktop's C, exported ----
    JS copies bytes into hkw_in, calls, and reads hkw_out. One session per page. */
@@ -2399,16 +2597,37 @@ HKW(hkw_name_open) long hkw_name_open(int n) {
 	return bad ? -1 : len;
 }
 
+/* in: K(32) name(n) -> out: nonce(24) mac(16) sealed name. Its length, or -1.
+   A browser that holds K lists itself this way, like a computer does. */
+HKW(hkw_name_seal) long hkw_name_seal(int n) {
+	uint8_t key[32];
+	if (n < 32 + 1 || n > 32 + 150 || !hkRandomBytes(hkw_out, 24)) return -1;
+	hkNameKey(key, hkw_in);
+	crypto_aead_lock(hkw_out + 40, hkw_out + 24, key, hkw_out, NULL, 0, hkw_in + 32, (size_t)n - 32);
+	crypto_wipe(key, sizeof key);
+	return 40 + (long)n - 32;
+}
+
 /* The link frame's body for a computer: in: secret(32) K(32) account id(16)
    -> out: nonce(24) mac(16) sealed(48). hrOnLink opens it. */
-HKW(hkw_link) int hkw_link(void) {
-	uint8_t key[32];
-	if (!hkRandomBytes(hkw_out, 24)) return -1;
-	crypto_blake2b_keyed(key, 32, hkw_in, 32, (const uint8_t *)"hako link key", 13);
-	crypto_aead_lock(hkw_out + 40, hkw_out + 24, key, hkw_out, NULL, 0, hkw_in + 32, 48);
-	crypto_wipe(key, sizeof key);
-	return 0;
+HKW(hkw_link) int hkw_link(void) { return hkLinkSeal(hkw_out, hkw_in, hkw_in + 32); }
+
+/* in: text(n) -> out: its QR modules, row by row, a byte each (1 = dark).
+   The side in modules, or -1. The page draws the pair code with it. */
+HKW(hkw_qr) int hkw_qr(int n) {
+	static hkQr q;
+	char text[214];
+	if (n <= 0 || n > 213) return -1;
+	memcpy(text, hkw_in, (size_t)n);
+	text[n] = '\0';
+	if (!hkQrEncode(&q, text)) return -1;
+	for (int y = 0; y < q.n; y++) memcpy(hkw_out + y * q.n, q.m[y], (size_t)q.n);
+	return q.n;
 }
+
+/* :remote pair's answer, opened: in: secret(32) nonce(24) mac(16) sealed(48)
+   -> out: K(32) account id(16). 0, or -1. */
+HKW(hkw_link_open) int hkw_link_open(void) { return hkLinkOpen(hkw_out, hkw_in, hkw_in + 32); }
 #endif
 
 #ifdef HAKO_RELAY    /* the six-digit fallback: built by the tests until a link uses it */
@@ -4349,12 +4568,25 @@ static void hkClipToken(char *buf, size_t cap) {
 #endif
 }
 
+/* A browser here can show a page: not over ssh, and on Linux/BSD only with a
+   display (xdg-open with none can start a text browser in this terminal). */
+#ifndef HAKO_WASM
+static int hkHasDesktop(void) {
+	if (getenv("SSH_CONNECTION") || getenv("SSH_TTY")) return 0;
+#if defined(__APPLE__) || defined(_WIN32)
+	return 1;
+#else
+	return getenv("DISPLAY") || getenv("WAYLAND_DISPLAY");
+#endif
+}
+#endif
+
 static void clOpenUrl(const char *url) {
 #ifdef HAKO_WASM
 	(void)url;      /* the front end opens links; there is no launcher to call */
 	return;
 #else
-	if (!url) return;
+	if (!url || !hkHasDesktop()) return;
 	char cmd[2048];
 	/* A truncated URL is a DIFFERENT url, and this one goes to a shell.
 	   Refuse rather than open something the user did not ask for. */
@@ -8233,6 +8465,7 @@ static void hsAttachInfo(int *port, const char **token);
 static void hsAttachSetPort(int port);
 static int hrStart(void);
 static int hrLinked(void);
+static void hrPairPrompt(aiData *data);
 static const char *hrStudioUrl(void);
 static volatile int hk_line_wait;
 #endif
@@ -13454,7 +13687,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			":memory  what it remembers (:memory forget <name>)",
 			":name <chat>  :color <name|off>  :mouse on|off  :mode ask|auto|plan",
 			":e [<editor>]  compose in $EDITOR   :o  last tool output in full",
-			":remote        how to reach this session from another device",
+			":remote        how to reach this session from another device (pair: add a browser)",
 			"",
 			":model   :models [refresh]   bare = picker",
 			":provider  :providers        bare = picker",
@@ -14331,8 +14564,17 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			aiAddHistory(data, "  every tool asks, \"always\" counts once, and the phone stays in this folder");
 			return 1;
 		}
+		if (!strcmp(ra, "pair")) {
+			if (E.pipe_mode || E.serve_mode || !isatty(STDIN_FILENO))
+				aiAddHistory(data, ":remote pair shows a code in this terminal; run it in one");
+			else if (!hs_attached || !hrLinked())
+				aiAddHistory(data, "remote: run :remote on first, so this computer is linked to your account");
+			else hrPairPrompt(data);
+			return 1;
+		}
 #endif
 		aiAddHistory(data, ":remote on shares this session through your account, from any signed-in browser (invite beta)");
+		aiAddHistory(data, ":remote pair adds a browser that signed in without a passkey (an emailed code): scan the code it shows");
 		aiSayfSecret(data, "headless on the same wifi: hako --serve --lan --token %s, and open the printed address with ?t=%s", tok, tok);
 		aiAddHistory(data, "the phone can prompt and approve, every tool asks, and it cannot turn on auto or leave this folder");
 #ifdef __APPLE__
@@ -19278,6 +19520,31 @@ static void hsAttachOff(void) {
 	pthread_mutex_unlock(&hs_inject_lock);
 }
 
+/* Prints text as a QR code, dark on light whatever the theme, two module rows
+   per line, with the four-module quiet zone around it. Secret lines: shown
+   here only. */
+static int hkQrShow(aiData *data, const char *text) {
+	hkQr *q = calloc(1, sizeof *q);
+	if (!q || !hkQrEncode(q, text) || clTermCols() < q->n + 8) { free(q); return 0; }
+	char ink[24], line[512];
+	snprintf(ink, sizeof ink, "%s%s", clSeq(0x4000000u | 30), clSeq(0x4000000u | 107));
+	int n = q->n, z = 4;
+	for (int y = -z; y < n + z; y += 2) {
+		size_t o = (size_t)snprintf(line, sizeof line, "%s", ink);
+		for (int x = -z; x < n + z && o + 8 < sizeof line; x++) {
+			int a = x >= 0 && x < n && y >= 0 && y < n && q->m[y][x];
+			int b = x >= 0 && x < n && y + 1 >= 0 && y + 1 < n && q->m[y + 1][x];
+			const char *c = a && b ? "\xe2\x96\x88" : a ? "\xe2\x96\x80" : b ? "\xe2\x96\x84" : " ";
+			memcpy(line + o, c, strlen(c));
+			o += strlen(c);
+		}
+		snprintf(line + o, sizeof line - o, "%s", clSeq(0x4000000u));
+		aiSayfSecret(data, "%s", line);
+	}
+	free(q);
+	return 1;
+}
+
 /* ---- :remote over the relay (RELAY.md §4, §7) ----
    The page links this computer once: it binds this device key to the account
    and sends the account key K sealed under a secret from the link URL's
@@ -19291,7 +19558,7 @@ static void hsAttachOff(void) {
 #define HR_PEERS   8
 #define HR_STREAMS 32
 #define HR_CHUNK   49152
-enum { HR_HS = 1, HR_TP = 2, HR_LINK = 3 };          /* frame kinds, the first byte */
+enum { HR_HS = 1, HR_TP = 2, HR_LINK = 3, HR_PAIR = 4 };   /* frame kinds, the first byte */
 enum { HR_DATA = 1, HR_EOF = 2, HR_RESET = 3 };      /* stream ops, after the 4-byte id */
 
 typedef struct { int sid, fd; } hrStream;
@@ -19312,6 +19579,8 @@ static pthread_t hr_thread;
 static volatile int hr_on;
 static int hr_has_k, hr_linking;
 static uint8_t hr_k[32], hr_secret[32];
+static uint8_t hr_pair[32];             /* :remote pair's one-use secret, live until hr_pair_until */
+static time_t hr_pair_until;
 static char hr_acct[17];
 static void hrPostName(void);
 
@@ -19532,12 +19801,8 @@ static void hrOnTransport(const char *from, const uint8_t *m, size_t n) {
 /* The page's link frame: nonce(24) mac(16) then K(32) and the account id(16),
    sealed under a key from the secret in the link URL. */
 static void hrOnLink(const uint8_t *m, size_t n) {
-	if (!hr_linking || n != 24 + 16 + 48) return;
-	uint8_t key[32], pt[48];
-	crypto_blake2b_keyed(key, 32, hr_secret, 32, (const uint8_t *)"hako link key", 13);
-	int bad = crypto_aead_unlock(pt, m + 24, key, m, NULL, 0, m + 40, 48);
-	crypto_wipe(key, sizeof key);
-	if (bad) return;
+	uint8_t pt[48];
+	if (!hr_linking || n != 24 + 16 + 48 || hkLinkOpen(pt, hr_secret, m)) return;
 	memcpy(hr_k, pt, 32);
 	snprintf(hr_acct, sizeof hr_acct, "%.16s", (const char *)pt + 32);
 	crypto_wipe(pt, sizeof pt);
@@ -19576,7 +19841,54 @@ static void hrPostName(void) {
 	free(b);
 }
 
-/* Shows (and opens) the link page once per :remote on, while not linked. */
+/* A browser in the account opened :remote pair's code and asks for K: the
+   answer is sealed under the code's secret, which the relay never saw. One use. */
+static void hrOnPair(const char from[33]) {
+	uint8_t pt[48], f[1 + 88];
+	pthread_mutex_lock(&hr_lock);
+	int open = hr_has_k && hr_pair_until && time(NULL) <= hr_pair_until;
+	if (open) {
+		memcpy(pt, hr_k, 32);
+		memset(pt + 32, 0, 16);
+		memcpy(pt + 32, hr_acct, strnlen(hr_acct, 16));
+		open = hkLinkSeal(f + 1, hr_pair, pt) == 0;
+		crypto_wipe(hr_pair, sizeof hr_pair);
+		hr_pair_until = 0;
+	}
+	pthread_mutex_unlock(&hr_lock);
+	crypto_wipe(pt, sizeof pt);
+	if (!open) return;
+	f[0] = HR_PAIR;
+	hkRelaySend(&hr, from, f, sizeof f);
+	aiAddHistory(&G_AI, "remote: paired, that browser now holds your account key");
+	hkLogMessage("system", "remote: a browser was paired");
+}
+
+/* :remote pair: a QR code of <studio>/#pair=<this folder's device id>.<secret>
+   for a browser that signed in without a passkey that unlocks K (email, SSO,
+   no prf). It signs in, asks this session, and gets K back sealed. */
+static void hrPairPrompt(aiData *data) {
+	char id[33], sec[65], url[512];
+	pthread_mutex_lock(&hr_lock);
+	int up = hr.id[0] && hr.acct[0] && hkRandomBytes(hr_pair, 32);
+	if (up) {
+		hr_pair_until = time(NULL) + 600;
+		snprintf(id, sizeof id, "%s", hr.id);
+		hkHexEnc(sec, hr_pair, 32);
+	}
+	pthread_mutex_unlock(&hr_lock);
+	if (!up) { aiAddHistory(data, "remote: not connected to your account yet, try again in a moment"); return; }
+	int fit = hkFmtFits(url, sizeof url, "%s/#pair=%s.%s", hrStudioUrl(), id, sec);
+	crypto_wipe(sec, sizeof sec);
+	aiAddHistory(data, "remote: scan this on the device to add, then sign in there (one use, 10 minutes):");
+	if (!fit || !hkQrShow(data, url)) aiAddHistory(data, "  (no room for the code here: widen this terminal, or open the link on that device)");
+	if (fit) aiSayfSecret(data, "  %s", url);
+	crypto_wipe(url, sizeof url);
+}
+
+/* Shows the link page once per :remote on, while not linked: as a QR code for
+   a phone signed in to hako (no browser needed here), and opened here when
+   this computer has a screen. */
 static void hrLinkPrompt(void) {
 	char pub[65], sec[65], url[512];
 	if (hr_linking) return;
@@ -19585,9 +19897,12 @@ static void hrLinkPrompt(void) {
 	hkHexEnc(sec, hr_secret, 32);
 	if (!hkFmtFits(url, sizeof url, "%s/#link=%s.%s", hrStudioUrl(), pub, sec)) return;
 	hr_linking = 1;
-	aiAddHistory(&G_AI, "remote: link this computer to your account (once). sign in on the page that opened:");
+	int here = !getenv("HAKO_NO_BROWSER") && hkHasDesktop();
+	aiAddHistory(&G_AI, here ? "remote: link this computer to your account (once): sign in on the page that opened, or scan this with a phone signed in to hako"
+	                         : "remote: link this computer to your account (once): scan this with a phone signed in to hako, or open the link");
+	if (!hkQrShow(&G_AI, url)) aiAddHistory(&G_AI, "  (no room for the code here: widen this terminal)");
 	aiSayfSecret(&G_AI, "  %s", url);
-	if (!getenv("HAKO_NO_BROWSER")) clOpenUrl(url);
+	if (here) clOpenUrl(url);
 	crypto_wipe(sec, sizeof sec);
 	crypto_wipe(url, sizeof url);
 }
@@ -19606,7 +19921,8 @@ static void hrRead(hkRelay *r, uint8_t *buf, size_t cap) {
 			hrPeer *p = hrPeerFor(from, 0);
 			if (p) { hrPeerReset(p); p->used = 0; }
 			pthread_mutex_unlock(&hr_lock);
-		} else if (n > 1 && buf[0] == HR_HS) hrOnHandshake(from, buf + 1, (size_t)n - 1);
+		} else if (n == 1 && buf[0] == HR_PAIR) hrOnPair(from);
+		else if (n > 1 && buf[0] == HR_HS) hrOnHandshake(from, buf + 1, (size_t)n - 1);
 		else if (n > 1 && buf[0] == HR_TP) hrOnTransport(from, buf + 1, (size_t)n - 1);
 	}
 	hr_cur = NULL;

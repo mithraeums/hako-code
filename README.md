@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.8-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.8"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.9-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.9"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -111,7 +111,7 @@ being small enough to live anywhere is the whole point.
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
 - **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `~/.hako/skills` and `~/.claude/skills`, nearest first. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
-- **Drive it from your phone.** `:remote on` shares the session you are in. Sign in at hako.mithraeum.studio on any device and ☰ → code lists your sessions, one per folder; open one and you are in the same chat as the terminal, end to end encrypted (Noise XXpsk3) through a relay that only routes ciphertext and keeps no chats. Tools still ask, and the phone gets less than the desk: no `:auto`, no `:trust`, nothing outside the folder. Invite beta: the first `:remote on` links this computer to your account.
+- **Drive it from your phone.** `:remote on` shares the session you are in. Sign in at hako.mithraeum.studio on any device and ☰ → code lists your sessions, one per folder; open one and you are in the same chat as the terminal, end to end encrypted (Noise XXpsk3) through a relay that only routes ciphertext and keeps no chats. Tools still ask, and the phone gets less than the desk: no `:auto`, no `:trust`, nothing outside the folder. Invite beta: the first `:remote on` links this computer to your account. Signed in on a device by email instead of a passkey? `:remote pair` shows a code; scan it there and that device holds your account key.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
 - **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON — *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
 - **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
@@ -230,7 +230,7 @@ hako --update           # check + atomic-replace if newer
 :tools on|off   :toolgate on|off   :toolmode native|prose   :auto on|off   :mode ask|auto|plan
 :mcp [reload]   :trust [revoke]
 :sessions [clear [all]]   :resume <id>     :session [new]     :name <chat>     :color <name|off>
-:e [<editor>]   :o   :mouse on|off   :remote [on|off]
+:e [<editor>]   :o   :mouse on|off   :remote [on|off|pair]
 ```
 
 Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; give an argument to set directly. `:help` opens the same list in a filterable box.
@@ -357,12 +357,11 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.2.8
-- **Nous Portal.** `:login nous` signs in with your Nous account in the browser; `:login nous-api` takes a key. Its whole catalog shows in `:models`.
-- **Provider fixes that matter.** groq works again; a provider's error (bad key, no credits) is an error, not the model's answer; a key pasted after a browser sign-in is actually used; a provider with no model set gets its own default, not `gpt-4o-mini`.
-- **`:remote on` stays up.** It answers the relay's keepalive and reconnects a dead link, so the phone no longer loses the computer after a minute.
-- **Keys stay off the command line.** Headers go to curl in a private file, so `ps` on a shared machine shows no key or token.
-- Ships with **hako studio v0.0.7**.
+### Latest — v0.2.9
+- **`:remote pair`.** A device that signed in without a passkey (an emailed code, GitHub, Google) gets your account key from the computer: scan the QR code `:remote pair` draws, sign in, and the key arrives sealed under a secret only the code carries.
+- **Link without a browser.** `:remote on`'s first-time link step shows a QR code too: scan it with a phone signed in to hako and the computer is linked. Works over ssh, on iSh, on a server.
+- **No stray browsers.** A sign-in link no longer opens a browser over ssh or on a Linux box with no display; the link is printed either way.
+- Ships with **hako studio v0.0.8** (GitHub and Google sign-in, an account sheet, add a device from a browser).
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 
@@ -370,7 +369,7 @@ Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)
 
 ## Roadmap
 
-**Shipped through v0.2.8** — Nous Portal sign-in · `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
+**Shipped through v0.2.9** — `:remote pair` and QR linking · Nous Portal sign-in · `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
 termios line editor · `--update` · directory skills + `read_skill` · PKCE without openssl ·
 universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
 local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
