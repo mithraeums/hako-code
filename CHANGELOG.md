@@ -3,6 +3,20 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [Unreleased]
+
+## [v0.2.9] - 2026-10-27
+
+### added
+- **`:remote pair`**: a device that signed in without a passkey that unlocks your account (an emailed code, a browser without passkey prf) could see code sessions but never open one. `:remote pair` draws a QR code in the terminal; scan it on that device, sign in, and this session hands it your account key, sealed under a secret that only the code carries, so the relay passing it along cannot open it. one use, ten minutes, never logged and never shown on an attached device
+- the studio page draws its own pair code with this QR encoder and seals its browser's name under the account key (`hkw_qr`, `hkw_name_seal` in the wasm build), so one browser can add another
+- `:remote on`'s link step shows a QR code beside the link: scan it with a phone signed in to hako and the computer is linked, no browser needed here. so it works over ssh, on iSh, on a server
+
+### fixed
+- a sign-in link (`:login`, `:remote on`) opened a browser over ssh too, on the far computer's screen, and on Linux with no display `xdg-open` could start a text browser in this terminal. it opens one only where there is a screen; the link is printed either way
+- a QR code too wide for the terminal wrapped into noise; it says to widen the terminal instead
+- the studio built into `--serve` / `:remote` is v0.0.8
+
 ## [v0.2.8] - 2026-10-25
 
 ### added
