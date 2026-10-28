@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.9-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.9"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.10-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.10"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -105,7 +105,7 @@ being small enough to live anywhere is the whole point.
   shapes they get wrong. (ollama is also supported as a *separate* optional
   provider — `:login ollama` — for non-hako models.)
 - **14 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), ChatGPT sign-in (any ChatGPT plan, free included), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), Nous Portal (device code), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. Bare `:login` is a menu: sign-ins first, API keys one level down in `:login api`; `:login <name>` goes straight there.
-- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal — no absolute cursor moves, no scroll region — so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager.
+- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal — no absolute cursor moves, no scroll region — so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager, `ctrl+v` to paste an image (or drop its file in) for any provider that can see one.
 - **The editor's 19 themes + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a picker and the whole screen recolours as you move through it — enter keeps it, esc puts the old one back. The same names as hake and hako studio. Same picker on bare `:provider` and `:model`. `:theme` saves to `~/.hako/state`; `theme=` in `~/.hakorc` sets it for both tools. Truecolor where supported, 256-colour fallback otherwise.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
@@ -357,32 +357,15 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.2.9
-- **`:remote pair`.** A device that signed in without a passkey (an emailed code, GitHub, Google) gets your account key from the computer: scan the QR code `:remote pair` draws, sign in, and the key arrives sealed under a secret only the code carries.
-- **Link without a browser.** `:remote on`'s first-time link step shows a QR code too: scan it with a phone signed in to hako and the computer is linked. Works over ssh, on iSh, on a server.
-- **No stray browsers.** A sign-in link no longer opens a browser over ssh or on a Linux box with no display; the link is printed either way.
-- Ships with **hako studio v0.0.8** (GitHub and Google sign-in, an account sheet, add a device from a browser).
+### Latest — v0.2.10
+- **Images.** `ctrl+v` pastes the clipboard's image as `[image #1]`, and a dragged or typed image path becomes one when you send. Anthropic, OpenAI and every compatible host, a ChatGPT sign-in and ollama see it; the local engine says it cannot and runs on the words. Kept per session in `~/.hako`, never in your project.
+- **`:trust` takes effect at once.** Trusting a folder mid-session used to leave the model believing it had no tools until hako restarted.
+- **Quieter remote.** A phone that reconnects is announced once per `:remote on`, not on every wake-up.
+- Ships with **hako studio v0.0.9** (images from the phone, a code session that reconnects by itself and opens in about half the time, the iPhone keyboard fix).
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 
 <p align="center"><sub><b>—— VIII ——</b></sub></p>
-
-## Roadmap
-
-**Shipped through v0.2.9** — `:remote pair` and QR linking · Nous Portal sign-in · `:remote on` from anywhere (end to end, through the relay) · ChatGPT sign-in · clipboard sign-in on iSh · local models stream · in-flow input bar with type-ahead · transcript pager (ctrl+o) · `$EDITOR` on ctrl+g · `grep`/`glob`/`web_fetch` · context compaction · skills on demand + `:skill install` · diff before every approval · the editor's 19 themes · `--serve` (hako studio in a browser, UI embedded in the binary) ·
-termios line editor · `--update` · directory skills + `read_skill` · PKCE without openssl ·
-universal2 / Linux arm64 / FreeBSD · 4 OAuth providers + Anthropic OAuth tool calls ·
-local `hako` models via the [hakm](https://github.com/mithraeums/hako) subprocess (no ollama, no in-process link) ·
-`edit_file` + `edit_lines` · local-model tool reliability · MCP client ·
-popup pickers with live provider catalogs.
-
-**Next**
-
-- [ ] `hako.wasm` hosted at hako.mithraeum.studio, and the native app shells (see [hako-studio](https://github.com/mithraeums/hako-studio))
-- [ ] a phone-sized local model (0.5B–1.5B) for iSh and the browser
-- [ ] MCP over HTTP with Dynamic Client Registration (stdio MCP ships today)
-
-<p align="center"><sub><b>—— IX ——</b></sub></p>
 
 ## Contributing
 If you share the belief that simplicity empowers creativity, feel free to contribute.

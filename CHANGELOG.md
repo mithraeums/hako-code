@@ -5,6 +5,21 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ## [Unreleased]
 
+## [v0.2.10] - 2026-10-28
+
+### added
+- **images**: ctrl+v puts the clipboard's image in the line as `[image #1]` (macOS; Linux reads it with wl-paste or xclip), and a dragged or typed image path (absolute, `~/`, or `@relative`) becomes one when you send. the model sees the image with your words: Anthropic, OpenAI and every compatible host (Gemini, Copilot, OpenRouter...), a ChatGPT sign-in and ollama. the local engine cannot see images yet and says so, and the turn runs on the words
+- images are kept per session in `~/.hako/projects/<folder>/images/`, never in the project, so a resumed chat still has them. the newest 6 go with each request. over 3.7 MB, macOS shrinks one to 1568 px (what providers scale to anyway); elsewhere it is refused with its size
+- `POST /api/image` for `--serve` and `:remote`: raw image bytes in, `[image #N]` back, so studio can paste, drop or pick one. `/api/state` lists the `image` capability
+
+### fixed
+- **trusting a folder mid-session did not reach the model**: `:trust` and the startup "grant trust?" wrote the trust file, but the system prompt was already built for an untrusted folder and was never rebuilt, so the model kept saying it had no tools and asked for `:trust` again for the rest of the session. the same stale prompt followed a shift+tab mode change. every turn now picks up a prompt that something marked stale
+- an untrusted folder's note to the model says to run `:trust` in the terminal where hako runs, since a phone or browser cannot grant it
+- "remote: a device on your account connected" printed again every time a phone or browser reconnected (a phone waking up, hako's own relay link dropping). each device is announced once per `:remote on`
+
+### changed
+- the studio inside `--serve` and `:remote` is v0.0.9
+
 ## [v0.2.9] - 2026-10-27
 
 ### added
