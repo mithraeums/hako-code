@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.2.9"
+#define HAKO_VERSION "0.2.10"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -2894,6 +2894,7 @@ static const char *CL_LOGO_TINY[] = {
 };
 
 static void aiAddHistory(aiData *data, const char *text);
+static void aiSayf(aiData *data, const char *fmt, ...);
 static void aiAddHistoryRole(aiData *data, const char *text, unsigned char role);
 static void aiPushMessage(aiData *data, const char *role, const char *content);
 static void aiFlattenMessages(aiData *data);
@@ -4246,6 +4247,7 @@ static int hkGrantProjectTrust(void) {
 	char stamp[64];
 	int n = snprintf(stamp, sizeof(stamp), "granted=%ld\n", hk_time_unix());
 	if (hk_fs_write(trust, stamp, (size_t)n, 0) != 0) return 0;
+	hkPromptInvalidate();                   /* the prompt still says "no tools" */
 	char pdir[PATH_MAX];
 	if (hkProjectDirPath(pdir, sizeof(pdir))) {
 		hk_fs_mkdirp(pdir);
@@ -4776,6 +4778,266 @@ static unsigned char *clB64Decode(const char *in, size_t *outlen) {
 		if (bits >= 8) { bits -= 8; out[o++] = (v >> bits) & 0xff; }
 	}
 	*outlen = o;
+	return out;
+}
+
+/* ---- images: "[image #N]" in a message is <session>-N.<ext> in the project's images dir ---- */
+#define HK_IMAGE_MAX  (3750L * 1024)      /* base64 of it stays under the 5 MB providers take */
+#define HK_IMAGE_KEEP 6                   /* the newest this many ride along with a request */
+static const char *const hk_image_ext[]  = { "png", "jpg", "gif", "webp" };
+static const char *const hk_image_mime[] = { "image/png", "image/jpeg", "image/gif", "image/webp" };
+static pthread_mutex_t hk_image_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Which of hk_image_ext the bytes are, by their magic, or -1. */
+static int hkImageKind(const unsigned char *b, size_t n) {
+	if (n >= 8 && !memcmp(b, "\x89PNG\r\n\x1a\n", 8)) return 0;
+	if (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) return 1;
+	if (n >= 6 && (!memcmp(b, "GIF87a", 6) || !memcmp(b, "GIF89a", 6))) return 2;
+	if (n >= 12 && !memcmp(b, "RIFF", 4) && !memcmp(b + 8, "WEBP", 4)) return 3;
+	return -1;
+}
+
+static int hkImageDir(char *out, size_t n, int make) {
+	char dir[PATH_MAX];
+	if (!hkProjectStateDir(dir, sizeof dir) || !hkFmtFits(out, n, "%s/images", dir)) return 0;
+	return !make || hk_fs_mkdirp(out) == 0;
+}
+
+/* Image n of this session: its path (into path) and kind, or -1. */
+static int hkImageFind(int n, char *path, size_t cap) {
+	char dir[PATH_MAX];
+	if (n <= 0 || !E.session_id || !hkImageDir(dir, sizeof dir, 0)) return -1;
+	for (int k = 0; k < 4; k++) {
+		int isdir = 0;
+		if (hkFmtFits(path, cap, "%s/%s-%d.%s", dir, E.session_id, n, hk_image_ext[k])
+		    && hk_fs_exists(path, NULL, NULL, &isdir) && !isdir) return k;
+	}
+	return -1;
+}
+
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+/* argv with no shell between, stdout to out_path when given. Its exit status, or -1. */
+static int hkRunArgv(char *const argv[], const char *out_path) {
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		int nul = open("/dev/null", O_RDWR);
+		int out = out_path ? open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600) : nul;
+		if (nul >= 0) { dup2(nul, 0); dup2(nul, 2); }
+		if (out >= 0) dup2(out, 1);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	int st = 0;
+	while (waitpid(pid, &st, 0) < 0) if (errno != EINTR) return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+#endif
+
+/* Over the cap: macOS shrinks it to a 1568-pixel jpeg, the size providers scale to anyway. */
+static int hkImageShrink(const char *path, const char *dir, int n) {
+#if defined(__APPLE__) && !defined(HAKO_WASM)
+	char jpg[PATH_MAX + 64];
+	long sz = 0;
+	if (!hkFmtFits(jpg, sizeof jpg, "%s/%s-%d.jpg", dir, E.session_id, n)) return 0;
+	char *const av[] = { "sips", "-Z", "1568", "-s", "format", "jpeg", (char *)path, "--out", jpg, NULL };
+	int ok = hkRunArgv(av, NULL) == 0 && hk_fs_exists(jpg, &sz, NULL, NULL) && sz > 0 && sz <= HK_IMAGE_MAX;
+	if (strcmp(jpg, path)) hk_fs_remove(ok ? path : jpg);
+	return ok;
+#else
+	(void)path; (void)dir; (void)n;
+	return 0;
+#endif
+}
+
+/* Bytes in, the next "[image #N]" of this session out (into mark). 0 with why in err. */
+static int hkImageStore(const char *data, size_t len, char *mark, size_t mcap, char *err, size_t ecap) {
+	char dir[PATH_MAX], path[PATH_MAX + 64], probe[PATH_MAX + 64];
+	int k = hkImageKind((const unsigned char *)data, len);
+	if (k < 0) { snprintf(err, ecap, "not an image hako can send (png, jpeg, gif or webp)"); return 0; }
+	if (!E.session_id || !hkImageDir(dir, sizeof dir, 1)) { snprintf(err, ecap, "no place to keep the image"); return 0; }
+	pthread_mutex_lock(&hk_image_lock);
+	int n = 1;
+	while (n < 100000 && hkImageFind(n, probe, sizeof probe) >= 0) n++;
+	int ok = hkFmtFits(path, sizeof path, "%s/%s-%d.%s", dir, E.session_id, n, hk_image_ext[k])
+	      && hk_fs_write(path, data, len, 0) == 0;
+	pthread_mutex_unlock(&hk_image_lock);
+	if (!ok) { snprintf(err, ecap, "could not save the image"); return 0; }
+	if ((long)len > HK_IMAGE_MAX && !hkImageShrink(path, dir, n)) {
+		hk_fs_remove(path);
+		snprintf(err, ecap, "the image is %.1f MB, over the %.1f MB providers take: shrink it first",
+		         len / 1048576.0, HK_IMAGE_MAX / 1048576.0);
+		return 0;
+	}
+	snprintf(mark, mcap, "[image #%d]", n);
+	return n;
+}
+
+/* ctrl+v: the clipboard's image, stored. 0 with why in err. */
+static int hkClipImage(char *mark, size_t mcap, char *err, size_t ecap) {
+#if defined(_WIN32) || defined(HAKO_WASM)
+	(void)mark; (void)mcap;
+	snprintf(err, ecap, "no clipboard images here: type or drop the image's path instead");
+	return 0;
+#else
+	char dir[PATH_MAX], tmp[PATH_MAX + 32];
+	if (!hkImageDir(dir, sizeof dir, 1) || !hkFmtFits(tmp, sizeof tmp, "%s/.clip-%d", dir, (int)getpid())) {
+		snprintf(err, ecap, "no place to keep the image");
+		return 0;
+	}
+	int rc = -1;
+#ifdef __APPLE__
+	char w[PATH_MAX + 96];
+	if (!strchr(tmp, '"') && hkFmtFits(w, sizeof w, "set f to open for access (POSIX file \"%s\") with write permission", tmp)) {
+		char *const av[] = { "osascript", "-e", w, "-e", "try", "-e", "write (the clipboard as «class PNGf») to f",
+		                     "-e", "end try", "-e", "close access f", NULL };
+		rc = hkRunArgv(av, NULL);
+	}
+#else
+	if (getenv("WAYLAND_DISPLAY")) { char *const av[] = { "wl-paste", "--no-newline", "--type", "image/png", NULL }; rc = hkRunArgv(av, tmp); }
+	if (rc != 0 && getenv("DISPLAY")) { char *const av[] = { "xclip", "-selection", "clipboard", "-t", "image/png", "-o", NULL }; rc = hkRunArgv(av, tmp); }
+#endif
+	long n = 0;
+	char *data = rc == 0 ? hk_fs_read(tmp, HK_IMAGE_MAX * 8, &n) : NULL;
+	hk_fs_remove(tmp);
+	int ok = 0;
+	if (data && n > 0) ok = hkImageStore(data, (size_t)n, mark, mcap, err, ecap);
+	else {
+#ifdef __APPLE__
+		snprintf(err, ecap, "no image on the clipboard");
+#else
+		snprintf(err, ecap, "no image on the clipboard (read with wl-paste or xclip)");
+#endif
+	}
+	free(data);
+	return ok;
+#endif
+}
+
+/* Image paths in a typed line become "[image #N]": absolute, ~/ or @relative, a
+   dragged file's escaped spaces or quotes included. NULL when nothing changed. */
+static char *hkImagesFromLine(aiData *data, const char *line) {
+	char *out = NULL;
+	size_t o = 0, cap = 0;
+	const char *p = line, *copied = line;
+	while (*p) {
+		const char *s = p;
+		char q = 0;
+		if (p != line && p[-1] != ' ' && p[-1] != '\t') { p++; continue; }
+		if (*s == '\'' || *s == '"') q = *s++;
+		int at = *s == '@';
+		if (!(*s == '/' || (s[0] == '~' && s[1] == '/') || (at && s[1] && s[1] != ' '))) { p++; continue; }
+		if (at) s++;
+		char path[PATH_MAX];
+		size_t n = 0;
+		if (*s == '~') {
+			const char *h = getenv("HOME");
+			n = (size_t)snprintf(path, sizeof path, "%s", h ? h : "");
+			if (n >= sizeof path) { p++; continue; }
+			s++;
+		}
+		const char *e = s;
+		while (*e && n + 1 < sizeof path && (q ? *e != q : (*e != ' ' && *e != '\t'))) {
+			if (!q && *e == '\\' && e[1]) e++;
+			path[n++] = *e++;
+		}
+		if (q && *e == q) e++;
+		while (!q && n > 0 && strchr(".,;:!?)", path[n - 1])) { n--; e--; }   /* "look at /x/a.png." */
+		path[n] = '\0';
+		const char *dot = strrchr(path, '.');
+		int ext = 0, isdir = 1;
+		if (dot) for (const char *x = "png\0jpg\0jpeg\0gif\0webp\0"; *x && !ext; x += strlen(x) + 1) ext = !strcasecmp(dot + 1, x);
+		if (!ext || !hk_fs_exists(path, NULL, NULL, &isdir) || isdir) { p = e > p ? e : p + 1; continue; }
+		long len = 0;
+		char *bytes = hk_fs_read(path, HK_IMAGE_MAX * 8, &len);
+		char mark[32], err[160];
+		const char *base = strrchr(path, '/');
+		if (!bytes || len <= 0 || !hkImageStore(bytes, (size_t)len, mark, sizeof mark, err, sizeof err)) {
+			if (!bytes || len <= 0) snprintf(err, sizeof err, "could not read it");
+			aiSayf(data, "%s not attached: %s", base ? base + 1 : path, err);
+			free(bytes);
+			p = e;
+			continue;
+		}
+		free(bytes);
+		hkSbAdd(&out, &o, &cap, copied, (size_t)(p - copied));
+		hkSbAdd(&out, &o, &cap, mark, strlen(mark));
+		copied = p = e;
+	}
+	if (!out) return NULL;
+	hkSbAdd(&out, &o, &cap, copied, strlen(copied));
+	return out;
+}
+
+/* How the provider takes an image: 0 not at all (the local engine), 1 Anthropic,
+   2 OpenAI chat (and every compatible host), 3 OpenAI responses, 4 ollama. */
+static int hkImageWire(void) {
+	switch (E.ai_provider_type) {
+	case AI_PROVIDER_ANTHROPIC: return 1;
+	case AI_PROVIDER_OPENAI:    return hkOAuthIs("chatgpt") ? 3 : 2;
+	case AI_PROVIDER_OLLAMA:    return 4;
+	default:                    return 0;
+	}
+}
+
+static int hkImageRefs(const char *s) {
+	int n = 0;
+	while ((s = strstr(s, "[image #"))) { n++; s += 8; }
+	return n;
+}
+
+/* A user message with each [image #N] it names riding along as that wire's
+   image block, or NULL when none of them is on disk. */
+static char *hkUserImageMsg(const char *content, int wire) {
+	char *imgs = NULL, *out = NULL;
+	size_t il = 0, icap = 0, ol = 0, ocap = 0;
+	int seen[16], ns = 0;
+	for (const char *p = content; (p = strstr(p, "[image #")) && ns < 16; ) {
+		char *end;
+		long n = strtol(p + 8, &end, 10);
+		p += 8;
+		int dup = 0;
+		for (int i = 0; i < ns; i++) dup |= seen[i] == n;
+		char path[PATH_MAX + 64];
+		int k = *end == ']' && n > 0 && !dup ? hkImageFind((int)n, path, sizeof path) : -1;
+		long len = 0;
+		char *bytes = k >= 0 ? hk_fs_read(path, HK_IMAGE_MAX, &len) : NULL;
+		char *b64 = bytes && len > 0 ? clB64Encode((const unsigned char *)bytes, (size_t)len) : NULL;
+		free(bytes);
+		if (!b64) continue;
+		seen[ns++] = (int)n;
+		char head[160];
+		const char *tail = wire == 4 ? "\"" : wire == 1 ? "\"}}" : wire == 2 ? "\"}}" : "\"}";
+		if (wire == 1)      snprintf(head, sizeof head, ",{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"%s\",\"data\":\"", hk_image_mime[k]);
+		else if (wire == 2) snprintf(head, sizeof head, ",{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:%s;base64,", hk_image_mime[k]);
+		else if (wire == 3) snprintf(head, sizeof head, ",{\"type\":\"input_image\",\"image_url\":\"data:%s;base64,", hk_image_mime[k]);
+		else                snprintf(head, sizeof head, ",\"");
+		hkSbAdd(&imgs, &il, &icap, head, strlen(head));
+		hkSbAdd(&imgs, &il, &icap, b64, strlen(b64));
+		hkSbAdd(&imgs, &il, &icap, tail, strlen(tail));
+		free(b64);
+	}
+	if (!imgs) return NULL;
+	size_t clen = strlen(content);
+	char *esc = malloc(clen * 6 + 8);
+	if (!esc) { free(imgs); return NULL; }
+	hkJsonEscapeInto(content, esc, clen * 6 + 8);
+	const char *a = wire == 4 ? "{\"role\":\"user\",\"content\":\""
+	              : wire == 3 ? "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\""
+	              :             "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
+	hkSbAdd(&out, &ol, &ocap, a, strlen(a));
+	hkSbAdd(&out, &ol, &ocap, esc, strlen(esc));
+	if (wire == 4) {
+		hkSbAdd(&out, &ol, &ocap, "\",\"images\":[", 12);
+		hkSbAdd(&out, &ol, &ocap, imgs + 1, il - 1);
+		hkSbAdd(&out, &ol, &ocap, "]}", 2);
+	} else {
+		hkSbAdd(&out, &ol, &ocap, "\"}", 2);
+		hkSbAdd(&out, &ol, &ocap, imgs, il);
+		hkSbAdd(&out, &ol, &ocap, "]}", 2);
+	}
+	free(esc);
+	free(imgs);
 	return out;
 }
 
@@ -6062,7 +6324,8 @@ static int hkBuildPrompt(aiData *data) {
 		"for this directory yet. Do not claim you can read, write, edit or run "
 		"anything, and do not emit tool-call syntax — nothing will execute.\n\n"
 		"If the user asks you to do something that needs the filesystem, tell them "
-		"in one short line to run `:trust` first, then wait.\n\n";
+		"in one short line to run `:trust` in the terminal where hako runs (a phone "
+		"or browser cannot grant it), then wait.\n\n";
 
 	const char *tool_prompt = NULL;
 	int tools_available = E.ai_tools_enabled && hkProjectTrusted();
@@ -6918,17 +7181,33 @@ static char *aiBuildMessagesJson(aiData *data) {
 	if (!out) return NULL;
 	int len = 0;
 	out[len++] = '[';
+	/* images ride along from img_from on: the newest HK_IMAGE_KEEP, and all of the last message's */
+	int wire = hkImageWire(), img_from = data->message_count;
+	for (int i = data->message_count - 1, left = HK_IMAGE_KEEP; wire && i >= 0; i--) {
+		const aiMessage *m = &data->messages[i];
+		if (m->raw || !m->content || !m->role || strcmp(m->role, "user") || !strstr(m->content, "[image #")) continue;
+		left -= hkImageRefs(m->content);
+		if (left < 0 && img_from < data->message_count) break;
+		img_from = i;
+	}
 	for (int i = 0; i < data->message_count; i++) {
 		const char *content = data->messages[i].content ? data->messages[i].content : "";
 		int clen = strlen(content);
-		int need = len + clen * 6 + 128;
+		char *with_img = i >= img_from && !data->messages[i].raw && !strcmp(data->messages[i].role, "user")
+		               ? hkUserImageMsg(content, wire) : NULL;
+		int need = len + (with_img ? (int)strlen(with_img) : clen * 6) + 128;
 		if (need >= cap) {
 			while (cap < need) cap *= 2;
 			out = realloc(out, cap);
-			if (!out) return NULL;
+			if (!out) { free(with_img); return NULL; }
 		}
 		if (i > 0) out[len++] = ',';
-		if (data->messages[i].raw == 1) {
+		if (with_img) {
+			int wl = (int)strlen(with_img);
+			memcpy(out + len, with_img, wl);
+			len += wl;
+			free(with_img);
+		} else if (data->messages[i].raw == 1) {
 			int need2 = len + clen + 64;
 			if (need2 >= cap) { while (cap < need2) cap *= 2; out = realloc(out, cap); }
 			len += snprintf(out + len, cap - len, "{\"role\":\"%s\",\"content\":", data->messages[i].role);
@@ -10122,6 +10401,8 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 			  "-H 'Openai-Intent: conversation-panel' "
 			  "-H 'Copilot-Integration-Id: vscode-chat' "
 			: "");
+		if (copilot && strstr(body, "{\"type\":\"image_url\""))
+			hkFmtFits(hdr + strlen(hdr), sizeof(hdr) - strlen(hdr), "-H 'Copilot-Vision-Request: true' ");
 		break;
 	}
 	default:
@@ -12683,6 +12964,12 @@ static void *aiWorkerTurn(void *arg) {
 	char *prompt = data->current_prompt ? strdup(data->current_prompt) : NULL;
 	if (prompt) aiPushMessage(data, "user", prompt);
 	pthread_mutex_unlock(&data->lock);
+	if (prompt && !hkImageWire() && strstr(prompt, "[image #")) {
+		char probe[PATH_MAX + 64];
+		const char *m = strstr(prompt, "[image #");
+		if (hkImageFind(atoi(m + 8), probe, sizeof probe) >= 0)
+			aiSayf(data, "%s cannot see images, so it gets the words only", E.ai_model ? E.ai_model : "this model");
+	}
 	free(prompt);
 
 	int max_iters = 25;
@@ -13354,6 +13641,7 @@ static void *aiWorkerThread(void *arg) {
 
 static void aiWorkerSend(aiData *data) {
 	if (!data || data->streaming) return;
+	hkLoadSkills(data);                     /* no-op unless trust, mode or a skill marked it stale */
 	data->streaming = 1;
 #ifdef HAKO_WASM
 	aiWorkerThread(data);
@@ -13681,7 +13969,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		static const char *HELP[] = {
 			":help   this box · / filters · esc closes",
 			":clear  :retry  :edit  :undo  :usage  :compact  :q",
-			"keys   ctrl-g editor (opens on what you typed)  ctrl-o transcript  shift-tab mode",
+			"keys   ctrl-g editor (opens on what you typed)  ctrl-o transcript  ctrl-v image  shift-tab mode",
 			":use <skill>   turn a skill on as a mode (:use none to stop)",
 			":todo  show the current task list (:todo clear to drop it)",
 			":memory  what it remembers (:memory forget <name>)",
@@ -15660,6 +15948,22 @@ static int clReadLineRaw(const char *prompt, char *out, size_t cap) {
 					clOutEnd(&G_AI);
 				}
 			}			clRedrawLine(prompt, buf, len, cur);
+			continue;
+		}
+		if (c == 22) {                           /* ctrl-v: the clipboard's image, as [image #N] */
+			char mark[32], err[160];
+			int ml = hkClipImage(mark, sizeof mark, err, sizeof err) ? (int)strlen(mark) : 0;
+			if (ml && len + ml + 1 < (int)sizeof(buf)) {
+				memmove(&buf[cur + ml], &buf[cur], len - cur);
+				memcpy(&buf[cur], mark, ml);
+				len += ml; cur += ml; buf[len] = '\0';
+			} else if (!ml) {
+				clOutBegin();
+				aiAddHistory(&G_AI, err);
+				clRedrawReset();
+				clOutEnd(&G_AI);
+			}
+			clRedrawLine(prompt, buf, len, cur);
 			continue;
 		}
 		if (c == 7) {                            /* ctrl-g: keep writing in your editor */
@@ -17889,6 +18193,8 @@ static char *clComposeInEditor(const char *seed) {
 static int clOneShot(aiData *data, const char *prompt) {
 	hkPromptInvalidate();
 	hkLoadSkills(data);
+	char *imaged = hkImagesFromLine(data, prompt);
+	if (imaged) prompt = imaged;                /* lives for the process: a one-shot */
 	aiAddHistoryRole(data, prompt, HK_ROLE_USER);
 	hkLogMessage("user", prompt);
 	E.session_turn_count++;
@@ -17955,6 +18261,8 @@ static int clPipeHandleLine(aiData *data, const char *line) {
 		quit = 1;
 	} else if (strcmp(type, "prompt") == 0) {
 		char *text = hkExtractJsonString(line, "text");
+		char *imaged = text && *text && !E.serve_mode ? hkImagesFromLine(data, text) : NULL;   /* Rei's typed paths; studio uploads */
+		if (imaged) { free(text); text = imaged; }
 		if (text && *text) {
 			free(data->current_prompt);
 			data->current_prompt = text;
@@ -18312,11 +18620,17 @@ static void hsPutFmt(hsBuf *b, const char *fmt, ...) {
 	hsPut(b, tmp);
 }
 
+static char *hsReadBodyMax(int fd, char *req, size_t used, long max, long *got);
 static char *hsReadBody(int fd, char *req, size_t used) {
+	long got;
+	return hsReadBodyMax(fd, req, used, HS_BODY_MAX, &got);
+}
+
+static char *hsReadBodyMax(int fd, char *req, size_t used, long max, long *got) {
 	long want = 0;
 	const char *cl = strcasestr(req, "\r\nContent-Length:");
 	if (cl) want = strtol(cl + 17, NULL, 10);
-	if (want < 0 || want > HS_BODY_MAX) want = 0;
+	if (want < 0 || want > max) want = 0;
 
 	char *body = malloc((size_t)want + 1);
 	if (!body) return NULL;
@@ -18334,6 +18648,7 @@ static char *hsReadBody(int fd, char *req, size_t used) {
 		have += (size_t)n;
 	}
 	body[have] = '\0';
+	*got = (long)have;
 	return body;
 }
 
@@ -18826,7 +19141,7 @@ static void hsServeState(int fd) {
 	static const char *caps[] = {
 		"prompt", "slash", "approve", "input", "stop", "events", "sessions", "history",
 		"dirs", "files", "upload", "models", "providers", "places", "find", "link", "open", "rename", "delete",
-		"mkdir", "shell", NULL
+		"mkdir", "shell", "image", NULL
 	};
 	for (int i = 0, n = 0; caps[i]; i++) {
 		if (hs_remote && (!strcmp(caps[i], "places") || !strcmp(caps[i], "find"))) continue;
@@ -19267,6 +19582,15 @@ static void *hsConnThread(void *arg) {
 		}
 		free(body);
 		hsSendOk(fd, took);
+	} else if (!strncmp(req, "POST /api/image", 15)) {   /* a pasted or picked image: its "[image #N]" back */
+		long n = 0;
+		char *body = hsReadBodyMax(fd, req, used, HK_IMAGE_MAX * 4, &n);
+		char mark[32], err[160], js[256];
+		if (body && n > 0 && hkImageStore(body, (size_t)n, mark, sizeof mark, err, sizeof err))
+			snprintf(js, sizeof js, "{\"ok\":true,\"marker\":\"%s\"}", mark);
+		else snprintf(js, sizeof js, "{\"ok\":false,\"error\":\"%s\"}", body && n > 0 ? err : "empty, or over 15 MB");
+		free(body);
+		hsSendJson(fd, js);
 	} else if (!strncmp(req, "POST /api/upload", 16)) {
 		char raw[512], name[256], path[PATH_MAX];
 		hsQueryParam(req, "name", raw, sizeof(raw));
@@ -19563,7 +19887,7 @@ enum { HR_DATA = 1, HR_EOF = 2, HR_RESET = 3 };      /* stream ops, after the 4-
 
 typedef struct { int sid, fd; } hrStream;
 typedef struct {
-	int used, ready, said;         /* said: the desk was told this device connected */
+	int used, ready;
 	unsigned gen;                  /* bumped on every new handshake */
 	char id[33];
 	hkNoise hs;
@@ -19574,6 +19898,8 @@ typedef struct {
 static hkRelay hr, hrm;            /* this folder's session; the computer itself */
 static hkRelay *volatile hr_cur;    /* whichever is reading, for hrStop */
 static hrPeer hr_peers[HR_PEERS];
+static char hr_told[16][33];        /* devices the desk was told about, for this :remote on */
+static int hr_ntold;
 static pthread_mutex_t hr_lock = PTHREAD_MUTEX_INITIALIZER;  /* peers, streams, every send */
 static pthread_t hr_thread;
 static volatile int hr_on;
@@ -19707,6 +20033,13 @@ static void *hrPumpThread(void *arg) {
 	return NULL;
 }
 
+/* 1 the first time id connects while remote is on; a reconnect stays quiet. Caller holds hr_lock. */
+static int hrFirstSight(const char *id) {
+	for (int i = 0; i < hr_ntold && i < 16; i++) if (!strcmp(hr_told[i], id)) return 0;
+	snprintf(hr_told[hr_ntold++ % 16], sizeof hr_told[0], "%s", id);
+	return 1;
+}
+
 static hrPeer *hrPeerFor(const char *id, int make) {
 	hrPeer *spare = NULL;
 	for (int i = 0; i < HR_PEERS; i++) {
@@ -19734,8 +20067,7 @@ static void hrOnHandshake(const char *from, const uint8_t *m, size_t n) {
 		if (hkNoiseRead(&p->hs, m, n, pl, sizeof pl) >= 0 && hkNoiseDone(&p->hs)) {
 			hkNoiseSplit(&p->hs, &p->tx, &p->rx);
 			p->ready = 1;
-			int first = !p->said;
-			p->said = 1;
+			int first = hrFirstSight(from);
 			pthread_mutex_unlock(&hr_lock);
 			if (first) aiSayfSecret(&G_AI, "remote: a device on your account connected");   /* the desk's to know, not the chat's */
 			return;
@@ -19967,7 +20299,7 @@ static int hrLinked(void) { return hr_has_k; }
 
 static int hrStart(void) {
 	if (hr_on) return 1;
-	for (int i = 0; i < HR_PEERS; i++) hr_peers[i].said = 0;
+	hr_ntold = 0;
 	memset(&hr, 0, sizeof hr);
 	memset(&hrm, 0, sizeof hrm);
 	snprintf(hr.url, sizeof hr.url, "%s", hrRelayUrl());
@@ -20315,10 +20647,11 @@ static int clRepl(aiData *data) {
 		cl_bar_want = 1;
 		if (!cl_bar_h) clBarShow(data);
 		const char *prompt = E.color_enabled ? prompt_color : prompt_plain;
-		int n;
+		int n, from_remote = 0;
 #if HK_ATTACH
 		if (hs_attached && hkInjectTake(line, sizeof(line))) {
 			n = (int)strlen(line);
+			from_remote = 1;                 /* its images come by /api/image, never by a path on this disk */
 			hkLogMessage("system", "remote: the next line came from a remote device");
 		} else {
 			hk_line_wait = 1;
@@ -20379,6 +20712,8 @@ static int clRepl(aiData *data) {
 
 		/* Wipe the composing area, then print what was written as part of the
 		   conversation. */
+		char *imaged = from_remote ? NULL : hkImagesFromLine(data, line);
+		if (imaged) { snprintf(line, sizeof(line), "%s", imaged); free(imaged); }
 		clPrintRoleLine(HK_ROLE_USER, line);
 		aiPushHistoryStore(data, line, HK_ROLE_USER);
 		if (hs_attached) clPipeEmitMsg("user", line);
@@ -20408,6 +20743,8 @@ static int clRepl(aiData *data) {
 		while (hk_queue_n > 0 && !E.interrupt && !hk_quit_requested) {
 			char *next = hk_queue[0];
 			memmove(hk_queue, hk_queue + 1, sizeof(hk_queue[0]) * (size_t)(--hk_queue_n));
+			char *imaged = hkImagesFromLine(data, next);
+			if (imaged) { free(next); next = imaged; }
 			clPrintRoleLine(HK_ROLE_USER, next);
 			aiPushHistoryStore(data, next, HK_ROLE_USER);
 			if (hs_attached) clPipeEmitMsg("user", next);

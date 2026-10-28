@@ -1324,6 +1324,105 @@ static void bench_tests(void) {
    read and edit files, emits tool syntax that nothing executes, and the user
    watches turns go by with no output — which is what a first session on a new
    machine looked like. */
+/* --- images: a typed path becomes [image #N], and the request carries it per wire --- */
+static int count_of(const char *hay, const char *needle) {
+	int n = 0;
+	for (const char *p = hay; p && (p = strstr(p, needle)); p += strlen(needle)) n++;
+	return n;
+}
+
+static void image_tests(void) {
+	char tmpl[] = "/tmp/hakoimgXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	if (!dir) { printf("FAIL image mkdtemp\n"); fails++; return; }
+	char path[PATH_MAX], line[PATH_MAX * 2], cwd[PATH_MAX];
+	if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, "/tmp");
+	char *keep = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+	char *keep_sid = E.session_id, *keep_oauth = E.ai_oauth_provider;
+	int keep_prov = E.ai_provider_type;
+	setenv("HOME", dir, 1);
+	snprintf(path, sizeof path, "%s/proj", dir); mkdir(path, 0755);
+	if (chdir(path)) {}
+	E.session_id = "imgtest";
+	E.ai_oauth_provider = NULL;
+
+	static const char png[] = "\x89PNG\r\n\x1a\n" "pixels";
+	static const char jpg[] = "\xff\xd8\xff\xe0" "jfif";
+	snprintf(path, sizeof path, "%s/shots", dir); mkdir(path, 0755);
+	snprintf(path, sizeof path, "%s/shots/a b.png", dir); hk_fs_write(path, png, sizeof png - 1, 0);
+	snprintf(path, sizeof path, "%s/shots/c.jpg", dir);   hk_fs_write(path, jpg, sizeof jpg - 1, 0);
+	snprintf(path, sizeof path, "%s/shots/not.png", dir); hk_fs_write(path, "text", 4, 0);
+
+	ck(hkImageKind((const unsigned char *)png, sizeof png - 1) == 0, "png bytes are a png");
+	ck(hkImageKind((const unsigned char *)jpg, sizeof jpg - 1) == 1, "jpeg bytes are a jpeg");
+	ck(hkImageKind((const unsigned char *)"RIFF0000WEBP", 12) == 3, "webp bytes are a webp");
+	ck(hkImageKind((const unsigned char *)"text", 4) < 0, "text is not an image");
+
+	aiData d;
+	memset(&d, 0, sizeof(d));
+	pthread_mutex_init(&d.lock, NULL);
+
+	/* a dragged file: the terminal escapes its spaces */
+	snprintf(line, sizeof line, "look at %s/shots/a\\ b.png now", dir);
+	char *r = hkImagesFromLine(&d, line);
+	ck(r && !strcmp(r, "look at [image #1] now"), "a dragged image path becomes [image #1]");
+	free(r);
+	ck(hkImageFind(1, path, sizeof path) == 0 && strstr(path, "/.hako/projects/") && strstr(path, "/images/imgtest-1.png"),
+	   "the image is kept in the project's images dir, by session and number");
+	snprintf(line, sizeof line, "compare '%s/shots/a b.png' and %s/shots/c.jpg.", dir, dir);
+	r = hkImagesFromLine(&d, line);
+	ck(r && !strcmp(r, "compare [image #2] and [image #3]."), "a quoted path and one before a full stop both attach");
+	free(r);
+	ck(hkImageFind(3, path, sizeof path) == 1, "a jpeg keeps its kind");
+	snprintf(line, sizeof line, "fix %s/shots/missing.png and size.png and @nothing", dir);
+	ck(hkImagesFromLine(&d, line) == NULL, "a missing file, a bare name and a stray @ change nothing");
+	snprintf(line, sizeof line, "x=%s/shots/a\\ b.png", dir);
+	ck(hkImagesFromLine(&d, line) == NULL, "a path glued to other text is not a path");
+
+	/* the request: each wire's own image block, the words kept */
+	aiPushMessage(&d, "user", "what is [image #1]?");
+	char *b64 = clB64Encode((const unsigned char *)png, sizeof png - 1);
+	E.ai_provider_type = AI_PROVIDER_ANTHROPIC;
+	char *j = aiBuildMessagesJson(&d);
+	ckstr(j, "{\"type\":\"text\",\"text\":\"what is [image #1]?\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"", "anthropic gets a base64 image block after the words");
+	ckstr(j, b64, "and the bytes are the image's");
+	free(j);
+	E.ai_provider_type = AI_PROVIDER_OPENAI;
+	j = aiBuildMessagesJson(&d);
+	ckstr(j, "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,", "openai-compatible gets an image_url data url");
+	free(j);
+	E.ai_oauth_provider = "chatgpt";
+	j = aiBuildMessagesJson(&d);
+	ckstr(j, "{\"type\":\"input_text\",\"text\":\"what is [image #1]?\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,", "a ChatGPT sign-in gets input_image");
+	free(j);
+	E.ai_oauth_provider = NULL;
+	E.ai_provider_type = AI_PROVIDER_OLLAMA;
+	j = aiBuildMessagesJson(&d);
+	ckstr(j, "\"content\":\"what is [image #1]?\",\"images\":[\"", "ollama gets an images array");
+	free(j);
+	E.ai_provider_type = AI_PROVIDER_MITHRAEUM;
+	j = aiBuildMessagesJson(&d);
+	ckstr(j, "\"content\":\"what is [image #1]?\"}", "the local engine gets the words only");
+	cknot(j, b64, "and no image bytes");
+	free(j);
+
+	/* only the newest few ride along on every request */
+	E.ai_provider_type = AI_PROVIDER_ANTHROPIC;
+	for (int i = 0; i < 9; i++) aiPushMessage(&d, "user", "again [image #1]");
+	j = aiBuildMessagesJson(&d);
+	ck(count_of(j, "\"type\":\"image\"") == HK_IMAGE_KEEP, "only the newest HK_IMAGE_KEEP images are sent");
+	free(j);
+	free(b64);
+
+	E.session_id = keep_sid;
+	E.ai_oauth_provider = keep_oauth;
+	E.ai_provider_type = keep_prov;
+	if (keep) { setenv("HOME", keep, 1); free(keep); } else unsetenv("HOME");
+	if (chdir(cwd)) {}
+	snprintf(line, sizeof line, "rm -rf '%s'", dir);
+	if (system(line)) {}
+}
+
 static void trust_prompt_tests(void) {
 	char tmpl[] = "/tmp/hakotrustXXXXXX";
 	char *dir = mkdtemp(tmpl);
@@ -1346,13 +1445,15 @@ static void trust_prompt_tests(void) {
 	ckstr(d.system_prompt, "NO tools in this session", "an untrusted project says tools are unavailable");
 	ckstr(d.system_prompt, ":trust", "it names the command that fixes it");
 	cknot(d.system_prompt, "<tool name=", "it does not teach tool syntax that cannot run");
-	free(d.system_prompt); d.system_prompt = NULL;
+	ckstr(d.system_prompt, "terminal where hako runs", "and says where, since a phone cannot run it");
 
-	/* trusted: the real tool prompt comes back */
+	/* trusted mid-session: the built prompt is kept, so the grant itself must
+	   mark it stale (`:trust` and the startup prompt never did, and the model
+	   asked for :trust all session) */
 	hkGrantProjectTrust();
 	ck(hkProjectTrusted() == 1, "trust is granted");
 	E.ai_toolmode = 1;                       /* force the prose prompt */
-	hkLoadSkills(&d);
+	hkLoadSkills(&d);                        /* what the next turn does */
 	cknot(d.system_prompt, "NO tools in this session", "a trusted project drops the warning");
 	ckstr(d.system_prompt, "<tool name=", "and teaches the tool syntax again");
 	free(d.system_prompt);
@@ -1985,6 +2086,7 @@ int main(int argc, char **argv) {
 	ask_user_tests();
 	bench_tests();
 	trust_prompt_tests();
+	image_tests();
 	shell_tests();
 	fit_tests();
 	paste_tests();
