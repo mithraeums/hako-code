@@ -5,6 +5,46 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-10-29
+
+### added
+- **one rc for the whole suite**: the first that exists of `$HAKORC`, `~/.hakorc` and `~/.config/hako/hakorc`, then the project's own `.hakorc` once the folder is trusted. `code.<key>` is hako's own and beats `<key>`; a project rc may not set `ai_api_key`, `ai_endpoint`, `ai_auto_approve`, `editor` or a `*_cmd` (named once if it tries). `HAKORC` is passed on, so ctrl+g's editor and the studio read the same file
+- custom themes in the rc: `theme.<name>.base=<preset>` plus any slot as `#rrggbb`, `ansi0`-`ansi15` or `default`; they show in the picker after the presets
+- **a command menu**: typing `:` or `/` opens a list under the line, inside the bar (↑/↓, tab takes it, enter on a prefix runs it, esc closes only the menu). it works mid-turn, steps aside under 12 rows and drops to names under 50 columns
+- `:` runs hako, `/` drives the model (`/compact`, `/retry`), and every installed skill is `/<skill> [text]`: on as a mode, the text sent. the wrong prefix still works, and an unknown command says what it probably meant
+- the command table goes out as `commands` in the `--pipe` init and in `/api/state`, so the editor's Rei pane and the studio draw the same menu
+- **`:voice [on|off]`**: each finished reply read aloud (macOS `say`, `spd-say`, `espeak-ng`, `espeak`, Windows speech; `voice_cmd` for your own), markdown stripped, code skipped. esc, ^C or the next turn stops it. under `--serve` and `:remote` the browser speaks instead. bare `:voice` reads the last reply
+- the bar says `update <version>` when a newer release is out (checked once a day in the background, cached, `update_check=0` turns it off) and **`:update`** says how
+- the bar says `remote` (and how many devices) while `:remote on`, at the right end, where it outlasts the token count on a narrow screen
+- state for the front ends: `session_name`, `theme` (`?for=studio` gets `studio.theme`), `theme_slots` for a custom theme, `mode`, `shared` (`:remote on`), `voice`, `voice_rate`, `update`; `mtime` on `/api/dirs` files; `/api/sessions` titles prefer the `:name`
+- `POST /api/cmd`: a menu's command (`:name`, `:mode`, `:session new`) runs and updates state without a line in the chat
+- skills are also read from `./.agents/skills` and `~/.agents/skills` (where Codex, OpenCode, Cursor and Copilot look); a skill in two places loads once, the nearest winning
+
+### changed
+- the `mithraeum` and `washi` themes print in one ink like the rest of the suite: bone on near-black and sumi on paper, faint tints for syntax and tools, errors still red (every color at least 4.5:1); no blue
+- the icon is one ink on one ground, like the rest of the suite: sumi on washi (the windows `.exe` and the studio inside `--serve` carry it)
+- the default theme is `terminal`: your profile's own colors, nothing of ours. a picked theme is written to the rc, in place, and no longer saved per project (an old `theme=` in project state is ignored, so the rc always wins)
+- the session name chip rides the bar's top rule without `[ ]` around it
+- `:help` is generated from the command table, one row per command; a pane gets it as one message. `:help remote` has the whole remote story
+- `:remote on` says it in two lines (where to open it, and that every tool asks there); bare `:remote` in three
+- `:name` while `:remote on` and linked puts the chat's name in the account's session list, sealed under your account key like the rest of the entry
+
+### fixed
+- `write_file` says where it wrote relative to the project (`wrote 377 bytes to hello.py`); the whole absolute path was cut at 120 to 150 characters, so in a deep folder (an iCloud project) the model and the screen saw a wrong, truncated name
+- a local model that repeated a tool's `<observation>` back had it printed in the chat as raw text; the line is held back and the reply shown without it (pinned in `make test-tty`)
+- **a picker on a small window stacked copies of itself down the screen** (and redrew endlessly on iSh): the box plus the bar under it was taller than the window. the list now scrolls inside a box that fits, the bar steps aside when it would not, a window too small for any box gets a one-line chooser, and a resize lays it out again instead of closing it
+- the model's context stays lean: a `write_file` or `edit_*` body from an earlier turn is sent as `(wrote N bytes to path)`, not the whole file again on every request (a 4 KB write: 6,607 to 1,195 bytes of messages three turns later)
+- a resumed chat counted notices against its 40-message window, so a session full of them reached the model with a turn or two of context; the window now counts only what the model reads
+- a command typed mid-turn that changes the conversation (`/retry`, `:clear`, `:model`, `:use`) raced the running turn (`/retry` started a second worker); it now runs as soon as the turn ends
+- a bare esc waited for the next key and swallowed it
+- `read_skill` only found skills in `~/.hako/skills`, so a summarized skill from `.claude/skills` could never be opened; `:use` and `:skills` saw only that folder too
+- `make test` and friends take `TMP=<dir>` for their binaries; tests never ask GitHub for a release
+
+### security
+- a phone on `:remote` could set `:editor` to any command and then run `:e`, which ran it on the computer without asking; both are refused from a phone now, like `:auto` and `:trust`
+- a project `.hakorc` cannot switch `ai_provider` when the global rc holds an `ai_api_key` (the key would go along to that provider)
+- skill names and descriptions from a cloned repo's skill folders lose control bytes before they reach the command menu
+
 ## [v0.2.10] - 2026-10-28
 
 ### added

@@ -11,6 +11,9 @@
 #undef main
 
 static const char *SEEDS[] = {
+	"ok <tool name=\"write_file\">{\"path\": \"a.py\", \"content\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n\"}</tool>",
+	"{\"tool_calls\":[{\"function\":{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"c\\\",\\\"new\\\":\\\"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\\\\\\"\\\"}\"}}]}",
+	"<write_file path=\"d\">zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz</write_file> # h\n```\ncode\n```\n[a](b) | c",
 	"<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"x\\ny\\\\\"}}</tool_call>",
 	"{\"name\": \"run_shell\", \"arguments\": {\"command\": \"ls\"}}</tool_call>",
 	"<write_file path=\"a.c\">int main(void){return 0;}\n</write_file>",
@@ -96,6 +99,8 @@ static void run_one(const char *s, size_t len) {
 	free(hkStripCodeFences(s));
 	free(hkExtractBestFence(s));
 	free(hkStripToolBlocks(s));
+	free(hkSlimOne(s));                    /* an old write's body -> its receipt */
+	free(hkVoiceText(s));
 	free(hkHtmlToText(s));
 	int t, d; free(hkTodoNormalize(s, &t, &d));
 	free(hkDiffPreview("edit_file", s, 0));
