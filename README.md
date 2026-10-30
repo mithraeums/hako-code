@@ -1,6 +1,9 @@
 <p align="center">
   <a href="https://mithraeums.github.io">
-    <img src="https://mithraeums.github.io/assets/banner-hako-code.png" alt="hako-code — a standalone agent for the inner chamber" width="100%"/>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://mithraeums.github.io/assets/banner-hako-code-night.png"/>
+      <img src="https://mithraeums.github.io/assets/banner-hako-code.png" alt="hako-code — a standalone agent for the inner chamber" width="100%"/>
+    </picture>
   </a>
 </p>
 
@@ -9,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.2.10-e2402e?style=flat-square&labelColor=14130f" alt="v0.2.10"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.0-e2402e?style=flat-square&labelColor=14130f" alt="v0.3.0"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -22,30 +25,26 @@
 
 <br>
 
-<!-- hero: screenrecord-hako.gif, a real hako-sho session recorded through a pty and rendered (waits shortened) -->
+<!-- terminal media: real sessions through a pty, drawn in the night terminal at 2x (Code/mithraeums/.claude/web/look/media.py).
+     one image per row, width only, never a height: GitHub can shrink them but never stretch them -->
 <p align="center">
-  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenrecord-hako.gif?raw=true" alt="hako on hako-sho: writes hello.py, asks before each tool, runs it and prints the first five primes" width="82%"/>
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/hero.gif?raw=true" alt="hako on hako-sho, the local model: it writes hello.py, asks before each tool, runs it and prints the first five primes" width="100%"/>
 </p>
 
-<table align="center">
-  <tr>
-    <td align="center" width="33%">
-      <!-- hako-code/vhs/splash.tape — the press-any-key splash. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-splash.png?raw=true" alt="hako startup banner" width="100%"/><br/>
-      <sub>press-any-key splash · sizes down to a phone-width terminal</sub>
-    </td>
-    <td align="center" width="33%">
-      <!-- hako-code/vhs/models.tape — `:models` against a live openrouter catalog. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/screenshot-models.png?raw=true" alt=":models output" width="100%"/><br/>
-      <sub><code>:models</code> · the provider's own catalog, cached and filterable</sub>
-    </td>
-    <td align="center" width="33%">
-      <!-- hako-code/vhs/theme-picker.tape — :theme swatches, then :model + / filter. -->
-      <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/theme-picker.gif?raw=true" alt="theme picker popup with live swatches" width="100%"/><br/>
-      <sub><code>:theme</code> swatches · <code>:model</code> narrowed with <code>/</code></sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/menu.png?raw=true" alt="typing a colon opens the command menu under the line" width="100%"/><br/>
+  <sub><code>:</code> opens the command menu under the line &nbsp;·&nbsp; <code>/</code> drives the model &nbsp;·&nbsp; every skill is <code>/&lt;skill&gt;</code></sub>
+</p>
+
+<p align="center">
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/theme-picker.gif?raw=true" alt="the theme picker previewing each theme as the highlight moves" width="100%"/><br/>
+  <sub><code>:theme</code> previews as you move; the default is your terminal's own colors</sub>
+</p>
+
+<p align="center">
+  <img src="https://github.com/mithraeums/mithraeums.github.io/blob/main/assets/readme-screenshots/hako-code/models.png?raw=true" alt="the model picker on openrouter, narrowed to claude with a slash" width="100%"/><br/>
+  <sub><code>:model</code> lists the provider's own catalog, narrowed with <code>/</code></sub>
+</p>
 
 
 <table>
@@ -106,10 +105,10 @@ being small enough to live anywhere is the whole point.
   provider — `:login ollama` — for non-hako models.)
 - **14 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), ChatGPT sign-in (any ChatGPT plan, free included), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), Nous Portal (device code), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. Bare `:login` is a menu: sign-ins first, API keys one level down in `:login api`; `:login <name>` goes straight there.
 - **An input bar that stays out of the way.** Drawn in the normal flow of the terminal — no absolute cursor moves, no scroll region — so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager, `ctrl+v` to paste an image (or drop its file in) for any provider that can see one.
-- **The editor's 19 themes + arrow-key picker.** `:theme <name>` swaps the palette directly; bare `:theme` opens a picker and the whole screen recolours as you move through it — enter keeps it, esc puts the old one back. The same names as hake and hako studio. Same picker on bare `:provider` and `:model`. `:theme` saves to `~/.hako/state`; `theme=` in `~/.hakorc` sets it for both tools. Truecolor where supported, 256-colour fallback otherwise.
+- **Your terminal's colors by default, the suite's themes when you want them.** `theme=terminal` uses the profile's own 16 colors; `:theme <name>` swaps to one of the shared presets or a custom `theme.<name>.<slot>` theme from the rc, and bare `:theme` opens a picker that recolors as you move (enter keeps it, esc puts the old one back, and it fits even a phone-sized window). The pick is written to the rc, so hake and the studio see it too. Truecolor where supported, 256-color fallback otherwise.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
-- **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `~/.hako/skills` and `~/.claude/skills`, nearest first. Install a whole repository of them with `:skill install owner/repo`.
+- **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
 - **Drive it from your phone.** `:remote on` shares the session you are in. Sign in at hako.mithraeum.studio on any device and ☰ → code lists your sessions, one per folder; open one and you are in the same chat as the terminal, end to end encrypted (Noise XXpsk3) through a relay that only routes ciphertext and keeps no chats. Tools still ask, and the phone gets less than the desk: no `:auto`, no `:trust`, nothing outside the folder. Invite beta: the first `:remote on` links this computer to your account. Signed in on a device by email instead of a passkey? `:remote pair` shows a code; scan it there and that device holds your account key.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
@@ -213,27 +212,28 @@ hako --update           # check + atomic-replace if newer
 | `^G` | finish the line in `$EDITOR` (`editor=` in `~/.hakorc`) |
 | `^O` | the whole transcript, expanded, in a pager (`q` closes) |
 | Shift+Tab | cycle ask → auto → plan |
-| Tab | complete commands, names and paths |
+| Tab | complete commands, names and paths; with the menu open, take the selected entry |
+| Esc | close the command menu (the line stays); stop a reply being read aloud |
 
 *Bracketed paste — multi-line pastes land as one entry.*
 
 ### Commands (inside prompt):
 
-`:` is the primary prefix (vim / hako style). `/` works as a legacy alias.
+`:` runs hako itself; `/` drives the model. Typing either opens a menu under the line
+(↑/↓ to move, Tab to take, Esc to close); the wrong prefix still works.
 
 ```
-:help     :clear     :retry     :edit     :undo     :usage     :compact     :q
-:providers   :models [refresh]   :provider [<name>]   :model [<id>]   :theme [<name>]   :pull <model>
-:login [<prov>]     :logout [<prov>]     :accounts
-:history [local|global]   :todo [clear]   :memory [forget <name>]
-:skills [reload]    :skill install <url>     :skill uninstall <name>     :use <skill|none>
-:tools on|off   :toolgate on|off   :toolmode native|prose   :auto on|off   :mode ask|auto|plan
-:mcp [reload]   :trust [revoke]
-:sessions [clear [all]]   :resume <id>     :session [new]     :name <chat>     :color <name|off>
-:e [<editor>]   :o   :mouse on|off   :remote [on|off|pair]
+:help [cmd]   :q   :update   :remote [on|off|pair]   :mcp [reload]   :memory   :e   :o
+:name <chat>   :color <name|off>   :sessions [clear [all]]   :resume <id>   :session [new]
+:history   :clear   :undo   :edit   :todo [clear]
+:theme [<name>]   :mode ask|auto|plan   :auto   :tools   :toolgate   :toolmode   :trust   :mouse   :editor   :voice [on|off]
+:model [<id>]   :models [refresh]   :provider [<name>]   :pull <model>
+:login [<prov>|api]   :logout [<prov>]   :accounts   :usage
+:skills [reload]   :skill install <url>   :skill uninstall <name>   :use <skill|none>
+/compact   /retry   /<skill> [text]      (every installed skill is a / command)
 ```
 
-Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; give an argument to set directly. `:help` opens the same list in a filterable box.
+Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; give an argument to set directly. `:help` lists every command from the same table the menu, the editor's Rei pane and the studio use. A command that would race a running turn (`/retry`, `:clear`, `:model`) runs as soon as the turn ends.
 
 <p align="center"><sub><b>—— V ——</b></sub></p>
 
@@ -249,20 +249,28 @@ Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; g
 ~/.hako/projects/<encoded-cwd>/state       per-project session id, turn count
 ~/.hako/projects/<encoded-cwd>/trust       sentinel: tools allowed in this cwd
 ~/.hako/projects/<encoded-cwd>/sessions/   append-only JSONL session history
-~/.hakorc                                  user config
+~/.hakorc or ~/.config/hako/hakorc         user config ($HAKORC first)
+<cwd>/.hakorc                              per-project config, read once the folder is trusted
 <cwd>/.hako/HAKO.md                        per-project context (auto-loaded into system prompt)
 ```
 
 ### `~/.hakorc`
 
-One file for the whole suite: hake reads its own keys from it too, and keys it does not
-know are left alone (`:config` in hake writes a commented template of every key).
+One file for the whole suite (hako, hake, the studio): the first that exists of `$HAKORC`,
+`~/.hakorc` and `~/.config/hako/hakorc`, then the project's own `.hakorc` once the folder is
+trusted (it may not set `ai_api_key`, `ai_endpoint`, `ai_auto_approve`, `editor` or a
+`*_cmd`). `code.<key>` is hako's own and beats `<key>`; `edit.` and `studio.` are the
+others'. Unknown keys are left alone. The pickers write the one key they change, in place.
 
 ```
 ai_provider=mithraeum        # or anthropic, openai, gemini, ollama, groq, … (:providers)
 ai_model=hako-sho
-theme=mithraeum              # shared with hake: the same 18 names
-mouse=0                      # shared with hake; default off here — it takes the scroll wheel
+theme=terminal               # the default: your terminal's own colors. code.theme=nord for hako only
+theme.mine.base=nord         # a custom theme: a preset to start from,
+theme.mine.accent=#b89656    # then any slot as #rrggbb, ansi0-15 or default
+voice=0                      # 1 reads each finished reply aloud (voice_rate, voice_cmd)
+update_check=1               # 0: never ask GitHub for a newer release
+mouse=0                      # shared with hake; default off here, it takes the scroll wheel
 ai_auto_approve=0            # 0 = ask before tools (shift+tab cycles ask/auto/plan)
 show_splash=0
 anim_style=pump              # braille dots bar pulse bounce ghost arrows blocks pump
@@ -357,11 +365,15 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.2.10
-- **Images.** `ctrl+v` pastes the clipboard's image as `[image #1]`, and a dragged or typed image path becomes one when you send. Anthropic, OpenAI and every compatible host, a ChatGPT sign-in and ollama see it; the local engine says it cannot and runs on the words. Kept per session in `~/.hako`, never in your project.
-- **`:trust` takes effect at once.** Trusting a folder mid-session used to leave the model believing it had no tools until hako restarted.
-- **Quieter remote.** A phone that reconnects is announced once per `:remote on`, not on every wake-up.
-- Ships with **hako studio v0.0.9** (images from the phone, a code session that reconnects by itself and opens in about half the time, the iPhone keyboard fix).
+### Latest — v0.3.0
+- **One rc for the whole suite.** The first of `$HAKORC`, `~/.hakorc` and `~/.config/hako/hakorc`, with the project's own `.hakorc` on top once the folder is trusted. `code.`, `edit.` and `studio.` keys belong to one tool; custom themes live there too.
+- **A command menu.** Type `:` or `/` and a list opens under the line. `:` runs hako, `/` drives the model, and every installed skill is `/<skill>`. hake's Rei pane and the studio draw the same menu.
+- **Your terminal's colors by default.** `terminal` is the default theme, and a theme you pick is written to the rc, so every tool sees it.
+- **`:voice`** reads each reply aloud with the computer's own voice; under `:remote` the phone speaks instead.
+- **The bar says more.** `update <version>` when a newer release is out (`:update` says how), and `remote` while the session is shared.
+- **A leaner model context.** A file written in an earlier turn goes to the model as one line, not the whole file on every request.
+- **A safer remote.** A phone can no longer set `:editor` and run it on the computer.
+- Ships with **hako studio v0.1.0** (a new menu, a landing for an empty chat, replies in markdown, read aloud).
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 

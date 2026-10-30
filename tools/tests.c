@@ -238,6 +238,8 @@ static void pipe_tests(void) {
 	ck(strchr(emitted, '\n') == emitted + strlen(emitted) - 1,
 	   "tool_request is a single JSONL line");
 	ckstr(res, "wrote",                            "an approved write goes through");
+	ckstr(res, "wrote 11 bytes to f.txt (",        "the result names the file from the project, not the whole path");
+	ck(res && !strstr(res, root),                  "the project's absolute path stays out of the result");
 	free(emitted); free(res);
 
 	/* and a denial must come back as a denial, not a hang */
@@ -560,12 +562,32 @@ static void skill_roots_tests(void) {
 		"printf -- '---\\nname: dupe\\ndescription: >\\n  CLAUDE LOSES this clash.\\n---\\nBODY\\n' > %s/.claude/skills/dupe/SKILL.md",
 		dir, dir, dir, dir, dir, dir, dir, dir);
 	if (system(cmd)) {}
+	/* the vendor-neutral root, and a one-file copy of a folder skill */
+	snprintf(cmd, sizeof(cmd),
+		"mkdir -p %s/.agents/skills/agentsone %s/.agents/skills/dupe && "
+		"printf -- '---\\nname: agentsone\\ndescription: >\\n  From the AGENTS ROOT.\\n---\\nB\\n' > %s/.agents/skills/agentsone/SKILL.md && "
+		"printf -- '---\\nname: dupe\\ndescription: >\\n  AGENTS LOSES too.\\n---\\nB\\n' > %s/.agents/skills/dupe/SKILL.md && "
+		"printf -- '---\\nname: fromclaude\\ndescription: >\\n  FLAT COPY LOSES.\\n---\\nB\\n' > %s/.agents/skills/fromclaude.md",
+		dir, dir, dir, dir, dir);
+	if (system(cmd)) {}
 
 	aiData d;
 	memset(&d, 0, sizeof(d));
 	pthread_mutex_init(&d.lock, NULL);
 	int n = hkLoadSkills(&d);
-	ck(n == 3, "skills load from every root, deduped by name");
+	ck(n == 4, "skills load from every root, deduped by name");
+	ckstr(d.system_prompt, "AGENTS ROOT", "a .agents/skills skill is picked up");
+	cknot(d.system_prompt, "AGENTS LOSES", "a skill in two roots loads once, the nearest wins");
+	cknot(d.system_prompt, "FLAT COPY LOSES", "x.md and x/ are the same skill");
+	hkPromptInvalidate();
+	hkSkillScan();
+	int seen_agents = 0, dupes = 0;
+	for (int i = 0; i < hk_skill_n; i++) { if (!strcmp(hk_skill_names[i], "agentsone")) seen_agents++; if (!strcmp(hk_skill_names[i], "dupe")) dupes++; }
+	ck(seen_agents == 1 && dupes == 1, "the /<skill> list has each skill once");
+	E.ai_auto_approve = 1;
+	char *rs = hkExecTool("read_skill", "{\"skill\":\"agentsone\",\"path\":\"SKILL.md\"}");
+	ckstr(rs, "AGENTS ROOT", "read_skill finds a skill outside ~/.hako/skills");
+	free(rs);
 	ckstr(d.system_prompt, "Claude Code directory", "a .claude/skills skill is picked up");
 	ckstr(d.system_prompt, "project hako directory", "a project .hako/skills skill is picked up");
 	ckstr(d.system_prompt, "PROJECT WINS", "project-local wins a name clash");
@@ -1080,6 +1102,201 @@ static void rc_tests(void) {
 	remove(path);
 	E.ai_prompt_cache = pc; E.ai_context_window = cw; E.mouse_enabled = mo; E.ai_shell_timeout = st;
 	clThemeApply("mithraeum");
+}
+
+/* --- the unified rc (DESIGN 2026-10-29 §1): search order, code. keys, the
+   project file behind trust and its denylist, writing one key in place,
+   custom themes, and the theme gone from per-project state --- */
+static void put(const char *path, const char *text) {
+	FILE *f = fopen(path, "w"); if (f) { fputs(text, f); fclose(f); }
+}
+static char *slurp(const char *path) { return hk_fs_read(path, 1 << 20, NULL); }
+
+static void rc_unified_tests(void) {
+	ck(!strcmp(TH_PRESETS[0].name, "terminal"), "terminal is the first preset (the default)");
+	char home[PATH_MAX], rc[PATH_MAX], xdg[PATH_MAX + 32], alt[PATH_MAX + 16], cmd[PATH_MAX * 2];
+	snprintf(home, sizeof home, "%s", getenv("HOME"));
+	snprintf(rc, sizeof rc, "%s/.hakorc", home);
+	snprintf(xdg, sizeof xdg, "%s/.config/hako/hakorc", home);
+	snprintf(alt, sizeof alt, "%s/alt.rc", home);
+	snprintf(cmd, sizeof cmd, "mkdir -p %s/.config/hako", home);
+	if (system(cmd)) {}
+	unsetenv("HAKORC"); unsetenv("XDG_CONFIG_HOME");
+	remove(rc);
+
+	/* the XDG file is found when there is no ~/.hakorc */
+	put(xdg, "theme = nord \n");
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "nord"), "~/.config/hako/hakorc is read, key and value trimmed");
+	ckstr(hk_rc_path, ".config/hako/hakorc", "writes go to the file that was found");
+	ckstr(getenv("HAKORC"), ".config/hako/hakorc", "HAKORC is exported for the editor and the studio");
+	unsetenv("HAKORC");
+	/* ~/.hakorc comes before it, $HAKORC before both */
+	put(rc, "theme=dracula\n");
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "dracula"), "~/.hakorc wins over ~/.config/hako/hakorc");
+	put(alt, "theme=monokai\n");
+	setenv("HAKORC", alt, 1);
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "monokai"), "$HAKORC wins over both");
+	unsetenv("HAKORC");
+	remove(xdg);
+
+	/* code.<key> beats <key> in either order; edit./studio. are someone else's */
+	put(rc, "# mine\ncode.theme=solarized\ntheme=dracula\nedit.theme=gruvbox\nstudio.theme=washi\nmouse=0\ncode.mouse=1\n");
+	E.mouse_enabled = 0;
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "solarized"), "code.theme beats theme even when theme comes later");
+	ck(E.mouse_enabled == 1, "code.mouse beats mouse");
+	ck(!strcmp(hkThemeFor(HK_RC_STUDIO), "washi"), "studio.theme is the studio's");
+
+	/* one key set in place: the line rewritten, comments and order kept */
+	ck(hkRcSaveTheme(HK_RC_CODE, "nord") == 0, "the picker writes the rc");
+	char *t = slurp(rc);
+	ckstr(t, "# mine\ncode.theme=nord\ntheme=dracula\n", "code.theme rewritten in place, the rest kept");
+	free(t);
+	put(rc, "# only plain\ntheme=dracula\nmouse=0\n");
+	clLoadRc();
+	hkRcSaveTheme(HK_RC_CODE, "nord");
+	t = slurp(rc);
+	ckstr(t, "# only plain\ntheme=nord\nmouse=0\n", "without code.theme the plain key is the one written");
+	cknot(t, "code.theme", "and no code.theme is invented");
+	free(t);
+	hkRcSet("voice", "1");
+	t = slurp(rc);
+	ckstr(t, "mouse=0\nvoice=1\n", "a new key is appended");
+	free(t);
+
+	/* custom themes: a preset base plus slot overrides, listed after the presets */
+	put(rc, "theme=mine\ntheme.mine.base=nord\ntheme.mine.accent=#112233\ntheme.mine.fg=ansi3\n");
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "mine"), "a custom theme is applied by name");
+	ckstr(TH_ACCENT, "17;34;51", "its #hex slot is used");
+	ckstr(TH_AI, "[33m", "fg feeds the ai slot, ansi3 is the profile's yellow");
+	const char *names[64];
+	int nn = hkThemeNames(names, 64);
+	ck(nn > 2 && !strcmp(names[0], "terminal") && !strcmp(names[nn - 1], "mine"), "custom names come after the presets");
+	put(rc, "theme=nosuchtheme\n");
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "terminal"), "an unknown theme falls back to terminal");
+
+	/* the theme left per-project state: an old file that still says theme= is ignored */
+	char sp[PATH_MAX + 16];
+	snprintf(sp, sizeof sp, "%s/oldstate", home);
+	put(sp, "ai_tools_enabled=1\ntheme=dracula\n");
+	hkLoadSessionFile(sp, 1);
+	ck(!strcmp(TH_ACTIVE, "terminal"), "theme= in old per-project state is ignored");
+	hkWriteSessionFile(sp, 0);
+	t = slurp(sp);
+	cknot(t, "theme=", "state no longer saves the theme");
+	free(t);
+
+	/* the project's own .hakorc: only once trusted, never for a denied key */
+	char proj[PATH_MAX + 8], prc[PATH_MAX + 16], keep[PATH_MAX];
+	if (!getcwd(keep, sizeof keep)) keep[0] = '\0';
+	snprintf(proj, sizeof proj, "%s/proj", home);
+	snprintf(cmd, sizeof cmd, "mkdir -p %s", proj);
+	if (system(cmd)) {}
+	if (chdir(proj)) {}
+	snprintf(prc, sizeof prc, "%s/.hakorc", proj);
+	put(rc, "theme=dracula\nai_endpoint=https://mine.example\n");
+	put(prc, "theme=gruvbox\nai_endpoint=https://evil.example\nai_api_key=sk-evil\nvoice_cmd=rm -rf ~\nbuild_cmd=make\n");
+	free(E.ai_endpoint); E.ai_endpoint = NULL;
+	hk_rc_proj_done = 0; hk_rc_proj[0] = '\0';
+	clLoadRc();
+	aiData d; memset(&d, 0, sizeof d); clInitAI(&d);
+	hkRcProjectLoad(&d);
+	ck(!strcmp(TH_ACTIVE, "dracula"), "an untrusted folder's .hakorc is not read");
+	hkGrantProjectTrust();
+	hkRcProjectLoad(&d);
+	ck(!strcmp(TH_ACTIVE, "gruvbox"), "once trusted, the project .hakorc beats the global one");
+	ck(E.ai_endpoint && !strcmp(E.ai_endpoint, "https://mine.example"), "a project .hakorc cannot set ai_endpoint");
+	ck(!E.voice_cmd, "nor voice_cmd");
+	int said = 0;
+	for (int i = 0; i < d.history_count; i++)
+		if (strstr(d.history[i], "project .hakorc: ai_endpoint, ai_api_key, voice_cmd ignored (set it in ~/.hakorc)")) said++;
+	ck(said == 1, "the refused keys are named once");
+	ck(hkRcGet(HK_RC_EDIT, "build_cmd") != NULL, "hake's build_cmd stays allowed");
+
+	/* a project ai_provider would carry the global rc's key to another provider */
+	put(rc, "ai_provider=anthropic\nai_api_key=sk-mine\n");
+	put(prc, "ai_provider=groq\n");
+	hk_rc_proj_done = 0; hk_rc_proj[0] = '\0';
+	clLoadRc();
+	hkRcProjectLoad(&d);
+	ck(E.ai_provider_type == AI_PROVIDER_ANTHROPIC, "with a global ai_api_key, a project cannot switch the provider");
+	put(rc, "ai_provider=anthropic\n");
+	hk_rc_proj_done = 0; hk_rc_proj[0] = '\0';
+	clLoadRc();
+	hkRcProjectLoad(&d);
+	ck(E.ai_provider_type != AI_PROVIDER_ANTHROPIC, "without one it may (a local model for this repo)");
+	free(E.ai_api_key); E.ai_api_key = NULL;
+	clCleanupAI(&d);
+	if (keep[0] && chdir(keep)) {}
+	hk_rc_proj_done = 0; hk_rc_proj[0] = '\0';
+	remove(prc); remove(rc); remove(alt); remove(sp);
+	clLoadRc();
+	ck(!strcmp(TH_ACTIVE, "terminal"), "no rc at all: terminal colors");
+	clThemeApply("mithraeum");
+
+	/* a phone (relay) may not widen what the desk allows: :editor and :e run a command there */
+	hs_remote = 1;
+	ck(hkSlashRefusedRemote(":editor sh -c x") && hkSlashRefusedRemote(":e") && hkSlashRefusedRemote("/e vim"),
+	   "a phone cannot set or open the desk's editor");
+	ck(!hkSlashRefusedRemote(":edit") && !hkSlashRefusedRemote(":name x"), "but :edit and :name still work");
+	hs_remote = 0;
+}
+
+/* --- commands (§2), the lean context (§3), voice text, the update compare --- */
+static void cmd_and_context_tests(void) {
+	int m[CL_MENU_CAP];
+	int n = hkCmdMatch(':', "e", 1, m, CL_MENU_CAP);
+	ck(n > 3 && !strcmp(hkCmdAt(m[0]).n, "e"), "an exact name comes first (:e before :edit)");
+	int ix_edit = -1, ix_help = -1;
+	for (int i = 0; i < n; i++) { if (!strcmp(hkCmdAt(m[i]).n, "edit")) ix_edit = i; if (!strcmp(hkCmdAt(m[i]).n, "help")) ix_help = i; }
+	ck(ix_edit > 0 && ix_help > ix_edit, "prefix matches before substring ones (edit before help)");
+	n = hkCmdMatch(':', "", 0, m, CL_MENU_CAP);
+	int alias = 0;
+	for (int i = 0; i < n; i++) if (hkCmdAt(m[i]).f & HK_CF_ALIAS) alias++;
+	ck(alias == 0, "the bare menu leaves aliases out");
+	ck(!strcmp(hkCmdAt(m[0]).n, "help"), "and opens on :help");
+	n = hkCmdMatch(':', "compa", 5, m, CL_MENU_CAP);
+	ck(n == 1 && hkCmdAt(m[0]).p == '/', "a /command is found from a : too, and says where it lives");
+	char *js = hkCmdsJson();
+	ckstr(js, "{\"n\":\"theme\",\"p\":\":\",\"c\":\"settings\",\"a\":\"[name]\",\"d\":\"pick a theme\"}", "the wire shape of a command");
+	ckstr(js, "{\"n\":\"compact\",\"p\":\"/\"", "/compact is the model's");
+	free(js);
+	int ci = hkCmdFind("retry", 5);
+	ck(ci >= 0 && !(hkCmdAt(ci).f & HK_CF_TURN), "/retry waits for the turn (it would start a second worker)");
+	ci = hkCmdFind("theme", 5);
+	ck(ci >= 0 && (hkCmdAt(ci).f & HK_CF_TURN), ":theme runs mid-turn");
+
+	/* a write's body becomes a receipt once a later turn exists */
+	char big[1200];
+	memset(big, 'x', sizeof big - 1); big[sizeof big - 1] = '\0';
+	char prose[1500], raw[1500], esc[1600], chan[1500];
+	snprintf(prose, sizeof prose, "Writing.\n<tool name=\"write_file\">\n{\"path\": \"a.py\", \"content\": \"%s\\n\"}\n</tool>", big);
+	snprintf(raw, sizeof raw, "[{\"type\":\"text\",\"text\":\"ok\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"edit_file\",\"input\":{\"path\":\"b.c\",\"old\":\"q\",\"new\":\"%s\"}}]", big);
+	snprintf(esc, sizeof esc, "{\"content\":\"keep me\",\"tool_calls\":[{\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"c.txt\\\",\\\"content\\\":\\\"%s\\\"}\"}}]}", big);
+	snprintf(chan, sizeof chan, "<write_file path=\"d.txt\">%s</write_file>", big);
+	char *a = hkSlimOne(prose), *b = hkSlimOne(raw), *c = hkSlimOne(esc), *d = hkSlimOne(chan);
+	ckstr(a, "\"content\": \"(wrote 1200 bytes to a.py)\"", "a prose write_file body becomes (wrote N bytes to path)");
+	ckstr(b, "\"new\":\"(wrote 1199 bytes to b.c)\"", "a native edit_file body too, the JSON still whole");
+	ckstr(b, "\"old\":\"q\"", "a short value is left alone");
+	ckstr(c, "\\\"content\\\":\\\"(wrote 1199 bytes to c.txt)\\\"", "an escaped openai arguments body too");
+	ckstr(c, "\"content\":\"keep me\"", "the reply's own text is never touched");
+	ckstr(d, ">(wrote 1199 bytes)</write_file>", "the raw <write_file> channel too");
+	ck(hkSlimOne("just talking about write_file") == NULL, "nothing to slim, nothing changed");
+	free(a); free(b); free(c); free(d);
+
+	/* what voice says: no marks, no code */
+	char *v = hkVoiceText("# Title\n**bold** and `x` [link](http://e)\n```c\nint x;\n```\n- item | cell\n");
+	ckstr(v, "Title bold and x link code skipped. item , cell", "voice reads the words, skips the code");
+	cknot(v, "int x", "and never the code itself");
+	free(v);
+
+	ck(hkVersionNewer("v0.2.11", "0.2.10") && !hkVersionNewer("v0.2.10", "0.2.10") && !hkVersionNewer("0.1.9", "0.2.10")
+	   && hkVersionNewer("1.0.0", "0.9.99"), "release tags compare by number");
 }
 
 /* --- the ENVIRONMENT block: found by walking PATH (it spawned a shell per name)
@@ -1946,6 +2163,7 @@ int main(int argc, char **argv) {
 	char home_tmpl[] = "/tmp/hakotesthomeXXXXXX";
 	char *test_home = mkdtemp(home_tmpl);
 	if (test_home) setenv("HOME", test_home, 1);
+	setenv("HAKO_UPDATE_CHECK", "0", 1);   /* no GitHub calls from a test */
 	/* --- matcher --- */
 	struct { const char *pat, *str; int want; } m[] = {
 		{"*.c",        "hako.c",        1},
@@ -2078,6 +2296,8 @@ int main(int argc, char **argv) {
 	json_escape_scan_tests();
 	stdin_claim_tests();
 	rc_tests();
+	rc_unified_tests();
+	cmd_and_context_tests();
 	env_probe_tests();
 	truncation_notice_tests();
 	invoke_dialect_tests();

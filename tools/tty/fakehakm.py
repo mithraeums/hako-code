@@ -6,6 +6,7 @@ no weights, no model and no GPU. The reply is chosen by the LAST user message:
   "TWOTOOLS"    -> two tool calls in one reply (tests the approval handover)
   "ASK"         -> an ask_user question with two options
   "SLOW"        -> the same short answer after 30 s (a cold local model)
+  "ECHO"        -> a reply that repeats an <observation> before its sentence (small models do)
   <observation> -> a one-line wrap-up
   anything else -> a short bulleted answer
 Every frame received is appended to $FAKE_LOG, so a test can see what the
@@ -25,6 +26,8 @@ def reply_for(last):
     if "ASK" in last:
         return ('<tool_call>{"name": "ask_user", "arguments": {"question": "which one?", '
                 '"options": "red\\nblue"}}</tool_call>')
+    if "ECHO" in last:
+        return '<observation tool="run_shell">[2, 3, 5, 7, 11]</observation>\nDone, it printed the primes.'
     if "TOOL" in last:
         return '<tool_call>{"name": "list_dir", "arguments": {"path": "."}}</tool_call>'
     if "observation" in last:

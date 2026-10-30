@@ -21,6 +21,8 @@ ifeq ($(RELEASE),1)
 CFLAGS  := -O2 -Wall
 endif
 LDLIBS  ?= -lpthread
+# where test binaries and scratch files go; TMP=<dir> keeps them out of /tmp
+TMP     ?= /tmp
 
 ICON_DIR = icon
 SRC      = hako.c
@@ -220,8 +222,8 @@ themes-check:
 	@if [ -n "$(THEMES_PY)" ]; then python3 $(THEMES_PY) --check; else echo "themes: no ../hako-edit checkout — skipped"; fi
 
 test: tools/tests.c $(SRC) themes-check
-	$(CC) -O1 -Wall -Wextra -DHAKO_RELAY -Dmain=hako_cli_main -I. tools/tests.c -o /tmp/hako_tests $(LDLIBS)
-	@/tmp/hako_tests
+	$(CC) -O1 -Wall -Wextra -DHAKO_RELAY -Dmain=hako_cli_main -I. tools/tests.c -o $(TMP)/hako_tests $(LDLIBS)
+	@$(TMP)/hako_tests
 
 # Two devices through a real relay on loopback: sign-in, Noise XX + the six
 # digits, a big frame, offline notices, refused tokens and proofs.
@@ -229,10 +231,10 @@ RELAY      ?= ../hako-studio/relay/relay
 RELAY_PORT ?= 18790
 test-relay: tools/tests.c $(SRC)
 	@[ -x "$(RELAY)" ] || $(MAKE) -C $(dir $(RELAY)) relay
-	$(CC) -O1 -Wall -Wextra -DHAKO_RELAY -Dmain=hako_cli_main -I. tools/tests.c -o /tmp/hako_tests $(LDLIBS)
-	@d=$$(mktemp -d /tmp/hako-relay.XXXXXX); inv=$$($(RELAY) invite 1 -d $$d); \
+	$(CC) -O1 -Wall -Wextra -DHAKO_RELAY -Dmain=hako_cli_main -I. tools/tests.c -o $(TMP)/hako_tests $(LDLIBS)
+	@d=$$(mktemp -d $(TMP)/hako-relay.XXXXXX); inv=$$($(RELAY) invite 1 -d $$d); \
 	$(RELAY) -p $(RELAY_PORT) -d $$d --dev 2>$$d/log & rp=$$!; sleep 0.3; \
-	/tmp/hako_tests relay http://127.0.0.1:$(RELAY_PORT) $$inv $$d/log; r=$$?; kill $$rp; wait $$rp 2>/dev/null; rm -rf $$d; exit $$r
+	$(TMP)/hako_tests relay http://127.0.0.1:$(RELAY_PORT) $$inv $$d/log; r=$$?; kill $$rp; wait $$rp 2>/dev/null; rm -rf $$d; exit $$r
 
 asan: $(SRC)
 	$(CC) -fsanitize=address,undefined -g -O1 -Wall $< -o hako_asan $(LDLIBS)
@@ -295,7 +297,7 @@ uninstall:
 # place to find it. Needs mingw-w64 (brew install mingw-w64); skipped if absent.
 win-check:
 	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
-		x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra $(SRC) -o /tmp/hako-wincheck.exe -lws2_32 -lpthread && \
+		x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra $(SRC) -o $(TMP)/hako-wincheck.exe -lws2_32 -lpthread && \
 		echo "windows: builds"; \
 	else echo "windows: skipped (no mingw-w64)"; fi
 
@@ -322,5 +324,5 @@ test-serve: hako
 # Mutation fuzz of the model-output parsers under ASan+UBSan. FUZZ_ITERS / FUZZ_SEED.
 fuzz: tools/fuzz.c $(SRC)
 	$(CC) -fsanitize=address,undefined -fno-sanitize-recover=undefined -g -O1 -Wall -Wextra \
-	  -Dmain=hako_cli_main -I. tools/fuzz.c -o /tmp/hako_fuzz $(LDLIBS)
-	@cd /tmp && ASAN_OPTIONS=detect_leaks=0 /tmp/hako_fuzz
+	  -Dmain=hako_cli_main -I. tools/fuzz.c -o $(TMP)/hako_fuzz $(LDLIBS)
+	@cd $(TMP) && ASAN_OPTIONS=detect_leaks=0 $(TMP)/hako_fuzz

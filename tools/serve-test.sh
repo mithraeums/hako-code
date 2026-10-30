@@ -3,6 +3,7 @@
 # A request the browser never answers must not wedge the serve loop, and an
 # answer posted while nothing waits must not resolve the next request.
 BIN=${HAKO_BIN:-./hako}
+export HAKO_UPDATE_CHECK=0          # never ask GitHub from a test
 T=$(mktemp -d "${TMPDIR:-/tmp}/hako-serve.XXXXXX") || exit 1
 P=${HAKO_TEST_PORT:-18787}
 U=http://127.0.0.1:$P
@@ -12,6 +13,7 @@ no() { echo "  FAIL $1"; fail=1; }
 
 start() {
 	rm -rf "$T/h" "$T/p"; mkdir -p "$T/h" "$T/p"
+	[ -f "$T/rc" ] && cp "$T/rc" "$T/h/.hakorc"
 	HOME="$T/h" "$BIN" --serve --port $P --dir "$T/p" </dev/null >"$T/serve.out" 2>&1 &
 	pid=$!
 	i=0; until curl -s -o /dev/null "$U/api/state" || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done
@@ -110,6 +112,27 @@ grep -q '"type":"delta"' "$T/ev" && ok "a headless reply streams as deltas" || n
 d=$(grep -n '"type":"delta"' "$T/ev" | tail -1 | cut -d: -f1); m=$(grep -n '"role":"ai"' "$T/ev" | tail -1 | cut -d: -f1)
 [ -n "$d" ] && [ -n "$m" ] && [ "$d" -lt "$m" ] && ok "and the finished message follows them" || no "a delta arrived after the finished message"
 kill $cp $pid 2>/dev/null; wait $cp $pid 2>/dev/null
+
+# DESIGN 2026-10-29 §4: the optional state fields, and a rename that reaches the page
+printf 'theme=nord\nstudio.theme=washi\n' > "$T/rc"
+start
+st=$(curl -s "$U/api/state")
+case $st in *'"commands":[{"n":"help","p":":","c":"app"'*'"n":"compact","p":"/"'*) ok "state carries the command table, : and /";; *) no "no commands in state";; esac
+case $st in *'"theme":"nord"'*) ok "state names the theme";; *) no "state has no theme: $st";; esac
+case $(curl -s "$U/api/state?for=studio") in *'"theme":"washi"'*) ok "?for=studio gets studio.theme";; *) no "studio.theme not resolved";; esac
+case $st in *'"session_name":""'*'"voice":0'*) ok "session_name and voice are there";; *) no "no session_name/voice";; esac
+slash ':name pumpkin'; sleep 0.6
+grep -q '"type":"state".*"session_name":"pumpkin"' "$T/ev" && ok ":name emits state with the name" || no ":name did not emit state"
+case $(curl -s "$U/api/state") in *'"session_name":"pumpkin"'*) ok "and state keeps it";; *) no "state lost the name";; esac
+case $st in *'"mode":"ask","shared":false'*) ok "state has mode and shared";; *) no "no mode/shared in state";; esac
+n0=$(grep -c '"role":"system"' "$T/ev")
+curl -s -o /dev/null -X POST --data ':name quiet one' "$U/api/cmd"; sleep 0.6
+case $(curl -s "$U/api/state") in *'"session_name":"quiet one"'*) ok "/api/cmd runs the command";; *) no "/api/cmd did not rename";; esac
+[ "$(grep -c '"role":"system"' "$T/ev")" = "$n0" ] && ! grep -q '"text":":name quiet' "$T/ev" && ok "and says nothing in the chat" || no "/api/cmd echoed into the chat"
+finish
+rm -f "$T/rc"
+init=$(printf '{"type":"quit"}\n' | HOME="$T/h" "$BIN" --pipe 2>/dev/null | head -1)
+case $init in *'"type":"init"'*'"commands":[{'*'"n":"theme"'*) ok "--pipe init carries the command table";; *) no "init has no commands: $init";; esac
 
 rm -rf "$T"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

@@ -6,6 +6,8 @@ no account. Usage: fakeanthropic.py PORT LOGFILE
 Replies are chosen from the last user message, like fakehakm.py:
   "CLAUDETOOL" -> prose, then a text-dialect tool call (what Claude emitted in
                   the dogfood session), then prose on the follow-up turn
+  "CLAUDEWRITE" -> a write_file call with a 4 KB body, then prose (the payload
+                  that should not ride along in every later request)
   "CLAUDEGOESON" -> a tool call, then prose that invents its result (what Haiku
                   did); the request's stop_sequences cut it like the real API
   anything else -> a multi-line answer, streamed in 3-character deltas, with a
@@ -27,6 +29,9 @@ def reply_for(body):
         c = " ".join(p.get("text", "") or json.dumps(p.get("content", "")) for p in c if isinstance(p, dict))
     if "observation" in c or "tool_result" in json.dumps(last):
         return "Found alpha.txt in the folder.\nThat is everything here."
+    if "CLAUDEWRITE" in c:
+        body = "x = 1\\n" * 680
+        return 'Writing it now.\n<tool name="write_file">\n{"path": "big.py", "content": "%s"}\n</tool>' % body
     if "CLAUDEGOESON" in c:
         return ('<tool name="list_dir">\n{"path": "."}\n</tool>\n\n'
                 "It looks like there's no project directory set up here.")
