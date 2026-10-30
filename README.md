@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <em>A coding agent in one C file. ~650 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
+  <em>A coding agent in one C file. ~800 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
 </p>
 
 <p align="center">
@@ -70,14 +70,14 @@ hako is the same idea built the other way. One C file. It compiles with
 gcc hako.c -o hako -lpthread
 ```
 
-and the result is a **~650 KB binary (the browser UI inside) that links libc and nothing else**. It talks to thirteen
+and the result is a **~800 KB binary (the browser UI inside) that links libc and nothing else**. It talks to thirteen
 cloud providers when you want them, and to a 3B model on your own disk when you do not.
 It runs on a laptop, on a FreeBSD box, on Windows, and in a 32-bit Linux emulator on an
 iPhone — the same source, the same behaviour.
 
 |                        | hako                                   | agents that ship a runtime          |
 |------------------------|----------------------------------------|-------------------------------------|
-| install                | one binary, ~650 KB                    | interpreter + package tree          |
+| install                | one binary, ~800 KB                    | interpreter + package tree          |
 | runtime deps           | libc, pthread, `curl(1)`               | Python and/or Node, plus packages   |
 | build from source      | `gcc hako.c -o hako -lpthread`         | a package manager and a lockfile    |
 | works with no network  | yes, on local weights                  | usually only as a client            |
