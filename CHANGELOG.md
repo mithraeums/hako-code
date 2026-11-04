@@ -5,6 +5,13 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ## [Unreleased]
 
+## [v0.3.2] - 2026-11-04
+
+v0.3.1 as built: its release build failed on Linux, so v0.3.1 has no binaries
+
+### fixed
+- `make test-serve` dated its 70 test chats with minutes up to 69; macOS rolls 12:65 over to 13:05, GNU `touch` refuses it, so the Linux release test failed. the dates are real minutes now (checked in Debian, amd64 and arm64)
+
 ## [v0.3.1] - 2026-11-04
 
 ### added

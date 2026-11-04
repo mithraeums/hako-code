@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.1-e2402e?style=flat-square&labelColor=14130f" alt="v0.3.1"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.2-e2402e?style=flat-square&labelColor=14130f" alt="v0.3.2"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -364,7 +364,9 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.3.1
+### Latest — v0.3.2
+v0.3.1, built: its release build failed on a Linux-only test date, so it has no binaries.
+
 - **Pinned and archived chats.** hako keeps them beside each chat (`POST /api/session/mark`), so every browser on that computer sees the same list; the chat list and the resume picker show the newest first.
 - **Paths for cloud models.** The file tools still stay inside the project, but `run_shell` may now name a path outside it when you ask; a model no longer refuses that. The local model keeps the strict rule its bench scores best with.
 - **A crash found by the fuzzer.** A tool call cut short after an escaped backslash could make the context slimmer read and write past its buffer.
