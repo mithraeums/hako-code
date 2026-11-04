@@ -116,11 +116,12 @@ if [ "$VERIFY" = "1" ]; then
 				want="$(awk '{print $1}' "../${sha_name}")"; \
 				got="$(sha256 -q "$bin")"; \
 				[ "$want" = "$got" ] || { echo "sha256 mismatch" >&2; exit 1; }; \
-			else echo "no sha256 tool found, skipping verify" >&2; \
+			else echo "no sha256 tool found (set VERIFY=0 to install unverified)" >&2; exit 1; \
 			fi) || { echo "sha256 verify FAILED" >&2; exit 1; }
 		echo "sha256 ok."
 	else
-		echo "warning: sha sidecar missing — skipping verify (set VERIFY=0 to silence)" >&2
+		echo "sha256 sidecar missing at $sha_url (set VERIFY=0 to install unverified)" >&2
+		exit 1
 	fi
 fi
 

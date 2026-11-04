@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+# no AppleDouble ._ files in the macOS tarballs
+env:
+  COPYFILE_DISABLE: 1
+
 jobs:
   build:
     name: build (${{ matrix.name }})

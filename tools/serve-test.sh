@@ -120,6 +120,7 @@ st=$(curl -s "$U/api/state")
 case $st in *'"commands":[{"n":"help","p":":","c":"app"'*'"n":"compact","p":"/"'*) ok "state carries the command table, : and /";; *) no "no commands in state";; esac
 case $st in *'"theme":"nord"'*) ok "state names the theme";; *) no "state has no theme: $st";; esac
 case $(curl -s "$U/api/state?for=studio") in *'"theme":"washi"'*) ok "?for=studio gets studio.theme";; *) no "studio.theme not resolved";; esac
+grep -q '"type":"init".*"theme":"washi"' "$T/ev" && ok "the page's init event names studio.theme too, not hako's own" || no "init sent hako's theme to the page: $(grep -o '"type":"init".\{0,0\}' "$T/ev" | head -1)$(grep -o '"theme":"[^"]*"' "$T/ev" | head -1)"
 case $st in *'"session_name":""'*'"voice":0'*) ok "session_name and voice are there";; *) no "no session_name/voice";; esac
 slash ':name pumpkin'; sleep 0.6
 grep -q '"type":"state".*"session_name":"pumpkin"' "$T/ev" && ok ":name emits state with the name" || no ":name did not emit state"
@@ -129,6 +130,32 @@ n0=$(grep -c '"role":"system"' "$T/ev")
 curl -s -o /dev/null -X POST --data ':name quiet one' "$U/api/cmd"; sleep 0.6
 case $(curl -s "$U/api/state") in *'"session_name":"quiet one"'*) ok "/api/cmd runs the command";; *) no "/api/cmd did not rename";; esac
 [ "$(grep -c '"role":"system"' "$T/ev")" = "$n0" ] && ! grep -q '"text":":name quiet' "$T/ev" && ok "and says nothing in the chat" || no "/api/cmd echoed into the chat"
+finish
+
+# the chat list: all of a long history, newest first, with pins and the archive kept by hako
+start
+S=$(ls -d "$T"/h/.hako/projects/*/ | head -1)sessions; mkdir -p "$S"
+i=10; while [ $i -lt 80 ]; do
+	printf '{"role":"user","content":"chat %s"}\n' $i >"$S/c$i.jsonl"
+	touch -t 2026010112$(printf %02d $((i - 10))) "$S/c$i.jsonl"; i=$((i+1))
+done
+l=$(curl -s "$U/api/sessions")
+[ "$(printf %s "$l" | grep -o '"id":"c[0-9]*"' | wc -l | tr -d ' ')" = 70 ] && ok "all 70 chats are listed" || no "the list stopped short: $(printf %s "$l" | grep -o '"id":"c' | wc -l)"
+case $l in *'"sessions":[{"id":"c79"'*) ok "newest first";; *) no "not newest first: $(printf %s "$l" | cut -c1-160)";; esac
+post() { curl -s -X POST --data "$2" "$U/api/session/$1"; }
+case $(post mark "$(printf 'c42\npinned')") in *true*) ok "a chat can be pinned";; *) no "pin refused";; esac
+case $(post mark "$(printf 'c43\narchived')") in *true*) ok "and archived";; *) no "archive refused";; esac
+row() { curl -s "$U/api/sessions" | grep -o "{\"id\":\"$1\"[^}]*}"; }
+case $(row c42) in *'"mark":"pinned"'*) ok "the list carries the pin";; *) no "no pin in the list";; esac
+case $(row c43) in *'"mark":"archived"'*) ok "and the archive";; *) no "no archive in the list";; esac
+case $(row c44) in *'"mark"'*) no "an unmarked chat has a mark";; '{"id":"c44"'*) ok "an unmarked chat has none";; *) no "c44 missing";; esac
+case $(post mark "$(printf 'c42\nweird')") in *false*) ok "an unknown mark is refused";; *) no "took an unknown mark";; esac
+case $(post mark "$(printf 'nope\npinned')") in *false*) ok "a chat that does not exist gets no mark";; *) no "marked a missing chat";; esac
+printf 'c42\n' | curl -s -o /dev/null -X POST --data-binary @- "$U/api/session/mark"   # $(...) would drop the newline
+case $(row c42) in *'"mark"'*) no "unpin left the mark";; '{"id":"c42"'*) ok "an empty mark unpins";; *) no "c42 missing";; esac
+post delete c43 >/dev/null
+[ ! -e "$S/c43.mark" ] && ok "delete takes the mark with it" || no "delete left c43.mark"
+case $(curl -s "$U/api/state") in *'"mark"'*) ok "state lists the mark cap";; *) no "no mark cap";; esac
 finish
 rm -f "$T/rc"
 init=$(printf '{"type":"quit"}\n' | HOME="$T/h" "$BIN" --pipe 2>/dev/null | head -1)

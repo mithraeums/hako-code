@@ -297,8 +297,9 @@ uninstall:
 # place to find it. Needs mingw-w64 (brew install mingw-w64); skipped if absent.
 win-check:
 	@if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then \
-		x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra $(SRC) -o $(TMP)/hako-wincheck.exe -lws2_32 -lpthread && \
-		echo "windows: builds"; \
+		x86_64-w64-mingw32-gcc -std=c99 -O0 -Wall -Wextra -Werror -c $(SRC) -o $(TMP)/hako-wincheck.o && \
+		x86_64-w64-mingw32-gcc -std=c99 -O2 -Wall -Wextra -Werror $(SRC) -o $(TMP)/hako-wincheck.exe -lws2_32 -lpthread && \
+		echo "windows: builds, gcc clean at -O0 and -O2 (-Werror)"; \
 	else echo "windows: skipped (no mingw-w64)"; fi
 
 # The terminal UI over a real pty against a fake streaming engine. Catches the

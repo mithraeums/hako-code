@@ -440,6 +440,9 @@ r.wait_for("Done. The directory", 20); settle(r)
 d = " ".join(r.all_lines())
 check("allowed without asking" in d, "a tool let through by an always rule says so", r)
 check(d.count("Allow?") <= 1, "and the second read did not prompt again")
+for _ in range(20):                    # the bar comes back a beat after the turn ends; a busy machine was slower than settle()
+    if any("ask mode" in l and "always read" in l for l in r.lines()): break
+    r.pump(0.1)
 check(any("ask mode" in l and "always read" in l for l in r.lines()), "the bar shows the always rule next to the mode", r)
 r.close()
 logs = []
@@ -612,9 +615,11 @@ print("§3t :remote on shares the terminal session with a device")
 import threading, urllib.request, re as _re
 r = start(auto=True)                   # auto in the rc: ignored while remote is on
 RP = 18931
-r.send(f":remote on {RP}\r"); r.wait_for("?t=", 15)
+r.send(f":remote on {RP}\r"); r.wait_for("remote: on", 15)
+check(not any("?t=" in l for l in r.all_lines()), ":remote on keeps this computer's address out of the way", r)
+r.send(":help remote\r"); r.wait_for("?t=", 15)
 tok = next((m.group(1) for l in r.all_lines() for m in [_re.search(r"\?t=([a-z0-9]+)", l)] if m), "")
-check(len(tok) == 24, ":remote on prints a fresh token", r)
+check(len(tok) == 24, ":help remote gives this computer's address, with a fresh token", r)
 r.pump(0.6)
 check(any("remote" in l and "▶▶" in l for l in r.lines()), "the bar says remote", r)
 U = f"http://127.0.0.1:{RP}"

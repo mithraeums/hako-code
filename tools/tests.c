@@ -1149,6 +1149,12 @@ static void rc_unified_tests(void) {
 	ck(!strcmp(TH_ACTIVE, "solarized"), "code.theme beats theme even when theme comes later");
 	ck(E.mouse_enabled == 1, "code.mouse beats mouse");
 	ck(!strcmp(hkThemeFor(HK_RC_STUDIO), "washi"), "studio.theme is the studio's");
+	put(rc, "mouse=0\n");
+	clLoadRc();
+	ck(!strcmp(hkThemeFor(HK_RC_STUDIO), ""), "no theme in the rc: the studio is told none, so it draws its own default");
+	ck(!strcmp(hkThemeFor(HK_RC_CODE), "terminal"), "and hako itself stays on terminal");
+	put(rc, "# mine\ncode.theme=solarized\ntheme=dracula\nedit.theme=gruvbox\nstudio.theme=washi\nmouse=0\ncode.mouse=1\n");
+	clLoadRc();
 
 	/* one key set in place: the line rewritten, comments and order kept */
 	ck(hkRcSaveTheme(HK_RC_CODE, "nord") == 0, "the picker writes the rc");
@@ -1287,6 +1293,13 @@ static void cmd_and_context_tests(void) {
 	ckstr(c, "\"content\":\"keep me\"", "the reply's own text is never touched");
 	ckstr(d, ">(wrote 1199 bytes)</write_file>", "the raw <write_file> channel too");
 	ck(hkSlimOne("just talking about write_file") == NULL, "nothing to slim, nothing changed");
+	{   /* an escaped string cut after an escaped backslash: the scan stepped over the NUL into
+		   what followed in the buffer, and slimmed it as the body (fuzz, 2026-11-04) */
+		static const char cut[] = "{\"name\":\"edit_file\",\"arguments\":\"{\\\"path\\\":\\\"a\\\",\\\"new\\\":\\\"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\\\\" "\0" "STALE\\\"}\"}";
+		char *r = hkSlimOne(cut);
+		ck(r == NULL, "slim: an escaped string cut short is left alone, nothing past its end is read");
+		free(r);
+	}
 	free(a); free(b); free(c); free(d);
 
 	/* what voice says: no marks, no code */
@@ -1315,6 +1328,26 @@ static void env_probe_tests(void) {
 		size_t n = end ? (size_t)(end - env) : strlen(env);
 		ck(memchr(env, '/', n) == NULL, "the ENVIRONMENT block carries no absolute paths");
 	}
+	/* RULE 2 forbade every absolute path, so a cloud model refused even run_shell outside the
+	   project (iSh, 2026-10-30): for them it binds the file tools; the local model keeps the
+	   strict one, which its bench scores best with */
+	int keep_type = E.ai_provider_type;
+	for (int local = 0; local < 2; local++) {
+		E.ai_provider_type = local ? AI_PROVIDER_MITHRAEUM : AI_PROVIDER_ANTHROPIC;
+		hkPromptInvalidate();
+		free(d.system_prompt); d.system_prompt = NULL;
+		hkLoadSkills(&d);
+		const char *r2 = d.system_prompt ? strstr(d.system_prompt, "RULE 2:") : NULL;
+		const char *r2e = r2 ? strstr(r2, "\n") : NULL;
+		char rule[1024] = "";
+		if (r2 && r2e) snprintf(rule, sizeof rule, "%.*s", (int)(r2e - r2), r2);
+		if (local) ck(strstr(rule, "NEVER use absolute paths") && !strstr(rule, "run_shell") && strstr(d.system_prompt, "\n\nRULE 2:")
+		              && strstr(d.system_prompt, "every call will fail.\n\nExamples"), "RULE 2: the local model keeps the strict rule, as it was");
+		else ck(strstr(rule, "file tools") && strstr(rule, "run_shell") && strstr(rule, "outside it when the user asks")
+		        && !strstr(d.system_prompt, "every call will fail"), "RULE 2: a cloud model's binds the file tools, not run_shell");
+	}
+	E.ai_provider_type = keep_type;
+	hkPromptInvalidate();
 	free(d.system_prompt);
 	pthread_mutex_destroy(&d.lock);
 }
@@ -1825,6 +1858,27 @@ static void qr_tests(void) {
 	                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef."
 	                  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == 53, "qr: a link url is version 9");
 	ck(hkQrEncode(&q, url) == 49, "qr: a pair url is version 8");
+	{   /* the codes hako prints now: base64url, a 16-byte secret, a smaller QR */
+		char u[512], *saved = getenv("HAKO_STUDIO_URL") ? strdup(getenv("HAKO_STUDIO_URL")) : NULL;
+		uint8_t sec[32], key[32], pt[48], back[48], m[88];
+		unsetenv("HAKO_STUDIO_URL");
+		memset(sec, 0xaa, sizeof sec);
+		ck(hrNewSecret(sec) && sec[0] | sec[1] | sec[2] | sec[15] && !(sec[16] | sec[24] | sec[31]), "link code: 16 random bytes, the rest of the slot zero");
+		memset(key, 0xfb, sizeof key);
+		int lk = hrKeyUrl(u, sizeof u, "link", key, 32, sec);
+		ck(lk && strlen(u) == 102 && !strncmp(u, "https://hako.mithraeum.studio/#link=-_v7", 40)
+		   && u[79] == '.' && !strpbrk(u + 36, "+/="), "link code: <pub>.<secret> in base64url, 102 characters");
+		ck(hkQrEncode(&q, u) == 41, "link code: its QR is version 6, was 9");
+		ck(hrKeyUrl(u, sizeof u, "pair", key, 16, sec) && strlen(u) == 81 && u[58] == '.', "pair code: <id>.<secret>, 81 characters");
+		ck(hkQrEncode(&q, u) == 37, "pair code: its QR is version 5, was 8");
+		ck(!hrKeyUrl(u, 90, "link", key, 32, sec), "link code: refused when it doesn't fit");
+		for (int i = 0; i < 48; i++) pt[i] = (uint8_t)i;
+		ck(!hkLinkSeal(m, sec, pt) && !hkLinkOpen(back, sec, m) && !memcmp(back, pt, 48), "link code: the short secret seals and opens K");
+		sec[17] = 1;
+		ck(hkLinkOpen(back, sec, m), "link code: the slot past the secret is part of the key");
+		if (saved) { setenv("HAKO_STUDIO_URL", saved, 1); free(saved); }
+		hkQrEncode(&q, url);                 /* the checks below read the pair url's modules */
+	}
 	if (!G_AI.history) clInitAI(&G_AI);       /* the lines land in the history, as on screen */
 	aiClearHistory(&G_AI);
 	ck(hkQrShow(&G_AI, url), "qr: shows");
@@ -1851,6 +1905,27 @@ static void qr_tests(void) {
 	cl_cols_pinned = q.n + 7;
 	ck(!hkQrShow(&G_AI, url) && G_AI.history_count == 0, "qr: a terminal too narrow for it gets no half code");
 	cl_cols_pinned = 0;
+	{   /* a link longer than the line, indented: it wraps inside the word, not after the indent */
+		cl_cols_pinned = 40;
+		int keep_color = E.color_enabled;
+		E.color_enabled = 0;
+		FILE *cap = tmpfile();
+		int out = dup(STDOUT_FILENO);
+		fflush(stdout);
+		dup2(fileno(cap), STDOUT_FILENO);
+		clPutWrapped2("", "> ", "  ", "  https://hako.example/#link=0123456789abcdef0123456789abcdef0123456789");
+		fflush(stdout);
+		dup2(out, STDOUT_FILENO);
+		close(out);
+		char got[512] = "";
+		rewind(cap);
+		size_t gn = fread(got, 1, sizeof got - 1, cap);
+		got[gn] = '\0';
+		fclose(cap);
+		E.color_enabled = keep_color;
+		cl_cols_pinned = 0;
+		ck(!strncmp(got, ">   https://", 12), "wrap: an indented word too long for the line starts on the first row, no empty row above it");
+	}
 	const char *ssh = getenv("SSH_TTY");
 	char keep[256];
 	snprintf(keep, sizeof keep, "%s", ssh ? ssh : "");

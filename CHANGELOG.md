@@ -5,6 +5,30 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ## [Unreleased]
 
+## [v0.3.1] - 2026-11-04
+
+### added
+- **`:remote`** shows it all in one place: on or off, your account's phones and browsers (which are here now, which are online), and a pick to turn it on or off or show a QR code for a phone
+- `:remote pair`'s code opens this session on the phone that scans it, signing in there if it asks; a browser that already holds your account key goes straight in and leaves the code unused
+- a chat can be pinned or archived: `POST /api/session/mark` (`<id>\n<pinned|archived|>`) keeps it in a `.mark` beside the chat, `/api/sessions` lists it as `mark`, and delete takes it along, so every device on that computer sees the same pins (cap `mark`)
+
+### changed
+- `:remote on` says where the phone finds it and how to end it, in two lines; this computer's own address (`?t=`) moved to `:help remote`
+- linking a computer and `:remote pair` work like a sign-in: the page opens here, or a link to open on another device; the QR code only shows when you ask for it in `:remote`
+- the link and pair codes are shorter (base64url and a 128-bit secret, 102 and 81 characters, were 165 and 133), so the link fits one line from about 110 columns and the QR code is version 6 or 5 (41 or 37 modules, was 53 or 49). the studio still reads the old ones
+
+### fixed
+- slimming an earlier write in the model's context could read past the end of a tool call cut after an escaped backslash, and write past its buffer (found by `make fuzz`); it stops at the end of the text now
+- the prompt told the model never to use an absolute path, so a model refused even a `run_shell` command outside the project (seen on iSh); for a cloud model the rule now binds the file tools, which still refuse anything outside the project, and lets `run_shell` name a path when you ask. the local model keeps the strict rule: hako-sho scored 24/43 with either new wording, 26 with the old
+- an indented line whose first word is longer than the terminal (a link) wrapped after the indent, leaving an empty row above it
+- `/api/sessions` listed whichever 64 chats came off the disk first, and the resume picker whichever 16; both show the newest now, newest first (the studio's list goes to 256)
+- gcc warned `-Wformat-truncation` building the default (`-O0`) binary, seen on iSh: the bar's remote/update marks, the history path fallback, skill menu lines, a session title and two local-model notices now clip on purpose. `make win-check` compiles at `-O0` and `-O2` with `-Werror`, so a gcc warning fails the gate (it only built at `-O2` and never failed on one)
+- `install.sh` installed an unverified binary when a release had no `.sha256` sidecar or no sha256 tool was found; it stops now (`VERIFY=0` still skips the check on purpose)
+- macOS release tarballs could carry AppleDouble `._hako` files; the release workflow sets `COPYFILE_DISABLE`
+- the readme said hako talks to thirteen providers; it is fourteen (Nous Portal), as the badge says
+- `hako --serve` sent the page hako's own theme in its first (init) event and the studio's in state, so whichever came last won; init now sends the studio's too
+- with no theme in the rc, the studio is told none and draws its own default (mithraeum), instead of being told `terminal`
+
 ## [v0.3.0] - 2026-10-29
 
 ### added

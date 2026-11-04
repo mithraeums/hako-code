@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.3.0"
+#define HAKO_VERSION "0.3.1"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -3334,7 +3334,7 @@ static void clBarShowRaw(aiData *data) {
 		         mode_c, mode_s, ANSI_RESET, TH_ACCENT, model, TH_META, hk_queue_n > 0 ? verb : "");
 	if (marks[0]) {
 		char both[256];
-		snprintf(both, sizeof both, "%s%s%s", marks, right[0] ? "  " : "", right);
+		hkCatf(both, 0, sizeof both, "%s%s%s", marks, right[0] ? "  " : "", right);
 		if (clCellWidth(left) + clCellWidth(both) + 2 <= cols - 1) snprintf(right, sizeof right, "%s", both);
 		else snprintf(right, sizeof right, "%s", marks);
 		if (clCellWidth(left) + clCellWidth(right) + 2 > cols - 1) {   /* a phone: the marks win over the model */
@@ -4409,7 +4409,7 @@ static void hkHistoryPath(char *out, size_t n) {
 		return;                                   /* a clipped path falls back to the global one */
 	char fallback[512];
 	hkClawDirPath(fallback, sizeof(fallback));
-	snprintf(out, n, "%s/history.jsonl", fallback);
+	hkFmtFits(out, n, "%s/history.jsonl", fallback);
 }
 
 static void hkSessionLogPath(char *out, size_t n) {
@@ -5303,15 +5303,16 @@ static int hkRelaySignIn(hkRelay *r) {
 	return ok ? 0 : -1;
 }
 
-/* POST a route with this device's token. The reply body, or NULL. */
+/* POST a route with this device's token (GET with no body). The reply body, or NULL. */
 static char *hkRelayCall(hkRelay *r, const char *route, const char *body) {
 	char url[320], auth[96];
 	pid_t pid;
 	snprintf(url, sizeof url, "%s%s", r->url, route);
 	snprintf(auth, sizeof auth, "Authorization: Bearer %s", r->token);
-	char *argv[] = { "curl", "-s", "--max-time", "10", "-X", "POST", "--data-binary", (char *)body,
+	char *post[] = { "curl", "-s", "--max-time", "10", "-X", "POST", "--data-binary", (char *)body,
 	                 "-H", auth, "-H", "Content-Type: text/plain", url, NULL };
-	FILE *fp = hkRelayCurl(argv, 0, &pid);
+	char *get[] = { "curl", "-sf", "--max-time", "10", "-H", auth, url, NULL };
+	FILE *fp = hkRelayCurl(body ? post : get, 0, &pid);
 	if (!fp) return NULL;
 	char *out = hk_slurp(fp, 0);
 	fclose(fp);
@@ -6359,8 +6360,16 @@ static int hkBuildPrompt(aiData *data) {
 		"You are hako-code, a terminal AI agent.\n"
 		"\n"
 		"RULE 1: Call a tool whenever the user wants you to read, list, write, or run something in the project — INCLUDING polite forms like \"can you create…\", \"could you read…\", \"would you make…\", \"please write…\". Those are requests to DO it, not questions. ALSO an action: any mention of a file by name, or asking why something isn't working / to debug / check / look at / find / search it — READ, LIST or SEARCH it first, don't ask the user about it. To FIND something (where a function is defined or called, a string, TODOs) call grep; to list files of a kind (*.c, *.md, the tests) call glob — list_dir only shows one folder's names. Asking you to work on / fix / improve / set up / style / showcase / build out \"the website / site / project / app / code / this\" is ALSO an action: your FIRST move is list_dir(\".\") to see what's there. The words \"here\", \"this folder\", \"this directory\", \"this project\", \"our website\" ALWAYS mean the current directory — call list_dir(\".\"); NEVER ask the user its name, where it is, or to list it for you. Only greetings and GENERAL concept questions with no project file involved (\"what is recursion?\", \"how does a hashmap work?\") get a plain-text reply with no tool call.\n"
-		"\n"
-		"RULE 2: All paths are RELATIVE to the current project. Use \".\" for the project root. NEVER use absolute paths like /home/..., /Users/..., /root/..., /tmp/.... Those paths do NOT exist here and every call will fail.\n"
+		"\n";
+	/* RULE 2 (between BASE_PROMPT and BASE_TAIL). The strict one forbade every absolute
+	   path, so a cloud model refused even run_shell outside the project (iSh, 2026-10-30);
+	   theirs binds the file tools. The local 3B keeps the strict one word for word: any
+	   mention of run_shell there cost it 2-3 bench tasks (26 -> 24/43, 2026-11-04). */
+	static const char *RULE2_LOCAL =
+		"RULE 2: All paths are RELATIVE to the current project. Use \".\" for the project root. NEVER use absolute paths like /home/..., /Users/..., /root/..., /tmp/.... Those paths do NOT exist here and every call will fail.\n";
+	static const char *RULE2_WIDE =
+		"RULE 2: The file tools (read_file, write_file, edit_file, edit_lines, list_dir, grep, glob) take paths RELATIVE to the current project. Use \".\" for the project root. NEVER give them absolute paths like /home/..., /Users/..., /root/..., /tmp/...: they only reach inside the project and refuse anything else. run_shell is different: it runs in the project folder, and a command may name a path outside it when the user asks for one.\n";
+	static const char *BASE_TAIL =
 		"\n"
 		"Examples — call tools:\n"
 		"  user: \"read README.md\"               -> read_file(path=\"README.md\")\n"
@@ -6519,16 +6528,19 @@ static int hkBuildPrompt(aiData *data) {
 		tool_prompt = REACT_PROMPT;
 	char *mcp_tools = (E.ai_provider_type == AI_PROVIDER_MITHRAEUM) ? hkMcpLocalToolsPrompt() : NULL;
 	size_t mlen = mcp_tools ? strlen(mcp_tools) : 0;
-	size_t blen = strlen(BASE_PROMPT);
+	const char *rule2 = E.ai_provider_type == AI_PROVIDER_MITHRAEUM ? RULE2_LOCAL : RULE2_WIDE;
+	size_t blen = strlen(BASE_PROMPT), r2len = strlen(rule2), tlen = strlen(BASE_TAIL);
 	size_t rlen = tool_prompt ? strlen(tool_prompt) : 0;
 	size_t elen = strlen(env_probe);
-	size_t need = rlen + mlen + blen + elen + total + hako_hlen + hako_len + todo_len + mem_len + plan_len + 1;
+	size_t need = rlen + mlen + blen + r2len + tlen + elen + total + hako_hlen + hako_len + todo_len + mem_len + plan_len + 1;
 	char *combined = malloc(need);
 	if (combined) {
 		size_t off = 0;
 		if (rlen > 0) { memcpy(combined + off, tool_prompt, rlen); off += rlen; }
 		if (mlen > 0) { memcpy(combined + off, mcp_tools, mlen); off += mlen; }
 		memcpy(combined + off, BASE_PROMPT, blen); off += blen;
+		memcpy(combined + off, rule2, r2len); off += r2len;
+		memcpy(combined + off, BASE_TAIL, tlen); off += tlen;
 		if (elen > 0) { memcpy(combined + off, env_probe, elen); off += elen; }
 		if (buf && total > 0) { memcpy(combined + off, buf, total); off += total; }
 		if (hako_body) {
@@ -6697,7 +6709,8 @@ static void clPipeEmitInit(void) {
 	char *b = malloc(cap);
 	if (!b) { clPipeEmitRaw("{\"type\":\"init\"}"); return; }
 	memcpy(b, json, cap);
-	hkStateExtras(&b, &len, &cap, HK_RC_CODE, 1);
+	/* a browser draws the studio's theme, as clPipeEmitState says; Rei, the code one */
+	hkStateExtras(&b, &len, &cap, (E.serve_mode || hs_attached) ? HK_RC_STUDIO : HK_RC_CODE, 1);
 	hkSbAdd(&b, &len, &cap, "}", 1);
 	clPipeEmitRaw(b);
 	free(b);
@@ -6943,7 +6956,7 @@ static void clPutWrapped2(const char *color, const char *prefix, const char *con
 	while (*p) {
 		/* Measure forward to the wrap point, remembering the last space. */
 		const unsigned char *scan = p, *lastsp = NULL;
-		int cells = 0;
+		int cells = 0, lead = 1;              /* an indent is not a break: a long link would leave an empty row */
 		while (*scan) {
 			if (*scan == 0x1b && scan[1] == '[') {
 				scan += 2;
@@ -6955,7 +6968,8 @@ static void clPutWrapped2(const char *color, const char *prefix, const char *con
 			int adv = clUtf8Next(scan, &cp);
 			int w = clRuneWidth(cp);
 			if (cells + w > avail) break;
-			if (cp == ' ' || cp == '\t') lastsp = scan;
+			if (cp == ' ' || cp == '\t') { if (!lead) lastsp = scan; }
+			else lead = 0;
 			cells += w;
 			scan += adv;
 		}
@@ -8943,7 +8957,9 @@ static void hsAttachInfo(int *port, const char **token);
 static void hsAttachSetPort(int port);
 static int hrStart(void);
 static int hrLinked(void);
-static void hrPairPrompt(aiData *data);
+static void hrPairPrompt(aiData *data, int qr);
+static void hrLinkQr(void);
+static void hrPanel(aiData *data);
 static const char *hrStudioUrl(void);
 static void hrRenamed(void);
 static volatile int hk_line_wait;
@@ -10459,8 +10475,9 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 				"not invent tools like `str_replace_based_edit_tool`, `text_editor`, "
 				"`create_file`; they are remapped but cost an extra round-trip. Use "
 				"canonical names.\\n\\n"
-				"All paths are relative to the project root. Use \\\".\\\" "
-				"for the project root. Never use absolute paths.\\n\\n";
+				"The file tools take paths relative to the project root. Use \\\".\\\" "
+				"for the project root, never an absolute path. run_shell runs in the "
+				"project folder and may name a path outside it when the user asks.\\n\\n";
 			size_t cl = strlen(cli_lead);
 			size_t sl = sys_esc ? strlen(sys_esc) : 0;
 			oauth_block2 = malloc(cl + sl + 16);
@@ -13172,7 +13189,9 @@ static const char *hkSlimEnd(const char *v, int esc) {      /* past a JSON strin
 			if (*q == '\\') { if (!q[1]) return NULL; q++; continue; }
 			if (*q == '"') return q + 1;
 		} else {                                             /* inside an escaped JSON string (openai arguments) */
-			if (q[0] == '\\' && q[1] == '\\') { q += 2; if (*q == '\\' && q[1]) q++; continue; }
+			/* an escaped backslash last in the text: stop at its NUL, not past it (the loop's q++
+			   would step over the terminator and take whatever follows for the string's end) */
+			if (q[0] == '\\' && q[1] == '\\') { q += 2; if (!*q) return NULL; if (*q == '\\' && q[1]) q++; continue; }
 			if (q[0] == '\\' && q[1] == '"') return q + 2;
 		}
 	}
@@ -13231,7 +13250,9 @@ static char *hkSlimOne(const char *s) {
 		char rec[256];
 		snprintf(rec, sizeof rec, "%s(wrote %zu bytes to %s)%s", besc ? "\\\"" : "\"", bytes, path, besc ? "\\\"" : "\"");
 		size_t rl = strlen(rec);
-		if (o + rl + 1 > cap) { cap = o + rl + strlen(end) + 1; char *nb = realloc(out, cap); if (!nb) { free(out); return NULL; } out = nb; }
+		/* the record can be longer than the body it stands for (a long path), and the copies
+		   after it check nothing: room for it and all of the rest, or they run off the end */
+		if (o + rl + strlen(end) + 1 > cap) { cap = o + rl + strlen(end) + 1; char *nb = realloc(out, cap); if (!nb) { free(out); return NULL; } out = nb; }
 		memcpy(out + o, rec, rl); o += rl;
 		p = end;
 		changed = 1;
@@ -14255,7 +14276,7 @@ static void hkSkillScan(void) {
 			size_t dl = strlen(desc);
 			if (dl && desc[dl - 1] == '.') desc[dl - 1] = '\0';
 			snprintf(hk_skill_names[hk_skill_n], sizeof hk_skill_names[0], "%s", nm);
-			snprintf(hk_skill_descs[hk_skill_n], sizeof hk_skill_descs[0], "%s", desc[0] ? desc : "a skill");
+			hkCatf(hk_skill_descs[hk_skill_n], 0, sizeof hk_skill_descs[0], "%s", desc[0] ? desc : "a skill");
 			clClipToCells(hk_skill_descs[hk_skill_n], 60);
 			hk_skill_n++;
 		}
@@ -14426,7 +14447,14 @@ static const char *hkPickLogin(int api) {
 static void hkRemoteHelp(aiData *data) {
 	aiAddHistory(data, ":remote on shares this session through your account, from any signed-in browser (invite beta)");
 	aiAddHistory(data, ":remote pair adds a browser that signed in without a passkey (an emailed code): scan the code it shows");
-	aiAddHistory(data, ":remote off ends it; the bar says remote while it is on");
+	aiAddHistory(data, ":remote off ends it; the bar says remote while it is on, and :remote lists the devices");
+#if HK_ATTACH
+	if (hs_attached) {
+		int port; const char *t;
+		hsAttachInfo(&port, &t);
+		aiSayfSecret(data, "a browser on this computer: http://127.0.0.1:%d/?t=%s", port, t);
+	}
+#endif
 	char tok[25];
 	if (hkRandomToken(tok, 24, "abcdefghijklmnopqrstuvwxyz0123456789"))
 		aiSayfSecret(data, "headless on the same wifi: hako --serve --lan --token %s, and open the printed address with ?t=%s", tok, tok);
@@ -15307,11 +15335,12 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			hsAttachInfo(&port, &tok);
 			hkLogMessage("system", "remote on");
 			int linked = hrStart() && hrLinked();
-			/* two lines, not five: where to open it, and the one rule that matters */
-			if (linked) aiSayf(data, "remote: on \xC2\xB7 phone %s (signed in)", hrStudioUrl());
-			else aiAddHistory(data, "remote: on");
-			aiSayfSecret(data, "  this computer http://127.0.0.1:%d/?t=%s", port, tok);
-			aiAddHistory(data, "  every tool asks there \xC2\xB7 :remote off ends it \xC2\xB7 :help remote");
+			/* linked: where the phone finds it, and how to end it. not yet: the link
+			   code (hrLinkPrompt) follows. this computer's own address: :help remote */
+			if (linked) {
+				aiSayf(data, "remote: on \xC2\xB7 on your phone, %s, under code", hrStudioUrl() + (strncmp(hrStudioUrl(), "https://", 8) ? 0 : 8));
+				aiAddHistory(data, "  :remote for devices and a code \xC2\xB7 :remote off ends it");
+			} else aiAddHistory(data, "remote: on \xC2\xB7 :remote off ends it \xC2\xB7 :help remote");
 			return 1;
 		}
 		if (!strcmp(ra, "pair")) {
@@ -15319,12 +15348,13 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 				aiAddHistory(data, ":remote pair shows a code in this terminal; run it in one");
 			else if (!hs_attached || !hrLinked())
 				aiAddHistory(data, "remote: run :remote on first, so this computer is linked to your account");
-			else hrPairPrompt(data);
+			else hrPairPrompt(data, 0);
 			return 1;
 		}
+		if (!*ra) { hrPanel(data); return 1; }
 #endif
 		aiAddHistory(data, ":remote on    share this session with your signed-in phone (invite beta)");
-		aiAddHistory(data, ":remote pair  add a browser that signed in by email");
+		aiAddHistory(data, ":remote pair  a code that opens this session on another device");
 		aiAddHistory(data, ":help remote  same wifi without an account, and what a phone may do");
 		return 1;
 #endif
@@ -15925,11 +15955,12 @@ static void clRcApplyAll(int layer_min) {
 	clThemeApply(th && *th ? th : "terminal");
 }
 
-/* The theme a front end should draw with: studio asks for its own. */
+/* The theme a front end should draw with: studio asks for its own. With none in
+   the rc it gets "", and draws its own default (mithraeum, paper and night). */
 static const char *hkThemeFor(int tool) {
 	if (tool == HK_RC_CODE) return TH_ACTIVE;
 	const char *th = hkRcGet(tool, "theme");
-	return th && *th ? th : "terminal";
+	return th ? th : "";
 }
 
 static void clLoadRc(void) {
@@ -18906,6 +18937,13 @@ typedef struct {
 	char name[64];      /* from the chat's last meta row, or "" */
 } clSessionInfo;
 
+static int clSessionNewer(const void *a, const void *b) {
+	long x = ((const clSessionInfo *)a)->last, y = ((const clSessionInfo *)b)->last;
+	return (x < y) - (x > y);
+}
+
+/* The newest `max` chats of this folder, newest first: a long history still
+   lists its latest, not whichever files readdir happened to give first. */
 static int clEnumerateSessions(clSessionInfo *out, int max) {
 	char pdir[PATH_MAX];
 	if (!hkProjectStateDir(pdir, sizeof(pdir))) return 0;
@@ -18915,7 +18953,7 @@ static int clEnumerateSessions(clSessionInfo *out, int max) {
 	if (!d) return 0;
 	int n = 0;
 	struct dirent *e;
-	while ((e = readdir(d)) && n < max) {
+	while (max > 0 && (e = readdir(d))) {
 		if (e->d_name[0] == '.') continue;
 		const char *dot = strstr(e->d_name, ".jsonl");
 		if (!dot) continue;
@@ -18925,7 +18963,13 @@ static int clEnumerateSessions(clSessionInfo *out, int max) {
 		if (snprintf(path, sizeof(path), "%s/%s", sdir, e->d_name) >= (int)sizeof(path)) continue;
 		struct stat st;
 		if (stat(path, &st) != 0) continue;
-		int idx = n++;
+		int idx = n;
+		if (n < max) n++;
+		else {
+			idx = 0;
+			for (int k = 1; k < n; k++) if (out[k].last < out[idx].last) idx = k;
+			if ((long)st.st_mtime <= out[idx].last) continue;
+		}
 		memcpy(out[idx].id, e->d_name, idlen); out[idx].id[idlen] = '\0';
 		out[idx].last = (long)st.st_mtime;
 		out[idx].count = 0;
@@ -18962,6 +19006,7 @@ static int clEnumerateSessions(clSessionInfo *out, int max) {
 		fclose(fp);
 	}
 	closedir(d);
+	qsort(out, (size_t)n, sizeof(*out), clSessionNewer);
 	return n;
 }
 
@@ -19992,24 +20037,40 @@ static int hsSessionPath(const char *sid, const char *ext, char *out, size_t cap
 	return 1;
 }
 
-static void hsSessionTitle(const char *sid, const char *fallback, char *out, size_t cap) {
+/* A chat's sidecars hold one line: .title its name, .mark "pinned" or "archived". */
+static void hsSessionLine(const char *sid, const char *ext, const char *fallback, char *out, size_t cap) {
 	snprintf(out, cap, "%s", fallback ? fallback : "");
 	char path[PATH_MAX + 64];
-	if (!hsSessionPath(sid, ".title", path, sizeof(path))) return;
+	if (!hsSessionPath(sid, ext, path, sizeof(path))) return;
 	FILE *f = fopen(path, "r");
 	if (!f) return;
 	char line[256];
 	if (fgets(line, sizeof(line), f)) {
 		size_t l = strlen(line);
 		while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
-		if (l) snprintf(out, cap, "%s", line);
+		if (l) hkCatf(out, 0, cap, "%s", line);
 	}
 	fclose(f);
 }
 
+/* "" removes the sidecar. Control bytes become spaces, so it stays one line. */
+static int hsSessionSetLine(const char *sid, const char *ext, const char *text) {
+	char path[PATH_MAX + 64];
+	if (!hsSessionPath(sid, ext, path, sizeof(path))) return 0;
+	if (!text || !*text) { hk_fs_remove(path); return 1; }
+	FILE *f = fopen(path, "w");
+	if (!f) return 0;
+	for (int i = 0; text[i] && i < 200; i++)
+		fputc((unsigned char)text[i] < 0x20 ? ' ' : text[i], f);
+	fputc('\n', f);
+	fclose(f);
+	return 1;
+}
+
 static void hsServeSessions(int fd) {
-	clSessionInfo info[64];
-	int n = clEnumerateSessions(info, 64);
+	enum { HS_SESSIONS_MAX = 256 };   /* "view all" in the studio lists them all */
+	clSessionInfo *info = calloc(HS_SESSIONS_MAX, sizeof(*info));
+	int n = info ? clEnumerateSessions(info, HS_SESSIONS_MAX) : 0;
 
 	hsBuf b = {0};
 	char cwd[PATH_MAX];
@@ -20022,16 +20083,21 @@ static void hsServeSessions(int fd) {
 	for (int i = 0; i < n; i++) {
 		char title[200];
 		if (info[i].name[0]) snprintf(title, sizeof title, "%s", info[i].name);   /* :name wins */
-		else hsSessionTitle(info[i].id, info[i].first, title, sizeof(title));
+		else hsSessionLine(info[i].id, ".title", info[i].first, title, sizeof(title));
+		char mark[16];
+		hsSessionLine(info[i].id, ".mark", "", mark, sizeof(mark));
 		hsPut(&b, i ? ",{\"id\":\"" : "{\"id\":\"");
 		hsPutEsc(&b, info[i].id);
 		hsPut(&b, "\",\"title\":\"");
 		hsPutEsc(&b, title);
-		hsPutFmt(&b, "\",\"mtime\":%ld,\"turns\":%d}", info[i].last, info[i].count);
+		hsPutFmt(&b, "\",\"mtime\":%ld,\"turns\":%d", info[i].last, info[i].count);
+		if (!strcmp(mark, "pinned") || !strcmp(mark, "archived")) hsPutFmt(&b, ",\"mark\":\"%s\"", mark);
+		hsPut(&b, "}");
 	}
 	hsPut(&b, "]}");
 	hsSendJson(fd, b.buf ? b.buf : "{\"sessions\":[]}");
 	free(b.buf);
+	free(info);
 }
 
 static void hsServeHistory(int fd, const char *sid) {
@@ -20375,7 +20441,7 @@ static void hsServeState(int fd, const char *req) {
 	hsPut(&b, "\",\"caps\":[");
 	static const char *caps[] = {
 		"prompt", "slash", "approve", "input", "stop", "events", "sessions", "history",
-		"dirs", "files", "upload", "models", "providers", "places", "find", "link", "open", "rename", "delete",
+		"dirs", "files", "upload", "models", "providers", "places", "find", "link", "open", "rename", "delete", "mark",
 		"mkdir", "shell", "image", "cmd", NULL
 	};
 	for (int i = 0, n = 0; caps[i]; i++) {
@@ -20906,30 +20972,27 @@ static void *hsConnThread(void *arg) {
 		int ok = 0;
 		if (sid && hsSessionPath(sid, ".title", path, sizeof(path))) {
 			hk_fs_remove(path);
+			if (hsSessionPath(sid, ".mark", path, sizeof(path))) hk_fs_remove(path);
 			if (hsSessionPath(sid, ".jsonl", path, sizeof(path))) ok = (hk_fs_remove(path) == 0);
 		}
 		free(sid);
 		hsSendOk(fd, ok);
-	} else if (!strncmp(req, "POST /api/session/rename", 24)) {
+	} else if (!strncmp(req, "POST /api/session/rename", 24) || !strncmp(req, "POST /api/session/mark", 22)) {
+		/* "<id>\n<title>" or "<id>\n<pinned|archived|>": kept by hako, so every
+		   device that reaches this computer sees the same names, pins and archive */
+		int is_mark = !strncmp(req, "POST /api/session/mark", 22);
 		char *body = hsReadBody(fd, req, used);
-		char path[PATH_MAX + 64];
 		int ok = 0;
 		char *nl = body ? strchr(body, '\n') : NULL;
 		if (nl) {
 			*nl = '\0';
-			if (hsSessionPath(body, ".title", path, sizeof(path))) {
-				const char *title = nl + 1;
-				if (!*title) { hk_fs_remove(path); ok = 1; }
-				else {
-					FILE *f = fopen(path, "w");
-					if (f) {
-						for (int i = 0; title[i] && i < 200; i++)
-							fputc((unsigned char)title[i] < 0x20 ? ' ' : title[i], f);
-						fputc('\n', f);
-						fclose(f);
-						ok = 1;
-					}
-				}
+			const char *v = nl + 1;
+			if (!is_mark) ok = hsSessionSetLine(body, ".title", v);
+			else if (!*v || !strcmp(v, "pinned") || !strcmp(v, "archived")) {
+				char path[PATH_MAX + 64];   /* only a chat that exists gets a mark */
+				struct stat st;
+				ok = hsSessionPath(body, ".jsonl", path, sizeof(path)) && stat(path, &st) == 0
+				     && hsSessionSetLine(body, ".mark", v);
 			}
 		}
 		free(body);
@@ -21143,6 +21206,16 @@ typedef struct {
 	hkNoiseCipher tx, rx;
 	hrStream st[HR_STREAMS];
 } hrPeer;
+
+/* base64url, unpadded (RFC 4648 §5): for the relay's names and the link codes */
+static char *hkB64url(const unsigned char *in, size_t inlen) {
+	char *b = clB64Encode(in, inlen);
+	if (!b) return NULL;
+	size_t o = 0;
+	for (char *c = b; *c && *c != '='; c++) b[o++] = *c == '+' ? '-' : *c == '/' ? '_' : *c;
+	b[o] = '\0';
+	return b;
+}
 
 static hkRelay hr, hrm;            /* this folder's session; the computer itself */
 static hkRelay *volatile hr_cur;    /* whichever is reading, for hrStop */
@@ -21429,11 +21502,8 @@ static void hrPostName(void) {
 	hkNameKey(key, hr_k);
 	crypto_aead_lock(blob + 40, blob + 24, key, blob, NULL, 0, (const uint8_t *)text, (size_t)n);
 	crypto_wipe(key, sizeof key);
-	char *b = clB64Encode(blob, 40 + (size_t)n);
+	char *b = hkB64url(blob, 40 + (size_t)n);
 	if (!b) return;
-	size_t o = 0;
-	for (char *c = b; *c && *c != '='; c++) b[o++] = *c == '+' ? '-' : *c == '/' ? '_' : *c;
-	b[o] = '\0';
 	free(hkRelayCall(&hr, "/v1/name", b));
 	free(b);
 }
@@ -21470,46 +21540,159 @@ static void hrOnPair(const char from[33]) {
 	hkLogMessage("system", "remote: a browser was paired");
 }
 
-/* :remote pair: a QR code of <studio>/#pair=<this folder's device id>.<secret>
-   for a browser that signed in without a passkey that unlocks K (email, SSO,
-   no prf). It signs in, asks this session, and gets K back sealed. */
-static void hrPairPrompt(aiData *data) {
-	char id[33], sec[65], url[512];
+/* A link code: <studio>/#<kind>=<key>.<secret>, both base64url. The secret is
+   HR_SECRET random bytes (128 bits) at the front of a 32-byte key slot, the
+   rest zero, so the seal is the same one older hex links used; the short form
+   keeps the link to one line and its QR code small. 0 if it doesn't fit. */
+#define HR_SECRET 16
+static int hrKeyUrl(char *url, size_t cap, const char *kind, const uint8_t *key, size_t kn, const uint8_t *secret) {
+	char *a = hkB64url(key, kn), *b = hkB64url(secret, HR_SECRET);
+	int fit = a && b && hkFmtFits(url, cap, "%s/#%s=%s.%s", hrStudioUrl(), kind, a, b);
+	if (b) { crypto_wipe(b, strlen(b)); free(b); }
+	free(a);
+	return fit;
+}
+
+/* A fresh one-time secret in a 32-byte slot (see hrKeyUrl). */
+static int hrNewSecret(uint8_t s[32]) {
+	memset(s, 0, 32);
+	return hkRandomBytes(s, HR_SECRET);
+}
+
+/* :remote pair: a link (or, asked, a QR code) of <studio>/#pair=<this folder's
+   device id>.<secret> for a browser that signed in without a passkey that
+   unlocks K (email, SSO, no prf). It signs in, asks this session, and gets K
+   back sealed. */
+static void hrPairPrompt(aiData *data, int qr) {
+	char url[512];
+	uint8_t id[16], sec[32];
 	pthread_mutex_lock(&hr_lock);
-	int up = hr.id[0] && hr.acct[0] && hkRandomBytes(hr_pair, 32);
+	int up = hr.id[0] && hr.acct[0] && !hkHexDec(id, hr.id, 16) && hrNewSecret(hr_pair);
 	if (up) {
 		hr_pair_until = time(NULL) + 600;
-		snprintf(id, sizeof id, "%s", hr.id);
-		hkHexEnc(sec, hr_pair, 32);
+		memcpy(sec, hr_pair, 32);
 	}
 	pthread_mutex_unlock(&hr_lock);
 	if (!up) { aiAddHistory(data, "remote: not connected to your account yet, try again in a moment"); return; }
-	int fit = hkFmtFits(url, sizeof url, "%s/#pair=%s.%s", hrStudioUrl(), id, sec);
+	int fit = hrKeyUrl(url, sizeof url, "pair", id, 16, sec);
 	crypto_wipe(sec, sizeof sec);
-	aiAddHistory(data, "remote: scan this on the device to add, then sign in there (one use, 10 minutes):");
-	if (!fit || !hkQrShow(data, url)) aiAddHistory(data, "  (no room for the code here: widen this terminal, or open the link on that device)");
+	/* a link, the way a sign-in prints one; the QR only when asked for (:remote) */
+	aiAddHistory(data, qr ? "remote: scan this on your phone to open this session there (one use, 10 minutes):"
+	                      : "remote: open this on your phone to open this session there, signing in if it asks (one use, 10 minutes):");
+	if (qr && (!fit || !hkQrShow(data, url))) aiAddHistory(data, "  (no room for the code here: widen this terminal, or open the link on that device)");
 	if (fit) aiSayfSecret(data, "  %s", url);
+	if (fit && !qr) aiAddHistory(data, "  :remote shows it as a QR code");
 	crypto_wipe(url, sizeof url);
+}
+
+/* The account's browsers, from the names each sealed under K ("browser:iPhone ·
+   Safari"); code sessions are left out, they are folders, not devices. here: 2
+   on this session now, 1 online, 0 not. The count, or -1 if the relay can't say. */
+typedef struct { char name[64]; int here; } hrDev;
+static int hrDevices(hrDev *out, int max) {
+	if (!hr_on || !hr_has_k || !hr.token[0]) return -1;
+	char *t = hkRelayCall(&hr, "/v1/devices", NULL);
+	if (!t || !*t) { free(t); return -1; }     /* -f: an error reply is empty, and a real list has this folder in it */
+	uint8_t key[32];
+	hkNameKey(key, hr_k);
+	int n = 0;
+	for (char *l = t; l && *l && n < max; ) {
+		char *nl = strchr(l, '\n');
+		if (nl) *nl = '\0';
+		char id[33], pub[65], on[4], sealed[400];
+		if (sscanf(l, "%32s %64s %3s %399s", id, pub, on, sealed) == 4 && strcmp(sealed, "-")) {
+			for (char *c = sealed; *c; c++) *c = *c == '-' ? '+' : *c == '_' ? '/' : *c;
+			size_t bl = 0;
+			uint8_t *b = clB64Decode(sealed, &bl);
+			char nm[200];
+			if (b && bl > 40 && bl - 40 < sizeof nm
+			    && !crypto_aead_unlock((uint8_t *)nm, b + 24, key, b, NULL, 0, b + 40, bl - 40)) {
+				nm[bl - 40] = '\0';
+				if (!strncmp(nm, "browser:", 8)) {
+					int here = on[0] == '1';
+					pthread_mutex_lock(&hr_lock);
+					for (int i = 0; i < HR_PEERS; i++)
+						if (hr_peers[i].used && hr_peers[i].ready && !strcmp(hr_peers[i].id, id)) here = 2;
+					pthread_mutex_unlock(&hr_lock);
+					for (char *c = nm; *c; c++) if ((unsigned char)*c < 0x20) *c = ' ';
+					snprintf(out[n].name, sizeof out[n].name, "%.63s", nm + 8);
+					out[n++].here = here;
+				}
+			}
+			free(b);
+		}
+		l = nl ? nl + 1 : NULL;
+	}
+	crypto_wipe(key, sizeof key);
+	free(t);
+	for (int i = 1; i < n; i++)                      /* here now, then online, then the rest */
+		for (int j = i; j > 0 && out[j].here > out[j - 1].here; j--) { hrDev x = out[j]; out[j] = out[j - 1]; out[j - 1] = x; }
+	return n;
+}
+
+/* :remote, the whole of it in one place: on or off, the account's devices, and
+   a pick to turn it on or off or show the one code that opens this session on
+   another device. */
+static void hrPanel(aiData *data) {
+	int on = hs_attached, linked = on && hrLinked();
+	if (!on) aiAddHistory(data, "remote: off \xC2\xB7 on shares this session with your phone, through your account");
+	else if (!linked) aiAddHistory(data, "remote: on \xC2\xB7 not linked to your account yet: sign in on the link from :remote on");
+	else {
+		const char *u = hrStudioUrl();
+		aiSayf(data, "remote: on \xC2\xB7 on your phone, %s, under code", u + (strncmp(u, "https://", 8) ? 0 : 8));
+		hrDev d[16];
+		int n = hrDevices(d, 16);
+		if (n < 0) aiAddHistory(data, "  can't reach your account right now");
+		else if (!n) aiAddHistory(data, "  no phone or browser on your account yet: add a device");
+		int w = 0;
+		for (int i = 0; i < n; i++) if (clCellWidth(d[i].name) > w) w = clCellWidth(d[i].name);
+		for (int i = 0; i < n; i++)
+			aiSayf(data, "  %s%*s%s", d[i].name, d[i].here ? w - clCellWidth(d[i].name) + 3 : 0, "",
+			       d[i].here == 2 ? "here now" : d[i].here ? "online" : "");
+	}
+	if (E.pipe_mode || E.serve_mode || !isatty(STDIN_FILENO)) {
+		aiAddHistory(data, on ? "  :remote pair a code for another device \xC2\xB7 :remote off ends it" : "  :remote on to share \xC2\xB7 :help remote");
+		return;
+	}
+	const char *items[3];
+	int k = 0, act[3];
+	items[k] = on ? "turn off" : "turn on"; act[k++] = 0;
+	if (on && (linked || hr_linking)) { items[k] = "show a QR code for a phone"; act[k++] = 1; }
+	items[k] = "done"; act[k++] = 2;
+	int pick = clPopupSelect("remote", items, k, k == 3 ? 1 : 0, NULL);
+	if (pick < 0 || act[pick] == 2) return;
+	if (act[pick] == 1) { if (linked) hrPairPrompt(data, 1); else hrLinkQr(); return; }
+	hkHandleSlashCmd(data, on ? ":remote off" : ":remote on");
 }
 
 /* Shows the link page once per :remote on, while not linked: as a QR code for
    a phone signed in to hako (no browser needed here), and opened here when
    this computer has a screen. */
 static void hrLinkPrompt(void) {
-	char pub[65], sec[65], url[512];
+	char url[512];
 	if (hr_linking) return;
-	if (!hkRandomBytes(hr_secret, 32)) return;
-	hkHexEnc(pub, hrm.s_pub, 32);
-	hkHexEnc(sec, hr_secret, 32);
-	if (!hkFmtFits(url, sizeof url, "%s/#link=%s.%s", hrStudioUrl(), pub, sec)) return;
+	if (!hrNewSecret(hr_secret)) return;
+	if (!hrKeyUrl(url, sizeof url, "link", hrm.s_pub, 32, hr_secret)) return;
 	hr_linking = 1;
+	/* like a sign-in: the page opens here, or a link to open on any device; a QR
+	   only when asked for (:remote) */
 	int here = !getenv("HAKO_NO_BROWSER") && hkHasDesktop();
-	aiAddHistory(&G_AI, here ? "remote: link this computer to your account (once): sign in on the page that opened, or scan this with a phone signed in to hako"
-	                         : "remote: link this computer to your account (once): scan this with a phone signed in to hako, or open the link");
-	if (!hkQrShow(&G_AI, url)) aiAddHistory(&G_AI, "  (no room for the code here: widen this terminal)");
+	aiAddHistory(&G_AI, here ? "remote: link this computer to your account (once): sign in on the page that opened"
+	                         : "remote: link this computer to your account (once): open this on a device and sign in");
 	aiSayfSecret(&G_AI, "  %s", url);
+	if (!here) aiAddHistory(&G_AI, "  :remote shows it as a QR code");
 	if (here) clOpenUrl(url);
-	crypto_wipe(sec, sizeof sec);
+	crypto_wipe(url, sizeof url);
+}
+
+/* :remote's QR pick before the link is done: the same link page, drawn. */
+static void hrLinkQr(void) {
+	char url[512];
+	if (!hr_linking) return;
+	if (hrKeyUrl(url, sizeof url, "link", hrm.s_pub, 32, hr_secret)) {
+		aiAddHistory(&G_AI, "remote: scan this with a phone signed in to hako to link this computer:");
+		if (!hkQrShow(&G_AI, url)) aiAddHistory(&G_AI, "  (no room for the code here: widen this terminal)");
+	}
 	crypto_wipe(url, sizeof url);
 }
 
@@ -21746,7 +21929,7 @@ static int clDetectKoiDefault(void) {
 			if (isatty(STDOUT_FILENO)) {
 				const char *M = E.color_enabled ? TH_META   : "";
 				{ char nb[160];
-				  snprintf(nb, sizeof(nb), "%s detected locally, running via the hakm subprocess (no ollama).", lpick);
+				  snprintf(nb, sizeof(nb), "%.80s detected locally, running via the hakm subprocess (no ollama).", lpick);
 				  clPutWrapped2(M, "  ", "  ", nb); }
 			}
 			return 1;
@@ -21785,7 +21968,7 @@ static int clDetectKoiDefault(void) {
 	if (isatty(STDOUT_FILENO)) {
 		const char *M = E.color_enabled ? TH_META   : "";
 		{ char nb[160];
-	  snprintf(nb, sizeof(nb), "%s detected, defaulted to local hako via mithraeum provider.", pick);
+	  snprintf(nb, sizeof(nb), "%.80s detected, defaulted to local hako via mithraeum provider.", pick);
 	  clPutWrapped2(M, "  ", "  ", nb); }
 	}
 	return 1;
