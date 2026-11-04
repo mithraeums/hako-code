@@ -8,11 +8,11 @@
 </p>
 
 <p align="center">
-  <em>A coding agent in one C file. ~650 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
+  <em>A coding agent in one C file. ~800 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.0-e2402e?style=flat-square&labelColor=14130f" alt="v0.3.0"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.1-e2402e?style=flat-square&labelColor=14130f" alt="v0.3.1"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -70,14 +70,14 @@ hako is the same idea built the other way. One C file. It compiles with
 gcc hako.c -o hako -lpthread
 ```
 
-and the result is a **~650 KB binary (the browser UI inside) that links libc and nothing else**. It talks to thirteen
+and the result is a **~800 KB binary (the browser UI inside) that links libc and nothing else**. It talks to fourteen
 cloud providers when you want them, and to a 3B model on your own disk when you do not.
 It runs on a laptop, on a FreeBSD box, on Windows, and in a 32-bit Linux emulator on an
 iPhone — the same source, the same behaviour.
 
 |                        | hako                                   | agents that ship a runtime          |
 |------------------------|----------------------------------------|-------------------------------------|
-| install                | one binary, ~650 KB                    | interpreter + package tree          |
+| install                | one binary, ~800 KB                    | interpreter + package tree          |
 | runtime deps           | libc, pthread, `curl(1)`               | Python and/or Node, plus packages   |
 | build from source      | `gcc hako.c -o hako -lpthread`         | a package manager and a lockfile    |
 | works with no network  | yes, on local weights                  | usually only as a client            |
@@ -110,7 +110,6 @@ being small enough to live anywhere is the whole point.
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
 - **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
-- **Drive it from your phone.** `:remote on` shares the session you are in. Sign in at hako.mithraeum.studio on any device and ☰ → code lists your sessions, one per folder; open one and you are in the same chat as the terminal, end to end encrypted (Noise XXpsk3) through a relay that only routes ciphertext and keeps no chats. Tools still ask, and the phone gets less than the desk: no `:auto`, no `:trust`, nothing outside the folder. Invite beta: the first `:remote on` links this computer to your account. Signed in on a device by email instead of a passkey? `:remote pair` shows a code; scan it there and that device holds your account key.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
 - **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON — *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
 - **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
@@ -365,15 +364,13 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.3.0
-- **One rc for the whole suite.** The first of `$HAKORC`, `~/.hakorc` and `~/.config/hako/hakorc`, with the project's own `.hakorc` on top once the folder is trusted. `code.`, `edit.` and `studio.` keys belong to one tool; custom themes live there too.
-- **A command menu.** Type `:` or `/` and a list opens under the line. `:` runs hako, `/` drives the model, and every installed skill is `/<skill>`. hake's Rei pane and the studio draw the same menu.
-- **Your terminal's colors by default.** `terminal` is the default theme, and a theme you pick is written to the rc, so every tool sees it.
-- **`:voice`** reads each reply aloud with the computer's own voice; under `:remote` the phone speaks instead.
-- **The bar says more.** `update <version>` when a newer release is out (`:update` says how), and `remote` while the session is shared.
-- **A leaner model context.** A file written in an earlier turn goes to the model as one line, not the whole file on every request.
-- **A safer remote.** A phone can no longer set `:editor` and run it on the computer.
-- Ships with **hako studio v0.1.0** (a new menu, a landing for an empty chat, replies in markdown, read aloud).
+### Latest — v0.3.1
+- **Pinned and archived chats.** hako keeps them beside each chat (`POST /api/session/mark`), so every browser on that computer sees the same list; the chat list and the resume picker show the newest first.
+- **Paths for cloud models.** The file tools still stay inside the project, but `run_shell` may now name a path outside it when you ask; a model no longer refuses that. The local model keeps the strict rule its bench scores best with.
+- **A crash found by the fuzzer.** A tool call cut short after an escaped backslash could make the context slimmer read and write past its buffer.
+- **A strict installer.** `install.sh` stops when a release has no `.sha256`, and macOS tarballs carry no `._` files.
+- **Clean gcc builds.** No `-Wformat-truncation` warnings at `-O0` (seen on iSh); the Windows gate fails on any warning.
+- Ships with **hako studio v0.1.1** (pinned chats, view all, a user menu, the mithraeum theme by default).
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 
