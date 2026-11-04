@@ -134,7 +134,7 @@ finish
 
 # the chat list: all of a long history, newest first, with pins and the archive kept by hako
 start
-S=$(ls -d "$T"/h/.hako/projects/*/ | head -1)sessions; mkdir -p "$S"
+S=$(ls -d "$T"/h/.hako/projects/*-p/ | head -1)sessions; mkdir -p "$S"   # the --dir folder's project, not the one hako was started from (that one sorts first on CI)
 i=10; while [ $i -lt 80 ]; do
 	printf '{"role":"user","content":"chat %s"}\n' $i >"$S/c$i.jsonl"
 	n=$((i - 10)); touch -t 20260101$(printf %02d%02d $((12 + n / 60)) $((n % 60))) "$S/c$i.jsonl"; i=$((i+1))   # a real minute: GNU touch refuses 12:65
