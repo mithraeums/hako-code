@@ -137,7 +137,7 @@ start
 S=$(ls -d "$T"/h/.hako/projects/*/ | head -1)sessions; mkdir -p "$S"
 i=10; while [ $i -lt 80 ]; do
 	printf '{"role":"user","content":"chat %s"}\n' $i >"$S/c$i.jsonl"
-	touch -t 2026010112$(printf %02d $((i - 10))) "$S/c$i.jsonl"; i=$((i+1))
+	n=$((i - 10)); touch -t 20260101$(printf %02d%02d $((12 + n / 60)) $((n % 60))) "$S/c$i.jsonl"; i=$((i+1))   # a real minute: GNU touch refuses 12:65
 done
 l=$(curl -s "$U/api/sessions")
 [ "$(printf %s "$l" | grep -o '"id":"c[0-9]*"' | wc -l | tr -d ' ')" = 70 ] && ok "all 70 chats are listed" || no "the list stopped short: $(printf %s "$l" | grep -o '"id":"c' | wc -l)"
