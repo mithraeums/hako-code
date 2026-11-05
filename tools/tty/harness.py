@@ -25,6 +25,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HAKO = os.environ.get("HAKO_BIN") or os.path.join(HERE, "..", "..", "hako")
 WORK = tempfile.mkdtemp(prefix="hako-tty-")
 os.environ["HAKO_UPDATE_CHECK"] = "0"   # no GitHub calls from a test run (§update writes its own cache)
+os.environ.setdefault("HAKO_RELAY_URL", "http://127.0.0.1:9")   # nor the live relay: :remote off waited out its calls
 HOME, PROJ, FAKE_LOG = (os.path.join(WORK, d) for d in ("home", "proj", "fake.log"))
 COLS, ROWS = int(os.environ.get("COLS", 100)), int(os.environ.get("ROWS", 40))
 ok = True
@@ -662,10 +663,15 @@ check("true" in http("/api/approve", "y"), "the device answers it")
 r.pump(1.5); settle(r)
 check(any('"type":"tool_end"' in e for e in ev), "the terminal popup closed and the tool ran", r)
 n0 = sum("only the desktop terminal" in e for e in ev)
+_nd = lambda: sum('"type":"done"' in e for e in ev)
+d0 = _nd()
 http("/api/slash", ":auto on"); r.pump(0.6)
 check(sum("only the desktop terminal" in e for e in ev) > n0, "a device cannot turn on auto")
+check(_nd() > d0, "11-05: and the refusal ends with a done, so the device stops saying thinking")
+d0 = _nd()
 http("/api/slash", ":model"); r.pump(0.6)
 check(any("menus open at the desktop" in e for e in ev), "a device's bare menu is refused, not opened on the desktop")
+check(_nd() > d0, "11-05: that refusal ends with a done too")
 check(not any("Model" in l and "esc" in l for l in r.lines()), "and no picker opened in the terminal", r)
 r.send("TOOL desk\r"); r.wait_for("llow", 10); r.send("\r"); r.pump(1.2); settle(r)
 check(any('"type":"tool_decision"' in e and '"answer":"y"' in e for e in ev), "a terminal answer settles the device's box")
@@ -685,6 +691,50 @@ r.send(":remote off\r"); r.wait_for("remote: off", 10); r.pump(0.5)
 check(http("/api/state").startswith("ERR"), ":remote off closes the port")
 check(not any("remote" in l and "▶▶" in l for l in r.lines()), "and the bar drops it", r)
 r.close()
+
+print("§3u :remote on when another hako holds the usual port")
+import socket as _socket
+_hold = _socket.socket(); _hold.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+try: _hold.bind(("127.0.0.1", 8787)); _hold.listen(1)
+except OSError: pass                    # something already has it: the same case
+r = start()
+r.send(":remote on\r"); r.wait_for("remote:", 15); r.pump(0.5)
+L = r.all_lines()
+check(any("remote: on" in l for l in L) and not any("could not listen" in l or "bind 127" in l for l in L),
+      "11-04: a second hako's :remote on takes a free port instead of failing (8787 was the sandbox's)", r)
+r.send(":help remote\r"); r.wait_for("?t=", 15)
+_m = next((m for l in r.all_lines() for m in [_re.search(r"127\.0\.0\.1:(\d+)/\?t=([a-z0-9]+)", l)] if m), None)
+_ok = False
+if _m and _m.group(1) != "8787":
+    try: _ok = '"remote":1' in urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{_m.group(1)}/api/state",
+               headers={"Cookie": "hako_token=" + _m.group(2)}), timeout=3).read().decode()
+    except Exception: pass
+check(_ok, f"and it answers there ({_m.group(1) if _m else None})", r)
+r.send(":remote off\r"); r.wait_for("remote: off", 10)
+r.close(); _hold.close()
+
+print("§3v :remote off with a relay that never answers")
+import socket as _socket
+_mute = _socket.socket(); _mute.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+_mute.bind(("127.0.0.1", 0)); _mute.listen(8)
+_held = []
+def _swallow():                         # accepts, reads, never replies: a relay on a bad network
+    while True:
+        try: c, _ = _mute.accept(); _held.append(c)
+        except OSError: return
+threading.Thread(target=_swallow, daemon=True).start()
+_relay0 = os.environ["HAKO_RELAY_URL"]; os.environ["HAKO_RELAY_URL"] = "http://127.0.0.1:%d" % _mute.getsockname()[1]
+r = start()
+os.environ["HAKO_RELAY_URL"] = _relay0
+r.send(":remote on 18932\r"); r.wait_for("remote: on", 15); r.pump(1.0)   # the sign-in call is now hanging
+_t0 = time.time(); r.send(":remote off\r")
+_off = False
+while time.time() - _t0 < 8:
+    r.pump(0.2)
+    if any("remote: off" in l for l in r.screen.display): _off = True; break
+check(_off and time.time() - _t0 < 3, "11-05: :remote off cuts a hanging relay call short (%.1fs; it waited out curl's 15 s)" % (time.time() - _t0), r)
+r.close(); _mute.close()
+for c in _held: c.close()
 
 print("§menu the command menu is part of the bar block")
 r = start()

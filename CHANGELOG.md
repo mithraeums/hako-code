@@ -5,6 +5,15 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ## [Unreleased]
 
+### changed
+- `--serve` carries studio's phone fixes: taps instead of hovers on a touch screen, and sheets kept above the keyboard
+
+### fixed
+- `:remote on` in a second hako no longer fails with "could not listen on port 8787" when another hako has it: the relay does not care which port, so it takes a free one (`:remote on <port>` still means that port), and the raw bind error stays out of the chat
+- a command refused from a remote device (`:auto`, a bare menu like `:model`) now ends with a done, so the studio stops saying thinking; it spun on forever
+- `:remote off` no longer freezes the terminal while the relay is slow to answer: it waited out the sign-in's curl calls (up to 15 s each), now it ends them
+- the pty tests no longer reach the live relay (`HAKO_RELAY_URL` points nowhere), which made them slow and flaky on a slow network
+
 ## [v0.3.3] - 2026-11-04
 
 v0.3.1 as built: the release builds of v0.3.1 and v0.3.2 failed their Linux test, so neither has binaries
