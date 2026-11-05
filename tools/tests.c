@@ -2124,15 +2124,15 @@ static void relay_tests(const char *url, const char *invite, const char *log) {
 		char pubh[66], body[128];
 		hkHexEnc(pubh, A.s_pub, 32);
 		snprintf(u, sizeof u, "%s/v1/auth/challenge", url);
-		char *c = hkRelayPost(u, pubh);
+		char *c = hkRelayPost(NULL, u, pubh);
 		ck(c && strlen(c) >= 97, "relay: a challenge is issued");
 		if (c && strlen(c) >= 97) {
 			snprintf(body, sizeof body, "%.32s %064d", c, 0);
 			snprintf(u, sizeof u, "%s/v1/auth/prove", url);
-			char *t = hkRelayPost(u, body);
+			char *t = hkRelayPost(NULL, u, body);
 			ck(t && !strncmp(t, "no", 2), "relay: a wrong proof is refused");
 			free(t);
-			t = hkRelayPost(u, body);
+			t = hkRelayPost(NULL, u, body);
 			ck(t && !strncmp(t, "no", 2), "relay: and the challenge is spent");
 			free(t);
 		}

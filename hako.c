@@ -5200,6 +5200,7 @@ typedef struct {
 	char url[256], token[65], id[33], acct[17];   /* acct: "" until the page binds this device */
 	uint8_t s[32], s_pub[32];
 	pid_t down_pid, up_pid;
+	volatile pid_t call_pid;    /* a sign-in or route call in flight: stopping kills it too */
 	FILE *down, *up;
 	char *line;                 /* getline buffer for down */
 	size_t line_cap;
@@ -5249,16 +5250,29 @@ static FILE *hkRelayCurl(char *const argv[], int writing, pid_t *pid) {
 	return fdopen(writing ? p[1] : p[0], writing ? "w" : "r");
 }
 
-static char *hkRelayPost(const char *url, const char *body) {
+/* One call's curl, killable from another thread while it runs: :remote off
+   waited out a slow relay's --max-time (up to 30 s over a sign-in) at the keyboard.
+   The pid is cleared under the lock that reaps it, so a stop never kills a
+   process that has been reaped and its number reused. */
+static pthread_mutex_t hk_relay_call_lock = PTHREAD_MUTEX_INITIALIZER;
+static char *hkRelayRun(hkRelay *r, char **argv) {
 	pid_t pid;
-	char *argv[] = { "curl", "-s", "--max-time", "15", "-X", "POST", "--data-binary", (char *)body,
-	                 "-H", "Content-Type: text/plain", (char *)url, NULL };
 	FILE *fp = hkRelayCurl(argv, 0, &pid);
 	if (!fp) return NULL;
+	if (r) r->call_pid = pid;
 	char *out = hk_slurp(fp, 0);
 	fclose(fp);
+	pthread_mutex_lock(&hk_relay_call_lock);
 	waitpid(pid, NULL, 0);
+	if (r && r->call_pid == pid) r->call_pid = 0;
+	pthread_mutex_unlock(&hk_relay_call_lock);
 	return out;
+}
+
+static char *hkRelayPost(hkRelay *r, const char *url, const char *body) {
+	char *argv[] = { "curl", "-s", "--max-time", "15", "-X", "POST", "--data-binary", (char *)body,
+	                 "-H", "Content-Type: text/plain", (char *)url, NULL };
+	return hkRelayRun(r, argv);
 }
 
 /* Prove to the relay that this device holds s: the MAC is keyed by
@@ -5268,7 +5282,7 @@ static int hkRelaySignIn(hkRelay *r) {
 	crypto_x25519_public_key(r->s_pub, r->s);
 	hkHexEnc(pubh, r->s_pub, 32);
 	snprintf(url, sizeof url, "%s/v1/auth/challenge", r->url);
-	char *a = hkRelayPost(url, pubh);
+	char *a = hkRelayPost(r, url, pubh);
 	uint8_t cid[16], epub[32], k[32], mac[64];
 	int ok = a && strlen(a) >= 97 && a[32] == ' ' && !hkHexDec(cid, a, 16) && !hkHexDec(epub, a + 33, 32);
 	char cidh[33];
@@ -5290,7 +5304,7 @@ static int hkRelaySignIn(hkRelay *r) {
 	hkHexEnc(mach, mac, 32);
 	snprintf(body, sizeof body, "%s %s", cidh, mach);
 	snprintf(url, sizeof url, "%s/v1/auth/prove", r->url);
-	char *t = hkRelayPost(url, body);
+	char *t = hkRelayPost(r, url, body);
 	char want[33];
 	hkRelayDeviceId(want, r->s_pub);
 	ok = t && strlen(t) >= 97 && t[64] == ' ' && !strncmp(t + 65, want, 32);
@@ -5306,18 +5320,12 @@ static int hkRelaySignIn(hkRelay *r) {
 /* POST a route with this device's token (GET with no body). The reply body, or NULL. */
 static char *hkRelayCall(hkRelay *r, const char *route, const char *body) {
 	char url[320], auth[96];
-	pid_t pid;
 	snprintf(url, sizeof url, "%s%s", r->url, route);
 	snprintf(auth, sizeof auth, "Authorization: Bearer %s", r->token);
 	char *post[] = { "curl", "-s", "--max-time", "10", "-X", "POST", "--data-binary", (char *)body,
 	                 "-H", auth, "-H", "Content-Type: text/plain", url, NULL };
 	char *get[] = { "curl", "-sf", "--max-time", "10", "-H", auth, url, NULL };
-	FILE *fp = hkRelayCurl(body ? post : get, 0, &pid);
-	if (!fp) return NULL;
-	char *out = hk_slurp(fp, 0);
-	fclose(fp);
-	waitpid(pid, NULL, 0);
-	return out;
+	return hkRelayRun(r, body ? post : get);
 }
 
 static int hkRelayOpen(hkRelay *r) {
@@ -5337,6 +5345,9 @@ static int hkRelayOpen(hkRelay *r) {
 /* Wakes a thread blocked in hkRelayRecv (its stream ends); it then closes. */
 static void hkRelayStop(hkRelay *r) {
 	if (r->down_pid > 0) kill(r->down_pid, SIGTERM);
+	pthread_mutex_lock(&hk_relay_call_lock);
+	if (r->call_pid > 0) kill(r->call_pid, SIGTERM);
+	pthread_mutex_unlock(&hk_relay_call_lock);
 }
 
 static int hkRelaySend(hkRelay *r, const char to[33], const uint8_t *b, size_t n) {
@@ -17963,7 +17974,7 @@ static int clOAuthAnthropic(aiData *data) {
 
 	aiAddHistory(data, "Sign in at this URL, then paste the code shown:");
 	aiAddHistory(data, url);
-	aiAddHistory(data, "(format: <code>#<state>  — copy the whole string)");
+	aiAddHistory(data, "(format: <code>#<state>, copy the whole string)");
 	if (hkClipCopy(url)) aiAddHistory(data, "the link is on your clipboard: paste it into a browser");
 	clOpenUrl(url);
 
@@ -20634,16 +20645,21 @@ static int hsRouteToTerminal(const char *type, const char *value) {
 		return 1;
 	}
 	if (strcmp(type, "prompt") != 0 && strcmp(type, "slash") != 0) return 0;
-	if (!value || !*value) return 1;
 	char line[4096];
-	int cmd = !strcmp(type, "slash") || value[0] == ':' || value[0] == '/';
-	snprintf(line, sizeof(line), "%s%s", cmd && value[0] != ':' && value[0] != '/' ? ":" : "", value);
-	if (cmd && hkSlashRefusedRemote(line))
-		clPipeEmitMsg("system", "not from a remote device: only the desktop terminal can widen what the agent may do");
-	else if (cmd && hkIsMenuCommand(line))
-		clPipeEmitMsg("system", "menus open at the desktop. here, use the studio's menus or give the name (:model <id>)");
-	else
+	int cmd = value && (!strcmp(type, "slash") || value[0] == ':' || value[0] == '/');
+	if (value && *value) snprintf(line, sizeof(line), "%s%s", cmd && value[0] != ':' && value[0] != '/' ? ":" : "", value);
+	if (value && *value && !(cmd && (hkSlashRefusedRemote(line) || hkIsMenuCommand(line)))) {
 		hsInjectPush(line);
+		return 1;
+	}
+	if (value && *value)
+		clPipeEmitMsg("system", hkSlashRefusedRemote(line)
+			? "not from a remote device: only the desktop terminal can widen what the agent may do"
+			: "menus open at the desktop. here, use the studio's menus or give the name (:model <id>)");
+	/* Nothing runs, so this is the whole answer: the device marked itself busy
+	   when it sent, and without a done it said thinking forever (11-05). Not
+	   while a turn runs: that turn's own done ends it. */
+	if (!G_AI.streaming) clPipeEmitDone(NULL);
 	return 1;
 }
 #endif
@@ -21058,7 +21074,13 @@ static void *hsAcceptThread(void *arg) {
 	return NULL;
 }
 
-static int hsOpenListener(void) {
+/* attach: for :remote on, which says what failed in the chat, not on stderr.
+   With no port named the relay reaches it through loopback whatever the number,
+   so a port in use (another hako's --serve or :remote on) is no reason to fail:
+   the system picks a free one. */
+static int hs_port_named = 0;               /* :remote on <port>: that one or none */
+static int hsOpenListener(int attach) {
+	int any_port = attach && !hs_port_named;
 	int srv = hkCloexec((int)socket(AF_INET, SOCK_STREAM, 0));
 	if (srv < 0) { fprintf(stderr, "hako: socket failed (error %d)\n", hs_errno()); return -1; }
 	int yes = 1;
@@ -21074,9 +21096,16 @@ static int hsOpenListener(void) {
 		return -1;
 	}
 	if (bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-		fprintf(stderr, "hako: bind %s:%d failed (error %d)\n", HS.bind_addr, HS.port, hs_errno());
-		hs_close(srv);
-		return -1;
+		socklen_t sl = sizeof(sa);
+		sa.sin_port = 0;
+		if (!any_port || bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0
+		    || getsockname(srv, (struct sockaddr *)&sa, &sl) != 0) {
+			if (!attach)
+				fprintf(stderr, "hako: bind %s:%d failed (error %d)\n", HS.bind_addr, HS.port, hs_errno());
+			hs_close(srv);
+			return -1;
+		}
+		HS.port = ntohs(sa.sin_port);
 	}
 	listen(srv, 16);
 	return srv;
@@ -21103,7 +21132,7 @@ static int hsStartThreads(int srv) {
 
 #if HK_ATTACH
 static void hsAttachInfo(int *port, const char **token) { *port = HS.port; *token = HS.token; }
-static void hsAttachSetPort(int port) { if (port > 0 && port < 65536) HS.port = port; }
+static void hsAttachSetPort(int port) { if (port > 0 && port < 65536) { HS.port = port; hs_port_named = 1; } }
 
 /* :remote on. The same listener and gates as --serve --token, inside this session. */
 static int hsAttachOn(void) {
@@ -21116,7 +21145,9 @@ static int hsAttachOn(void) {
 	fcntl(hs_wake[1], F_SETFL, O_NONBLOCK);
 	hs_listen_stop = 0;
 	hs_remote = 1;                     /* before the first request can arrive */
-	int srv = hsOpenListener();
+	if (!hs_port_named) HS.port = 8787;    /* each :remote on tries the usual port first */
+	int srv = hsOpenListener(1);
+	hs_port_named = 0;
 	if (srv < 0) {
 		hs_remote = 0;
 		close(hs_wake[0]); close(hs_wake[1]);
@@ -21725,6 +21756,7 @@ static void *hrThread(void *arg) {
 	while (hr_on) {
 		/* the computer's key links it (once), then vouches for this folder's key */
 		int up = hkRelaySignIn(&hrm) == 0;
+		if (!hr_on) break;                  /* :remote off cut the call short */
 		if (up && (!hr_has_k || !hrm.acct[0])) {
 			if (hkRelayOpen(&hrm) == 0) { hrLinkPrompt(); hrRead(&hrm, buf, sizeof buf); }
 			else hkRelayClose(&hrm);
@@ -21737,6 +21769,7 @@ static void *hrThread(void *arg) {
 		free(r);
 		if (!bound || hkRelaySignIn(&hr) || !hr.acct[0] || hkRelayOpen(&hr)) {
 			hkRelayClose(&hr);
+			if (!hr_on) break;
 			if (!said++) aiAddHistory(&G_AI, "remote: can't reach your account right now, still trying (the here link works)");
 			for (int i = 0; i < wait * 10 && hr_on; i++) cl_sleep_ms(100);
 			if (wait < 30) wait *= 2;
@@ -21774,6 +21807,8 @@ static void hrStop(void) {
 	hr_on = 0;
 	hkRelay *r = hr_cur;
 	if (r) hkRelayStop(r);
+	if (r != &hrm) hkRelayStop(&hrm);    /* a sign-in or call in flight on either: killed, not waited out */
+	if (r != &hr) hkRelayStop(&hr);
 	pthread_join(hr_thread, NULL);
 	crypto_wipe(hr_secret, sizeof hr_secret);
 	hr_linking = 0;
@@ -21804,7 +21839,7 @@ static int clServeMode(aiData *data, const char *dir) {
 		return 1;
 	}
 #endif
-	int srv = hsOpenListener();
+	int srv = hsOpenListener(0);
 	if (srv < 0) return 1;
 
 	if (strcmp(HS.bind_addr, "127.0.0.1") != 0 && !HS.token[0]) {

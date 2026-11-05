@@ -2,21 +2,21 @@
   <a href="https://mithraeums.github.io">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://mithraeums.github.io/assets/banner-hako-code-night.png"/>
-      <img src="https://mithraeums.github.io/assets/banner-hako-code.png" alt="hako-code — a standalone agent for the inner chamber" width="100%"/>
+      <img src="https://mithraeums.github.io/assets/banner-hako-code.png" alt="hako-code: a standalone agent for the inner chamber" width="100%"/>
     </picture>
   </a>
 </p>
 
 <p align="center">
-  <em>A coding agent in one C file. ~800 KB, no runtime, no package manager.<br/>Runs offline on a model you own — and on a phone.</em>
+  <em>A coding agent in one C file. ~800 KB, no runtime, no package manager.<br/>Runs offline on a model you own, and on a phone.</em>
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.3-e2402e?style=flat-square&labelColor=14130f" alt="v0.3.3"/></a>
-  <img src="https://img.shields.io/badge/license-GPL--3.0-2636c4?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
-  <img src="https://img.shields.io/badge/C99-single%20file-2636c4?style=flat-square&labelColor=14130f" alt="C99 single file"/>
-  <img src="https://img.shields.io/badge/providers-14-2636c4?style=flat-square&labelColor=14130f" alt="14 providers"/>
-  <img src="https://img.shields.io/badge/platforms-5-2636c4?style=flat-square&labelColor=14130f" alt="5 platforms"/>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.3-ece7da?style=flat-square&labelColor=14130f" alt="v0.3.3"/></a>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
+  <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
+  <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
+  <img src="https://img.shields.io/badge/platforms-5-ece7da?style=flat-square&labelColor=14130f" alt="5 platforms"/>
 </p>
 
 <p align="center">
@@ -49,9 +49,9 @@
 
 <table>
   <tr>
-    <td width="33%" valign="top"><b>Local first.</b><br/><sub>Auto-defaults to any installed <a href="https://github.com/mithraeums/hako">hako</a> model — <code>hako-sho</code> (3B) or <code>hako-koi</code> (7B), runs on your device, no key, no cloud. The agent detects it and just works.</sub></td>
+    <td width="33%" valign="top"><b>Local first.</b><br/><sub>Auto-defaults to any installed <a href="https://github.com/mithraeums/hako">hako</a> model (<code>hako-sho</code> 3B or <code>hako-koi</code> 7B); it runs on your device, no key, no cloud. The agent detects it and just works.</sub></td>
     <td width="33%" valign="top"><b>Single binary.</b><br/><sub>One C file. Builds with <code>gcc -lpthread</code>. Curl on PATH for HTTP. Nothing else linked.</sub></td>
-    <td width="33%" valign="top"><b>14 cloud providers when you want them.</b><br/><sub>Anthropic OAuth (Claude Pro/Max sub), GitHub Copilot, GH Models (free), OpenRouter, plus 9 more over OpenAI-compat. Set a key or run a one-line <code>:login</code> — your call.</sub></td>
+    <td width="33%" valign="top"><b>14 cloud providers when you want them.</b><br/><sub>Anthropic OAuth (Claude Pro/Max sub), GitHub Copilot, GH Models (free), OpenRouter, plus 9 more over OpenAI-compat. Set a key or run a one-line <code>:login</code>, your call.</sub></td>
   </tr>
 </table>
 
@@ -60,8 +60,8 @@
 ## Why this exists
 
 Every serious coding agent ships a runtime with it. Hermes pulls Python 3.11, Node, `uv`,
-ripgrep and ffmpeg — on Windows it downloads a portable Git too. Claude Code and its
-neighbours want Node and npm. They are good tools; they are also a language ecosystem you
+ripgrep and ffmpeg; on Windows it downloads a portable Git too. Claude Code and its
+neighbors want Node and npm. They are good tools; they are also a language ecosystem you
 have to keep alive on every machine you want to think on.
 
 hako is the same idea built the other way. One C file. It compiles with
@@ -73,7 +73,7 @@ gcc hako.c -o hako -lpthread
 and the result is a **~800 KB binary (the browser UI inside) that links libc and nothing else**. It talks to fourteen
 cloud providers when you want them, and to a 3B model on your own disk when you do not.
 It runs on a laptop, on a FreeBSD box, on Windows, and in a 32-bit Linux emulator on an
-iPhone — the same source, the same behaviour.
+iPhone: the same source, the same behavior.
 
 |                        | hako                                   | agents that ship a runtime          |
 |------------------------|----------------------------------------|-------------------------------------|
@@ -85,33 +85,33 @@ iPhone — the same source, the same behaviour.
 | license                | GPL-3.0                                | varies                              |
 
 The wager is simple: an agent is mostly a loop, some JSON, and careful text handling. None of
-that needs a runtime. Keeping it in C is what makes it small enough to live anywhere — and
+that needs a runtime. Keeping it in C is what makes it small enough to live anywhere, and
 being small enough to live anywhere is the whole point.
 
 <p align="center"><sub><b>—— II ——</b></sub></p>
 
 ## Overview
 
-- **Local models run on the native engine — no ollama, no server.** The agent
+- **Local models run on the native engine: no ollama, no server.** The agent
   starts the [hako engine](https://github.com/mithraeums/hako) as a `hakm --serve`
   child that keeps the model resident and the system prompt's KV prefix warm (on
   disk too, so a cold first turn costs seconds, not minutes). Answers stream token
   by token. No in-process link, no compile flag, no daemon, no socket. Install the
   engine once (`curl -fsSL https://mithraeums.github.io/hakm.sh | sh`, or `make hakm`
   next to a checkout), `hakm pull hako-sho`, and `hako` defaults to the
-  **mithraeum** provider on first launch — no key, no `:login`, no config. Small
+  **mithraeum** provider on first launch: no key, no `:login`, no config. Small
   models speak their native Qwen `<tool_call>` dialect, and the harness repairs the
   shapes they get wrong. (ollama is also supported as a *separate* optional
-  provider — `:login ollama` — for non-hako models.)
+  provider, `:login ollama`, for non-hako models.)
 - **14 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), ChatGPT sign-in (any ChatGPT plan, free included), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), Nous Portal (device code), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. Bare `:login` is a menu: sign-ins first, API keys one level down in `:login api`; `:login <name>` goes straight there.
-- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal — no absolute cursor moves, no scroll region — so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager, `ctrl+v` to paste an image (or drop its file in) for any provider that can see one.
+- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal (no absolute cursor moves, no scroll region), so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager, `ctrl+v` to paste an image (or drop its file in) for any provider that can see one.
 - **Your terminal's colors by default, the suite's themes when you want them.** `theme=terminal` uses the profile's own 16 colors; `:theme <name>` swaps to one of the shared presets or a custom `theme.<name>.<slot>` theme from the rc, and bare `:theme` opens a picker that recolors as you move (enter keeps it, esc puts the old one back, and it fits even a phone-sized window). The pick is written to the rc, so hake and the studio see it too. Truecolor where supported, 256-color fallback otherwise.
-- **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt — the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
+- **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt, the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`. Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
-- **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard — a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure — so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
+- **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard (a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure), so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
-- **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON — *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
+- **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON: *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
 - **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
 - **Self-update.** `hako --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
 - **Streaming everywhere.** Anthropic SSE, every OpenAI-compatible provider and the local engine stream live tokens, including through tool calls. The spinner names the tool in flight (`reading main.c`); `anim_style=` picks one of eight.
@@ -145,7 +145,7 @@ curl -fsSL https://mithraeums.github.io/hako.sh | sh       # the agent
 curl -fsSL https://mithraeums.github.io/install.sh | sh    # the whole suite: agent, editor, engine
 ```
 
-Detects OS and arch, downloads the latest release, verifies the sha256 sidecar, drops `hako` into `/usr/local/bin` (or `~/.local/bin`). Where there is no release binary — iSh is 32-bit x86 — it builds from source instead (`apk add build-base git curl` first). No package manager. No daemon. No telemetry.
+Detects OS and arch, downloads the latest release, verifies the sha256 sidecar, drops `hako` into `/usr/local/bin` (or `~/.local/bin`). Where there is no release binary (iSh is 32-bit x86), it builds from source instead (`apk add build-base git curl` first). No package manager. No daemon. No telemetry.
 
 <table align="center">
   <tr>
@@ -159,7 +159,7 @@ Detects OS and arch, downloads the latest release, verifies the sha256 sidecar, 
 
 ### First turn
 
-**Local, zero config (recommended)** — the engine, one model, launch:
+**Local, zero config (recommended):** the engine, one model, launch:
 
 ```sh
 curl -fsSL https://mithraeums.github.io/hakm.sh | sh   # the engine → ~/.hako/bin/hakm
@@ -173,7 +173,7 @@ hako                                                   # finds them and runs loc
 
 ```sh
 hako
-> :login anthropic       # OAuth — uses your Claude Pro / Max subscription
+> :login anthropic       # OAuth, uses your Claude Pro / Max subscription
 > :login github-models   # free for any GitHub account
 > :login gemini          # paste a free-tier API key
 > :model gemini-2.5-flash
@@ -214,7 +214,7 @@ hako --update           # check + atomic-replace if newer
 | Tab | complete commands, names and paths; with the menu open, take the selected entry |
 | Esc | close the command menu (the line stays); stop a reply being read aloud |
 
-*Bracketed paste — multi-line pastes land as one entry.*
+*Bracketed paste: multi-line pastes land as one entry.*
 
 ### Commands (inside prompt):
 
@@ -286,11 +286,11 @@ wins inside that project.
 
 **Three auth paths:**
 
-- **OAuth (subscription / account-bound)** — `:login anthropic` (Claude Pro/Max), `:login copilot` (GitHub Copilot Pro/Business), `:login github-models` (free for any GitHub user), `:login openrouter` (PKCE, auto-issue an OR API key), `:login nous` (Nous Portal, device code). Inference bills against your subscription where applicable; no per-token API key needed.
-- **API-key paste** — `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login nous-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
-- **Local** — hako's own models need no login: `hakm pull hako-sho`, then `:provider mithraeum`. Ollama works too: `:login ollama` (ensure `ollama serve` is running) or `:login ollamacloud` (paste an Ollama key).
+- **OAuth (subscription / account-bound):** `:login anthropic` (Claude Pro/Max), `:login copilot` (GitHub Copilot Pro/Business), `:login github-models` (free for any GitHub user), `:login openrouter` (PKCE, auto-issue an OR API key), `:login nous` (Nous Portal, device code). Inference bills against your subscription where applicable; no per-token API key needed.
+- **API-key paste:** `:login openai`, `:login gemini`, `:login groq`, `:login cerebras`, `:login deepseek`, `:login mistral`, `:login together`, `:login fireworks`, `:login xai`, `:login anthropic-api`, `:login openrouter-api`, `:login nous-api`, `:login custom`. Opens provider console in your browser, prompts with input hidden, persists into the cred store.
+- **Local:** hako's own models need no login: `hakm pull hako-sho`, then `:provider mithraeum`. Ollama works too: `:login ollama` (ensure `ollama serve` is running) or `:login ollamacloud` (paste an Ollama key).
 
-Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists the active provider's live catalog (its own listing endpoint, cached 24h — `:models refresh` refetches; installed `.mlf2` weights for **mithraeum**), falling back to a built-in list when offline. Bare `:model` opens the picker, where `/` filters as you type. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
+Run `:providers` for the full grouped list with `◎` (active) and `*` (saved login) markers. `:models` lists the active provider's live catalog (its own listing endpoint, cached 24h, `:models refresh` refetches; installed `.mlf2` weights for **mithraeum**), falling back to a built-in list when offline. Bare `:model` opens the picker, where `/` filters as you type. `:accounts` lists saved logins; `:logout [<provider>]` wipes one. Mid-chat `:provider X` swaps secrets and flattens wire-format-specific message bodies so the conversation survives.
 
 Resolution order: `HAKO_API_KEY` env → `<PROVIDER>_API_KEY` env → `~/.hako/credentials` (per provider). Legacy `CLAW_*` / `HAKOC_*` env names are read as fallback with a one-shot deprecation warning.
 
@@ -341,8 +341,8 @@ ReAct mode injects a tool schema in the system prompt and parses `<tool>...</too
 
 ```
 ~/.hako/skills/
-├── style.md                  flat skill — whole file injected
-└── corp/                     directory skill — SKILL.md is the dispatcher
+├── style.md                  flat skill, whole file injected
+└── corp/                     directory skill, SKILL.md is the dispatcher
     ├── SKILL.md
     └── agents/
         ├── CEO.md
@@ -350,7 +350,7 @@ ReAct mode injects a tool schema in the system prompt and parses `<tool>...</too
         └── QA.md
 ```
 
-Directory skills inject only `SKILL.md` plus a `<files>` manifest. The agent reads inner files on demand via `read_skill(skill, path)` — no trust gate (skills are user-installed), path-traversal blocked.
+Directory skills inject only `SKILL.md` plus a `<files>` manifest. The agent reads inner files on demand via `read_skill(skill, path)`: no trust gate (skills are user-installed), path-traversal blocked.
 
 ```
 :skill install mithraeums/skills      # every skill in the repo, into ~/.hako/skills
@@ -364,7 +364,7 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest — v0.3.3
+### Latest: v0.3.3
 v0.3.1, built: the release builds of v0.3.1 and v0.3.2 failed two Linux-only test setups, so neither has binaries.
 
 - **Pinned and archived chats.** hako keeps them beside each chat (`POST /api/session/mark`), so every browser on that computer sees the same list; the chat list and the resume picker show the newest first.
