@@ -10,6 +10,7 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - `--serve` carries studio's tidier menu (a folder holds its chats) and the home-screen icon that survives a tinted home screen
 
 ### fixed
+- `:remote on` no longer makes a new key for the folder on every failed bind: a rate limit, an expired token or a gateway error each left the old key bound, and the account filled up with dead devices. only a real refusal does now, and a full account says so
 - a long tool turn on a cloud provider now folds as it goes: it could not fold until the next prompt, because it looked for a plain message in the tail
 - a second fold no longer loses the first one's digest; the digest keeps what you said first, then the newest lines, and counts every message ever folded
 - a digest names native tool calls instead of quoting their JSON, and its size follows the context window (24 to 200 lines)
