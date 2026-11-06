@@ -325,6 +325,112 @@ static void sse_tests(void) {
 	free(body); hkSseFree(&a);
 }
 
+/* --- a long session: folds inside a tool turn, folds of folds, what they keep --- */
+static void long_msg_free(aiData *d) {
+	for (int i = 0; i < d->message_count; i++) { free(d->messages[i].role); free(d->messages[i].content); }
+	free(d->messages); free(d->system_prompt);
+	pthread_mutex_destroy(&d->lock);
+}
+
+static void long_session_tests(void) {
+	char blob[2049], m[2300];
+	memset(blob, 'x', sizeof(blob) - 1);
+	blob[sizeof(blob) - 1] = '\0';
+
+	/* one prompt, then nothing but native tool calls: no plain user message in the tail */
+	aiData a;
+	memset(&a, 0, sizeof(a));
+	pthread_mutex_init(&a.lock, NULL);
+	a.system_prompt = strdup("sys");
+	aiPushMessage(&a, "user", "the goal: fix the parser");
+	for (int i = 0; i < 40; i++) {
+		snprintf(m, sizeof(m), "[{\"type\":\"tool_use\",\"id\":\"t%d\",\"name\":\"read_file\",\"input\":{}}]", i);
+		aiPushMessageRaw(&a, "assistant", m);
+		snprintf(m, sizeof(m), "[{\"type\":\"tool_result\",\"tool_use_id\":\"t%d\",\"content\":\"%s\"}]", i, blob);
+		aiPushMessageRaw(&a, "user", m);
+	}
+	long before = hkContextUsed(&a);
+	ck(hkCompactHistory(&a) > 0, "a long native tool turn folds without waiting for the next prompt");
+	ck(hkContextUsed(&a) < before / 2, "and that cuts the tokens");
+	ckstr(a.messages[0].content, "the goal", "and keeps the goal");
+	ckstr(a.messages[1].content, "ran read_file", "its digest names the tool, not the JSON");
+	ck(a.messages[1].content && !strstr(a.messages[1].content, "tool_use_id"), "its digest has no raw tool JSON");
+	ck(a.messages[2].raw && !strcmp(a.messages[2].role, "assistant") && strstr(a.messages[2].content, "tool_use"),
+	   "the tail opens on a tool call, so no tool result is orphaned");
+	long_msg_free(&a);
+
+	/* the same with the OpenAI shape: one call, then its "tool" answer */
+	aiData o;
+	memset(&o, 0, sizeof(o));
+	pthread_mutex_init(&o.lock, NULL);
+	o.system_prompt = strdup("sys");
+	aiPushMessage(&o, "user", "the goal: fix the parser");
+	for (int i = 0; i < 40; i++) {
+		snprintf(m, sizeof(m), "\"tool_calls\":[{\"id\":\"c%d\",\"function\":{\"name\":\"grep\",\"arguments\":\"{}\"}}]", i);
+		aiPushMessageBody(&o, "assistant", m);
+		snprintf(m, sizeof(m), "\"tool_call_id\":\"c%d\",\"content\":\"%s\"", i, blob);
+		aiPushMessageBody(&o, "tool", m);
+	}
+	ck(hkCompactHistory(&o) > 0, "the OpenAI tool shape folds too");
+	ckstr(o.messages[1].content, "ran grep", "its digest names the tool");
+	ck(!strcmp(o.messages[2].role, "assistant"), "its tail opens on the call, never on a tool answer");
+	long_msg_free(&o);
+
+	/* folds of folds: what the person said survives every one, and the digest stays small */
+	long window_was = E.ai_context_window;
+	E.ai_context_window = 8192;
+	aiData f;
+	memset(&f, 0, sizeof(f));
+	pthread_mutex_init(&f.lock, NULL);
+	f.system_prompt = strdup("sys");
+	aiPushMessage(&f, "user", "the goal: ship it");
+	aiPushMessage(&f, "assistant", "ok");
+	aiPushMessage(&f, "user", "always use port 8443 for the proxy");
+	int total = 0;
+	for (int round = 0; round < 12; round++) {
+		for (int i = 0; i < 14; i++) {
+			aiPushMessage(&f, "assistant", blob);
+			snprintf(m, sizeof(m), "<observation tool=\"read_file\">%s</observation>", blob);
+			aiPushMessage(&f, "user", m);
+		}
+		snprintf(m, sizeof(m), "round %d request", round);
+		aiPushMessage(&f, "user", m);
+		aiPushMessage(&f, "assistant", "ok");
+		for (int i = 0; i < 6; i++) aiPushMessage(&f, i % 2 ? "assistant" : "user", "tail");
+		int n = hkCompactHistory(&f);
+		ck(n > 0, "each round folds");
+		total += n;
+		ckstr(f.messages[1].content, "port 8443", "a rule from the first turn survives another fold");
+		ckstr(f.messages[0].content, "the goal", "the goal survives another fold");
+		ck(strlen(f.messages[1].content) < 6000, "the digest stays small");
+		ck(!strncmp(f.messages[1].content, "[earlier conversation compacted", 31), "a folded digest is still one digest");
+	}
+	ckstr(f.messages[1].content, "round 11 request", "the newest folded request is in the digest, not cut as the oldest would keep");
+	char want[80];
+	snprintf(want, sizeof(want), "compacted \xE2\x80\x94 %d messages", total);
+	ckstr(f.messages[1].content, want, "the digest counts every message ever folded");
+	long_msg_free(&f);
+	E.ai_context_window = window_was;
+
+	/* the words providers use for a conversation that no longer fits, and not a rate limit */
+	ck(hkIsContextOverflow("{\"message\":\"prompt is too long: 210000 tokens > 200000 maximum\"}"), "overflow: Anthropic's words");
+	ck(hkIsContextOverflow("{\"code\":\"context_length_exceeded\"}"), "overflow: OpenAI's code");
+	ck(hkIsContextOverflow("exceeds the maximum number of tokens allowed"), "overflow: Gemini's words");
+	ck(!hkIsContextOverflow("{\"message\":\"rate limit: too many tokens per minute\"}"), "overflow: a rate limit is not one");
+	ck(!hkIsContextOverflow(NULL), "overflow: no answer is not one");
+
+	/* a local engine out of room drops half: never the goal */
+	aiData g;
+	memset(&g, 0, sizeof(g));
+	pthread_mutex_init(&g.lock, NULL);
+	g.system_prompt = strdup("sys");
+	aiPushMessage(&g, "user", "the goal: stay");
+	for (int i = 0; i < 9; i++) aiPushMessage(&g, i % 2 ? "user" : "assistant", "filler");
+	ck(hkMithraeumTrimOldest(&g) > 0, "the engine's retry drops messages");
+	ckstr(g.messages[0].content, "the goal", "and keeps the goal");
+	long_msg_free(&g);
+}
+
 /* --- context accounting and compaction --- */
 static void compact_tests(void) {
 	aiData d;
@@ -2357,6 +2463,7 @@ int main(int argc, char **argv) {
 	pipe_tests();
 	sse_tests();
 	compact_tests();
+	long_session_tests();
 	skill_tests();
 	context_file_tests();
 	skill_roots_tests();

@@ -11009,7 +11009,9 @@ static char *hkSseFinish(hkSseAcc *a) {
 #define HK_CTX_TRIGGER   70    /* percent of the window before compacting */
 #define HK_CTX_KEEP_HEAD  1    /* the opening request states the goal */
 #define HK_CTX_KEEP_TAIL  6    /* recent turns stay verbatim */
-#define HK_CTX_DIGEST_MAX 24   /* lines of digest */
+#define HK_CTX_DIGEST_MIN 24   /* lines of digest: a small window's */
+#define HK_CTX_DIGEST_MAX 200  /* and a big one's (5% of the window, ~30 tokens a line) */
+#define HK_CTX_DIGEST_HEAD "[earlier conversation compacted"
 
 /* Four bytes per token is close enough to steer with, and costs nothing. Real
    tokenisers disagree with each other anyway. */
@@ -11060,11 +11062,43 @@ static int hkContextPercent(aiData *data) {
 	return (int)((hkContextUsed(data) * 100) / w);
 }
 
-/* One line describing a message, for the digest. */
+/* What a message adds to the digest, a line or more, each "  - ...\n". */
 static void hkDigestLine(char **b, size_t *l, size_t *c, const aiMessage *m) {
 	const char *role = m->role ? m->role : "?";
 	const char *s = m->content ? m->content : "";
 	while (*s == ' ' || *s == '\n' || *s == '\t') s++;
+	char line[384];
+	/* A native tool turn is JSON: name the calls, keep the words, and say nothing
+	   for the answers (a read_file's content is what compaction is there to drop). */
+	if (m->raw) {
+		if (!strcmp(role, "tool") || strstr(s, "\"tool_result\"")) return;
+		const char *t = strstr(s, "\"text\":\"");
+		if (t) t += 8;
+		else if (m->raw == 2 && (t = strstr(s, "\"content\":\"")) != NULL) t += 11;
+		char *text = t ? aiExtractStringValue(t) : NULL;
+		if (text) {
+			aiMessage plain = { .role = m->role, .content = text, .raw = 0 };
+			hkDigestLine(b, l, c, &plain);
+			free(text);
+		}
+		for (const char *q = s; (q = strstr(q, "\"name\"")) != NULL; ) {
+			q += 6;
+			while (*q == ' ' || *q == ':') q++;
+			if (*q != '"') continue;
+			q++;
+			size_t k = strcspn(q, "\"");
+			snprintf(line, sizeof(line), "  - ran %.*s\n", k < 64 ? (int)k : 64, q);
+			hkSbAdd(b, l, c, line, strlen(line));
+			q += k;
+		}
+		return;
+	}
+	/* An earlier digest goes in line by line, or a fold of a fold loses it. */
+	if (!strncmp(s, HK_CTX_DIGEST_HEAD, strlen(HK_CTX_DIGEST_HEAD))) {
+		const char *rest = strchr(s, '\n');
+		if (rest) hkSbAdd(b, l, c, rest + 1, strlen(rest + 1));
+		return;
+	}
 	/* Tool observations are the useful part of the middle: they say what was
 	   actually looked at. Name the tool rather than quoting its output. */
 	if (!strncmp(s, "<observation", 12)) {
@@ -11076,19 +11110,80 @@ static void hkDigestLine(char **b, size_t *l, size_t *c, const aiMessage *m) {
 			while (*q && *q != '"' && k < sizeof(tool) - 1) tool[k++] = *q++;
 			tool[k] = '\0';
 		}
-		char line[128];
-		int n = snprintf(line, sizeof(line), "  - ran %s\n", tool);
-		hkSbAdd(b, l, c, line, (size_t)n);
+		snprintf(line, sizeof(line), "  - ran %s\n", tool);
+		hkSbAdd(b, l, c, line, strlen(line));
 		return;
 	}
-	size_t n = 0;
-	while (s[n] && s[n] != '\n' && n < 96) n++;
+	/* What the person said carries the constraints, so it gets more room. */
+	int you = !strcmp(role, "user");
+	size_t n = 0, most = you ? 280 : 96;
+	while (s[n] && s[n] != '\n' && n < most) n++;
 	if (!n) return;
-	char line[192];
-	int k = snprintf(line, sizeof(line), "  - %s: %.*s%s\n",
-	                 !strcmp(role, "user") ? "you" : "me", (int)n, s,
-	                 s[n] && s[n] != '\n' ? "..." : "");
-	hkSbAdd(b, l, c, line, (size_t)k);
+	snprintf(line, sizeof(line), "  - %s: %.*s%s\n", you ? "you" : "me", (int)n, s,
+	         s[n] && s[n] != '\n' ? "..." : "");
+	hkSbAdd(b, l, c, line, strlen(line));
+}
+
+/* Cuts a digest's lines down to the budget, in order. What the person said goes
+   first: all of it if it fits, or else its opening (where the rules tend to be)
+   and its newest. The rest of the room goes to the newest other lines. A repeat
+   of the line before ("ran read_file" twenty times) is not a line. Takes `all`
+   apart. Returns a new string and the number of lines dropped. */
+static char *hkDigestPick(char *all, int budget, int *dropped) {
+	int n = 0, cap = 0;
+	char **row = NULL;
+	for (char *p = all, *nl; p && *p; p = nl ? nl + 1 : NULL) {
+		nl = strchr(p, '\n');
+		if (nl) *nl = '\0';
+		if (!strncmp(p, "  - ... ", 8)) continue;                /* an earlier digest's own count */
+		if (n && !strcmp(row[n - 1], p)) continue;
+		if (n == cap) {
+			char **g = realloc(row, sizeof(char *) * (size_t)(cap = cap ? cap * 2 : 64));
+			if (!g) break;
+			row = g;
+		}
+		row[n++] = p;
+	}
+	char *keep = calloc((size_t)n + 1, 1);
+	int yous = 0, left = budget;
+	for (int i = 0; i < n; i++) yous += !strncmp(row[i], "  - you:", 8);
+	int open = yous > budget ? budget / 3 : yous, late = yous > budget ? budget - open : 0;
+	for (int i = 0, k = 0; keep && i < n; i++)
+		if (!strncmp(row[i], "  - you:", 8)) {
+			if (k < open || k >= yous - late) { keep[i] = 1; left--; }
+			k++;
+		}
+	for (int i = n - 1; keep && i >= 0 && left > 0; i--)
+		if (!keep[i]) {
+			if (!strncmp(row[i], "  - you:", 8)) continue;
+			keep[i] = 1;
+			left--;
+		}
+	char *out = NULL;
+	size_t ol = 0, oc = 0;
+	int gone = 0;
+	for (int i = 0; i < n; i++) {
+		if (keep && !keep[i]) { gone++; continue; }
+		hkSbAdd(&out, &ol, &oc, row[i], strlen(row[i]));
+		hkSbAdd(&out, &ol, &oc, "\n", 1);
+	}
+	free(keep);
+	free(row);
+	*dropped = gone;
+	return out;
+}
+
+/* A provider's way of saying the conversation no longer fits. Not "too many
+   tokens": that is also how a rate limit reads. */
+static int hkIsContextOverflow(const char *body) {
+	static const char *said[] = {
+		"prompt is too long", "context_length_exceeded", "maximum context length",
+		"input is too long", "exceeds the maximum number of tokens", "exceeds the context window",
+	};
+	if (!body) return 0;
+	for (size_t i = 0; i < sizeof(said) / sizeof(said[0]); i++)
+		if (strstr(body, said[i])) return 1;
+	return 0;
 }
 
 /* Returns the number of messages folded away, 0 if nothing was done. Caller
@@ -11103,29 +11198,46 @@ static int hkCompactHistory(aiData *data) {
 	int head = HK_CTX_KEEP_HEAD;
 	int cut  = n - HK_CTX_KEEP_TAIL;
 
-	while (cut < n && !(data->messages[cut].role &&
-	                    !strcmp(data->messages[cut].role, "user") &&
-	                    !data->messages[cut].raw)) cut++;
+	/* The tail opens on a plain user message or on a native tool call, whose
+	   answers follow it: never on an answer, which would be orphaned. In one long
+	   tool turn the call is all there is. */
+	while (cut < n) {
+		const aiMessage *t = &data->messages[cut];
+		if (t->role && (t->raw ? !strcmp(t->role, "assistant") : !strcmp(t->role, "user"))) break;
+		cut++;
+	}
 	if (cut >= n || cut <= head + 1) {
 		pthread_mutex_unlock(&data->lock);
 		return 0;
 	}
 
+	const char *was = data->messages[head].content;
+	int refold = was && !data->messages[head].raw && !strncmp(was, HK_CTX_DIGEST_HEAD, strlen(HK_CTX_DIGEST_HEAD));
+	const char *dash = refold ? strstr(was, "\xE2\x80\x94 ") : NULL;
+	int folded = cut - head - refold, ever = folded + (dash ? atoi(dash + 4) : 0);
+
+	char *all = NULL;
+	size_t al = 0, ac = 0;
+	for (int i = head; i < cut; i++)
+		hkDigestLine(&all, &al, &ac, &data->messages[i]);
+	long fits = hkContextWindow() / 20 / 30;
+	int budget = fits < HK_CTX_DIGEST_MIN ? HK_CTX_DIGEST_MIN : fits > HK_CTX_DIGEST_MAX ? HK_CTX_DIGEST_MAX : (int)fits;
+	int dropped = 0;
+	char *lines = all ? hkDigestPick(all, budget, &dropped) : NULL;
+	free(all);
+
 	char  *dig = NULL;
 	size_t dl = 0, dc = 0;
 	char intro[96];
-	int in = snprintf(intro, sizeof(intro),
-	                  "[earlier conversation compacted — %d messages]\n", cut - head);
+	int in = snprintf(intro, sizeof(intro), HK_CTX_DIGEST_HEAD " \xE2\x80\x94 %d messages]\n", ever);
 	hkSbAdd(&dig, &dl, &dc, intro, (size_t)in);
-	int lines = 0;
-	for (int i = head; i < cut && lines < HK_CTX_DIGEST_MAX; i++, lines++)
-		hkDigestLine(&dig, &dl, &dc, &data->messages[i]);
-	if (cut - head > HK_CTX_DIGEST_MAX) {
+	if (dropped > 0) {
 		char more[64];
-		int mn = snprintf(more, sizeof(more), "  - ... %d more\n",
-		                  (cut - head) - HK_CTX_DIGEST_MAX);
+		int mn = snprintf(more, sizeof(more), "  - ... %d more\n", dropped);
 		hkSbAdd(&dig, &dl, &dc, more, (size_t)mn);
 	}
+	if (lines) hkSbAdd(&dig, &dl, &dc, lines, strlen(lines));
+	free(lines);
 
 	size_t original = 0;
 	for (int i = head; i < cut; i++)
@@ -11151,7 +11263,22 @@ static int hkCompactHistory(aiData *data) {
 		data->message_count = n - removed;
 	}
 	pthread_mutex_unlock(&data->lock);
-	return cut - head;
+	return folded;
+}
+
+/* The provider refused the conversation as too long: fold it and ask again, once
+   a turn. 1 when it folded. Caller must NOT hold data->lock. */
+static int hkFoldAfterOverflow(aiData *data, const char *body, int *tried) {
+	if (*tried || !hkIsContextOverflow(body)) return 0;
+	*tried = 1;
+	int folded = hkCompactHistory(data);
+	if (folded <= 0) return 0;
+	data->compact_floor = data->message_count + 4;
+	pthread_mutex_lock(&data->lock);
+	aiSayf(data, "(the provider said the context was full \xE2\x80\x94 folded %d earlier messages into a summary; now %d%%)",
+	       folded, hkContextPercent(data));
+	pthread_mutex_unlock(&data->lock);
+	return 1;
 }
 
 /* A model sometimes emits the tool JSON with only the CLOSING tag: */
@@ -12714,15 +12841,15 @@ static char *hkStripToolBlocks(const char *src) {
 static int hkMithraeumTrimOldest(aiData *data) {
 	pthread_mutex_lock(&data->lock);
 	int n = data->message_count;
-	int drop = n / 2;
-	if (drop >= n) drop = n - 1;
-	if (drop < 1) { pthread_mutex_unlock(&data->lock); return 0; }
-	for (int i = 0; i < drop; i++) {
+	if (n < 2) { pthread_mutex_unlock(&data->lock); return 0; }
+	int drop = (n - 1) / 2;                    /* after the first: it states the goal */
+	if (drop < 1) drop = 1;
+	for (int i = 1; i <= drop; i++) {
 		free(data->messages[i].role);
 		free(data->messages[i].content);
 	}
-	memmove(data->messages, data->messages + drop,
-	        (size_t)(n - drop) * sizeof(aiMessage));
+	memmove(data->messages + 1, data->messages + 1 + drop,
+	        (size_t)(n - 1 - drop) * sizeof(aiMessage));
 	data->message_count = n - drop;
 	pthread_mutex_unlock(&data->lock);
 	return drop;
@@ -13340,6 +13467,7 @@ static void *aiWorkerTurn(void *arg) {
 	int token_retried = 0;
 	int cache_retried = 0;
 	int stream_retried = 0;
+	int overflow_tried = 0;
 	hk_last_error[0] = '\0';   /* a stale reason must not be reported for a new turn */
 	hkRepeatReset();
 	/* Fence state is global; one reply that opens ``` and never closes it used
@@ -13766,6 +13894,10 @@ static void *aiWorkerTurn(void *arg) {
 				free(full_response);
 				continue;
 			}
+				if (hkFoldAfterOverflow(data, full_response, &overflow_tried)) {
+					free(full_response);
+					continue;
+				}
 				if (E.ai_oauth_refresh && !token_retried) {
 					token_retried = 1;
 					free(full_response);
@@ -13860,6 +13992,10 @@ static void *aiWorkerTurn(void *arg) {
 		int api_err;
 		char *content = aiExtractResponse(full_response, E.ai_provider_type, &api_err);
 		if (api_err) { free(content); content = NULL; }   /* not the model's answer: hkReportEmpty says it */
+		if (!content && hkFoldAfterOverflow(data, full_response, &overflow_tried)) {
+			free(full_response);
+			continue;
+		}
 
 		pthread_mutex_lock(&data->lock);
 		hkUpdateUsage(data, full_response);
