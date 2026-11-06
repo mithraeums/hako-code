@@ -511,6 +511,20 @@ check("stop_sequences" in sent, "prose tool calls ask Claude to stop at </tool>"
 check("no project directory" not in sent and not any("no project directory" in l for l in L),
       "so an invented result never reaches the screen or the next request", r)
 check(any("list_dir" in l for l in L), "and the call still runs", r)
+def one_more_done(seen):                                     # "Done." is already on screen: wait for another
+    end = time.time() + 20
+    while time.time() < end and sum("Done." in l for l in r.all_lines()) <= seen: r.pump(0.05)
+    settle(r)
+for i in range(3):                                           # enough chat that a digest is smaller than it
+    seen = sum("Done." in l for l in r.all_lines())
+    r.send("one more %d\r" % i)
+    one_more_done(seen)
+seen = sum("Done." in l for l in r.all_lines())
+r.send("CLAUDEFULL\r"); r.wait_for("the provider said the context was full", 20)
+one_more_done(seen)
+L = r.all_lines()
+check(any("the provider said the context was full" in l for l in L), "a provider's \"prompt is too long\" folds the chat", r)
+check(sum("Done." in l for l in L) > seen and not any("prompt is too long" in l for l in L), "and the turn answers, no error on screen", r)
 r.close()
 anth_home(APORT)
 os.makedirs(PROJ, exist_ok=True)

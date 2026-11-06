@@ -7,8 +7,14 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ### changed
 - `--serve` carries studio's phone fixes: taps instead of hovers on a touch screen, and sheets kept above the keyboard
+- `--serve` carries studio's tidier menu (a folder holds its chats) and the home-screen icon that survives a tinted home screen
 
 ### fixed
+- a long tool turn on a cloud provider now folds as it goes: it could not fold until the next prompt, because it looked for a plain message in the tail
+- a second fold no longer loses the first one's digest; the digest keeps what you said first, then the newest lines, and counts every message ever folded
+- a digest names native tool calls instead of quoting their JSON, and its size follows the context window (24 to 200 lines)
+- a provider's "prompt is too long" folds the chat and asks again, once a turn, instead of ending the turn in an error
+- a local engine out of room no longer drops the first message, the one that states the goal
 - `:remote on` in a second hako no longer fails with "could not listen on port 8787" when another hako has it: the relay does not care which port, so it takes a free one (`:remote on <port>` still means that port), and the raw bind error stays out of the chat
 - a command refused from a remote device (`:auto`, a bare menu like `:model`) now ends with a done, so the studio stops saying thinking; it spun on forever
 - `:remote off` no longer freezes the terminal while the relay is slow to answer: it waited out the sign-in's curl calls (up to 15 s each), now it ends them

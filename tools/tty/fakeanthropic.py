@@ -10,6 +10,8 @@ Replies are chosen from the last user message, like fakehakm.py:
                   that should not ride along in every later request)
   "CLAUDEGOESON" -> a tool call, then prose that invents its result (what Haiku
                   did); the request's stop_sequences cut it like the real API
+  "CLAUDEFULL" -> 400 "prompt is too long" until the request carries a compaction
+                  digest, then a normal answer
   anything else -> a multi-line answer, streamed in 3-character deltas, with a
                   delta that ends in a backslash on purpose
 Each request body is appended to LOGFILE."""
@@ -49,6 +51,14 @@ class H(BaseHTTPRequestHandler):
         with open(LOG, "ab") as f: f.write(raw + b"\n")
         try: body = json.loads(raw)
         except Exception: body = {}
+        if "CLAUDEFULL" in json.dumps(body.get("messages", [])) and "compacted" not in json.dumps(body.get("messages", [])):
+            msg = b'{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}'
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
         text = reply_for(body)
         stop_reason = "end_turn"
         for sq in body.get("stop_sequences") or []:      # as the API does: cut, and drop the sequence
