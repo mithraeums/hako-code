@@ -21885,10 +21885,15 @@ static void hrRead(hkRelay *r, uint8_t *buf, size_t cap) {
 	hkRelayClose(r);
 }
 
+/* /v1/bind's answer when the key belongs to another account. */
+static int hrBindRefused(const char *r) {
+	return r && r[0] == 'n' && r[1] == 'o' && (r[2] == '\n' || !r[2]);
+}
+
 static void *hrThread(void *arg) {
 	(void)arg;
 	static uint8_t buf[300 * 1024];
-	int wait = 1, said = 0;
+	int wait = 1, said = 0, full_said = 0;
 	while (hr_on) {
 		/* the computer's key links it (once), then vouches for this folder's key */
 		int up = hkRelaySignIn(&hrm) == 0;
@@ -21901,7 +21906,12 @@ static void *hrThread(void *arg) {
 		char pub[65], *r = NULL;
 		if (up) { hkHexEnc(pub, hr.s_pub, 32); r = hkRelayCall(&hrm, "/v1/bind", pub); }
 		int bound = r && !strncmp(r, "ok", 2);
-		if (r && !bound && hrProjectKey(1) == 0) crypto_x25519_public_key(hr.s_pub, hr.s);   /* held by another account */
+		/* Only a real "no" means another account holds this key. A rate limit, an
+		   expired token or a gateway's error page used to mint a new key too, and
+		   each one left the old key bound: the account filled up with dead devices. */
+		if (hrBindRefused(r) && hrProjectKey(1) == 0) crypto_x25519_public_key(hr.s_pub, hr.s);
+		if (r && !strncmp(r, "full", 4) && !full_said++)
+			aiAddHistory(&G_AI, "remote: your account has all the devices it can hold. remove some: in hako studio, account, your devices");
 		free(r);
 		if (!bound || hkRelaySignIn(&hr) || !hr.acct[0] || hkRelayOpen(&hr)) {
 			hkRelayClose(&hr);

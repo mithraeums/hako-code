@@ -1978,6 +1978,9 @@ static void qr_tests(void) {
 		ck(hrKeyUrl(u, sizeof u, "pair", key, 16, sec) && strlen(u) == 81 && u[58] == '.', "pair code: <id>.<secret>, 81 characters");
 		ck(hkQrEncode(&q, u) == 37, "pair code: its QR is version 5, was 8");
 		ck(!hrKeyUrl(u, 90, "link", key, 32, sec), "link code: refused when it doesn't fit");
+		ck(hrBindRefused("no\n") && hrBindRefused("no"), "bind: a refusal means another account holds the key");
+		ck(!hrBindRefused("ok\n") && !hrBindRefused("full\n") && !hrBindRefused("slow down\n") && !hrBindRefused("") && !hrBindRefused(NULL)
+		   && !hrBindRefused("not found\n") && !hrBindRefused("<html>502</html>"), "bind: nothing else throws this folder's key away");
 		for (int i = 0; i < 48; i++) pt[i] = (uint8_t)i;
 		ck(!hkLinkSeal(m, sec, pt) && !hkLinkOpen(back, sec, m) && !memcmp(back, pt, 48), "link code: the short secret seals and opens K");
 		sec[17] = 1;
