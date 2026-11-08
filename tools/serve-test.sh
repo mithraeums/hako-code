@@ -95,11 +95,16 @@ post approve a >/dev/null; sleep 1.2
 post prompt 'TOOL again' >/dev/null; sleep 1.2
 [ "$(grep -c '"type":"tool_request"' "$T/ev")" = 2 ] && ok "\"always\" counted once" || no "\"always\" was remembered for a remote device"
 post approve n >/dev/null; sleep 0.8
-for c in ':auto on' ':mode auto' ':mode' ':trust' ':remote'; do
+for c in ':auto on' ':mode' ':trust' ':remote'; do
 	n0=$(grep -c 'only the desktop terminal' "$T/ev"); post slash "$c" >/dev/null; sleep 0.4
 	[ "$(grep -c 'only the desktop terminal' "$T/ev")" -gt "$n0" ] && ok "refused: $c" || no "a remote device ran $c"
 done
 case $(curl -s -H "$K" "$U/api/state") in *'"yolo":0'*) ok "still not auto";; *) no "auto mode came on";; esac
+# a device that approves every call may stop being asked, and say so again
+post slash ':mode auto' >/dev/null; sleep 0.4
+case $(curl -s -H "$K" "$U/api/state") in *'"yolo":1'*) ok ":mode auto from a device holds";; *) no ":mode auto from a device did nothing";; esac
+post slash ':mode ask' >/dev/null; sleep 0.4
+case $(curl -s -H "$K" "$U/api/state") in *'"yolo":0'*) ok ":mode ask ends it";; *) no ":mode ask left auto on";; esac
 st=$(curl -s -H "$K" "$U/api/state")
 case $st in *'"places","'*|*'"find","'*) no "a remote device is offered places or find";;
 	*'"places":[]'*) ok "no places or find offered remotely";; *) no "places listed for a remote device";; esac
