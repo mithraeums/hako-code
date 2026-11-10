@@ -3,6 +3,8 @@
 3-char `T` frames with a small delay, so the terminal UI can be exercised with
 no weights, no model and no GPU. The reply is chosen by the LAST user message:
   "TOOL"        -> one list_dir tool call
+  "DELEGATE"    -> a delegate call (WRITE: its task writes a file, TWICE: it delegates again,
+                   LONG: its task is SLOW); "SUBWRITE" -> a write_file call
   "TWOTOOLS"    -> two tool calls in one reply (tests the approval handover)
   "ASK"         -> an ask_user question with two options
   "SLOW"        -> the same short answer after 30 s (a cold local model)
@@ -18,6 +20,12 @@ def reply_for(last):
     if "PLAN" in last:
         return ('<tool_call>{"name": "todo", "arguments": {"items": '
                 '"[x] read the file\\n[ ] change it\\n[ ] run the tests"}}</tool_call>')
+    if "DELEGATE" in last:
+        task = ("SUBWRITE please" if "WRITE" in last else "DELEGATE again" if "TWICE" in last
+                else "SLOW one" if "LONG" in last else "SUBTASK what files are here")
+        return '<tool_call>{"name": "delegate", "arguments": {"task": "%s"}}</tool_call>' % task
+    if "SUBWRITE" in last:
+        return '<tool_call>{"name": "write_file", "arguments": {"path": "sub.txt", "content": "from the subagent"}}</tool_call>'
     if "TWOTOOLS" in last:
         # two calls in ONE reply: the second approval is where the stdin
         # handover used to race and hang the turn

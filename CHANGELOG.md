@@ -11,6 +11,16 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - `--serve` carries studio's tidier menu (a folder holds its chats) and the home-screen icon that survives a tinted home screen
 
 ### added
+- several hakos on one session, each with its own model: each knows the others are there (`:agents`), and each is named for its model (claude, gpt, sho, numbered when two match). a second hako in a folder starts its own chat and says so; `:join` puts it on the other's chat, so two share one only when asked
+- `GET /api/agents` lists the hakos on the session (caps `agents`), for studio
+- memory notes say which hako (and model) saved them, and a note one hako saves reaches the others' next turn
+- a hako never writes over a file that changed since it read it: a whole-file write or a line-number edit made from a stale read is refused and the model reads it again (an exact-snippet edit still goes through). the check and the write happen under one lock on the folder, so two hakos never write at once
+- `delegate`: a model hands a self-contained subtask to a subagent, a fresh hako on this folder with its own chat, and gets its answer back. it reads only unless you are in auto mode, cannot start another, stops after 10 minutes (`HAKO_SUB_SECS`) or at ctrl-c, and never changes the folder's saved state
+- `:say <text>`: a line for the people on the chat; no model is sent it or answers it
+- a linked device cannot `:join` the terminal's chat to another one
+- ctrl-c stops a running `run_shell` command at once (and a subagent, which runs the same way): it ran on to its deadline
+- `@name <text>` sends a line to another hako on the session, and `@` completes only the ones that are live; the answer shows where it was asked. a line without `@` goes to this hako's own model, or wherever `:route <name>` points it (so several people can share one model); `:as <name>` renames this one
+- each model hears what the others said since its last turn, and every row of the session log says which hako wrote it and who a line was for
 - hako.wasm holds up to 8 remote sessions at once (`hkw_use`, `hkw_drop`), so a studio window keeps every code session it opened connected; a page that never picks one has slot 0, as before
 - `:mode auto` works with remote on, from any linked device: it is said in the terminal, logged, never saved, and ends when remote turns off
 

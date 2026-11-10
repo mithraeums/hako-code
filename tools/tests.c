@@ -138,6 +138,8 @@ static void diff_tests(void) {
 	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", root); if (system(cmd)) {} }
 }
 
+static void *shell_ctrl_c(void *a) { (void)a; usleep(400000); E.interrupt = 1; return NULL; }
+
 /* --- shell timeout: the cap has to be real on every platform, not only where
    coreutils `timeout` happens to exist --- */
 static void shell_tests(void) {
@@ -174,6 +176,20 @@ static void shell_tests(void) {
 	/* exit status survives the capture */
 	r = hkRunShellCapture("exit 3", 4096, 5);
 	ckstr(r, "exit code 3", "a silent failing command reports its exit code");
+	free(r);
+
+	/* ctrl-c stops a running command (and a subagent, which runs this way): it waited out the deadline */
+	t0 = hk_time_ms();
+	{
+		pthread_t th;
+		pthread_create(&th, NULL, shell_ctrl_c, NULL);
+		r = hkRunShellCapture("sleep 30", 4096, 20);
+		pthread_join(th, NULL);
+	}
+	dt = hk_time_ms() - t0;
+	E.interrupt = 0;
+	ckstr(r, "stopped: the user pressed ctrl-c", "ctrl-c stops a running command, and says so");
+	ck(dt < 5000, "at once, not at its deadline");
 	free(r);
 
 	/* the ceiling holds even when the model asks for more */
@@ -943,6 +959,78 @@ static void todo_tests(void) {
 	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", dir); if (system(cmd)) {} }
 }
 
+/* --- one writer at a time: a hako does not write over a file that changed since
+   it read it (another hako, or the user), and two never write at once --- */
+static void guard_tests(void) {
+	char tmpl[] = "/tmp/hakoguardXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	if (!dir) { printf("FAIL guard mkdtemp\n"); fails++; return; }
+	char cmd[512], proj[PATH_MAX], f[PATH_MAX + 16];
+	char *keep = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+	setenv("HOME", dir, 1);
+	snprintf(proj, sizeof proj, "%s/work", dir);
+	snprintf(cmd, sizeof cmd, "mkdir -p %s", proj);
+	if (system(cmd)) {}
+	if (chdir(proj)) {}
+	hkGrantProjectTrust();
+	E.ai_auto_approve = 1;
+	snprintf(f, sizeof f, "%s/notes.txt", proj);
+	hk_fs_write(f, "one\ntwo\nthree\n", 14, 0);
+
+	char *r = hkExecTool("read_file", "{\"path\":\"notes.txt\"}"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"one\\ntwo\\nthree\\nfour\\n\"}");
+	ckstr(r, "wrote", "a write after this hako's own read goes through"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"one\\ntwo\\nthree\\nfour\\nfive\\n\"}");
+	ckstr(r, "wrote", "and after its own write, without reading again"); free(r);
+
+	hk_fs_write(f, "ONE (theirs)\n", 13, 0);                  /* another hako changes it */
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"mine\\n\"}");
+	ckstr(r, "changed since you last read it", "a whole-file write over a change made since is refused");
+	free(r);
+	char *now = hkReadFileAll(f, 4096);
+	ck(now && !strcmp(now, "ONE (theirs)\n"), "and the other's change is kept"); free(now);
+	r = hkExecTool("edit_lines", "{\"path\":\"notes.txt\",\"start\":1,\"new\":\"mine\"}");
+	ckstr(r, "changed since you last read it", "so is a line-number edit"); free(r);
+	r = hkExecTool("edit_file", "{\"path\":\"notes.txt\",\"old\":\"ONE (theirs)\",\"new\":\"ONE (theirs, then mine)\"}");
+	ckstr(r, "wrote", "an edit of an exact snippet that is still there goes through"); free(r);
+	hk_fs_write(f, "changed again\n", 14, 0);
+	r = hkExecTool("read_file", "{\"path\":\"notes.txt\"}"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"mine, on what it holds\\n\"}");
+	ckstr(r, "wrote", "read again, the write goes through"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"fresh.txt\",\"content\":\"new\\n\"}");
+	ckstr(r, "new file", "a file this hako never read is written as before"); free(r);
+
+	/* the lock: while another holds the folder's write lock, a write waits for it */
+	char dirst[PATH_MAX], lk[PATH_MAX + 16];
+	if (hkProjectStateDir(dirst, sizeof dirst)) {
+		snprintf(lk, sizeof lk, "%s/write.lock", dirst);
+		int pfd[2];
+		if (pipe(pfd) == 0) {
+			pid_t c = fork();
+			if (c == 0) {
+				int fd = open(lk, O_RDWR | O_CREAT, 0600);
+				flock(fd, LOCK_EX);
+				if (write(pfd[1], "x", 1) < 0) {}
+				usleep(900000);
+				_exit(0);
+			}
+			char x;
+			if (read(pfd[0], &x, 1) < 0) {}
+			long t0 = hk_time_ms();
+			r = hkExecTool("write_file", "{\"path\":\"fresh.txt\",\"content\":\"after the other\\n\"}");
+			long waited = hk_time_ms() - t0;
+			ckstr(r, "wrote", "a write while another hako writes still lands");
+			ck(waited >= 600, "after the other one is done: the two never write at once");
+			free(r);
+			waitpid(c, NULL, 0);
+			close(pfd[0]); close(pfd[1]);
+		}
+	}
+	E.ai_auto_approve = 0;
+	if (keep) { setenv("HOME", keep, 1); free(keep); } else unsetenv("HOME");
+	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", dir); if (system(cmd)) {} }
+}
+
 /* --- memory: the thing that makes it grow across sessions. Project beats
    global, and it rides in the system prompt so compaction cannot lose it. --- */
 static void memory_tests(void) {
@@ -1003,6 +1091,32 @@ static void memory_tests(void) {
 	ck(system(cmd) != 0, "a global memory does NOT land in the project directory");
 	snprintf(cmd, sizeof(cmd), "test -f %s/.hako/memory/editor-pref.md", dir);
 	ck(system(cmd) == 0, "a global memory lands under HOME");
+
+	/* several hakos share one memory: each note says which saved it */
+	snprintf(hk_agent_name, sizeof hk_agent_name, "sho");
+	r = hkExecTool("remember", "{\"title\":\"Test runner\",\"text\":\"Run make test before a push.\"}");
+	free(r);
+	{
+		char p[PATH_MAX];
+		snprintf(p, sizeof p, "%s/.hako/memory/test-runner.md", proj);
+		char *b = hkReadFileAll(p, 4096);
+		ck(b && !strncmp(b, "<!-- by sho \xC2\xB7 ", 15) && strstr(b, "-->\nRun make test before a push."), "a note's first line says which hako saved it, with its model");
+		free(b);
+	}
+	int mc = 0;
+	char *mem = hkMemCollect(&mc);
+	ckstr(mem, "(project, from sho) Run make test before a push.", "the model is told who saved a note");
+	cknot(mem, "<!--", "and never sees the marker itself");
+	ckstr(mem, "(project) This project builds with make all", "a note from before keeps its plain label");
+	free(mem);
+	snprintf(hk_agent_name, sizeof hk_agent_name, "gpt");
+	r = hkExecTool("remember", "{\"title\":\"Test runner\",\"text\":\"Run make check, it runs the tests too.\"}");
+	free(r);
+	mem = hkMemCollect(&mc);
+	ckstr(mem, "(project, from gpt) Run make check", "another hako's update to a note says it is from that one");
+	cknot(mem, "make test before a push", "and replaces the old text");
+	free(mem);
+	hk_agent_name[0] = '\0';
 
 	/* a slug cannot escape the directory */
 	r = hkExecTool("remember", "{\"title\":\"../../etc/passwd\",\"text\":\"nope\"}");
@@ -1508,7 +1622,8 @@ static void rc_unified_tests(void) {
 	{
 		int was = hs_attached;
 		hs_attached = 1;
-		ck(hkSlashRefusedRemote(":resume abc123") && hkSlashRefusedRemote(":session new") && hkSlashRefusedRemote(":sessions clear all"),
+		ck(hkSlashRefusedRemote(":resume abc123") && hkSlashRefusedRemote(":session new") && hkSlashRefusedRemote(":sessions clear all")
+		   && hkSlashRefusedRemote(":join sho2") && !hkSlashRefusedRemote(":say hi") && !hkSlashRefusedRemote(":agents"),
 		   "remote on: a device cannot switch the terminal's chat, start another or clear the past ones");
 		ck(!hkSlashRefusedRemote(":session") && !hkSlashRefusedRemote(":sessions") && !hkSlashRefusedRemote(":clear"),
 		   "remote on: but can see this chat, and clear it");
@@ -3017,6 +3132,7 @@ int main(int argc, char **argv) {
 	tap_parse_tests();
 	todo_tests();
 	memory_tests();
+	guard_tests();
 	render_tests();
 	orient_tests();
 	orphan_tool_close_tests();

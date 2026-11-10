@@ -2954,6 +2954,8 @@ static void hkApplyProviderAlias(const char *val);
 static int hkProjectTrusted(void);
 static int hkGrantProjectTrust(void);
 static void hkSaveSession(void);
+static int clOwnPath(char *out, size_t cap);
+static char *hkToolDelegate(const char *input_json);
 static void hkLoadSession(void);
 static void hkGenSessionId(void);
 static void hkRestoreTerm(void);
@@ -3507,6 +3509,8 @@ static void clWinchInstall(void) {
 static char *cl_preset_input = NULL;
 static char *aiExtractResponse(const char *json, enum aiProviderType type, int *is_err);
 static char *hkExecTool(const char *name, const char *input_json);
+static void hkSeenSet(const char *full);
+static int hkCloexec(int fd);
 static char *hkExtractContentArray(const char *response);
 static char *hkExtractRawJsonArray(const char *src, const char *key);
 static void  hkMcpInit(void);
@@ -4232,12 +4236,13 @@ static char *hkRunShellCapture(const char *cmd, long max_bytes, int timeout_s) {
 	setpgid(pid, pid);
 	close(pfd[1]);
 	char *out = NULL; size_t olen = 0, ocap = 0;
-	int timed_out = 0;
+	int timed_out = 0, stopped = 0;
 	long deadline = began + (long)timeout_s * 1000;
 	for (;;) {
 		long now = hk_time_ms();
 		long left = timed_out ? 200 : deadline - now;
 		if (!timed_out && left <= 0) { kill(-pid, SIGKILL); timed_out = 1; continue; }
+		if (!timed_out && E.interrupt) { kill(-pid, SIGKILL); timed_out = stopped = 1; continue; }   /* ctrl-c */
 		struct pollfd pf = { pfd[0], POLLIN, 0 };
 		int pr = poll(&pf, 1, (int)(left > 1000 ? 1000 : left));
 		if (pr < 0) { if (errno == EINTR) continue; break; }
@@ -4283,6 +4288,15 @@ static char *hkRunShellCapture(const char *cmd, long max_bytes, int timeout_s) {
 	if (out && !*out) { free(out); out = NULL; }
 #endif
 
+#ifndef _WIN32
+	if (stopped) {
+		size_t have = out ? strlen(out) : 0;
+		char *e = malloc(have + 96);
+		if (e) snprintf(e, have + 96, "%s%serror: stopped: the user pressed ctrl-c", out ? out : "", (have && out[have-1] != '\n') ? "\n" : "");
+		free(out);
+		return e ? e : strdup("error: stopped");
+	}
+#endif
 	/* SIGKILL from the watchdog is 128+9, but a command can be killed for other
 	   reasons; the elapsed time is what distinguishes our deadline from theirs. */
 	if (rc == 137 && took >= (long)timeout_s * 1000 - 250) {
@@ -5577,30 +5591,28 @@ static clCred *clCredsUpsert(const char *provider) {
 	return c;
 }
 
-/* One process at a time across every hako. -1 where there is no flock: the browser's
-   one worker, Windows. The fd must not reach a child, or the lock outlives the call. */
-static int clCredsLockTake(const char *suffix) {
+/* One process at a time across every hako, on a lock file. -1 where there is no
+   flock: the browser's one worker, Windows. The fd must not reach a child, or the
+   lock outlives the call. */
+static int hkLockTake(const char *path) {
 #if defined(LOCK_EX) && !defined(HAKO_WASM) && !defined(_WIN32)
-	char path[680], base[640]; clCredsPath(base, sizeof(base));
-	if (!base[0]) return -1;
-	snprintf(path, sizeof(path), "%s%s", base, suffix);
 	int fd = open(path, O_WRONLY | O_CREAT, 0600);
 	if (fd < 0) return -1;
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
 	while (flock(fd, LOCK_EX) != 0 && errno == EINTR) {}
 	return fd;
 #else
-	(void)suffix;
+	(void)path;
 	return -1;
 #endif
 }
+static void hkLockDrop(int fd) { if (fd >= 0) close(fd); }
 
-static void clCredsLockDrop(int fd) {
-#if defined(LOCK_EX) && !defined(HAKO_WASM) && !defined(_WIN32)
-	if (fd >= 0) close(fd);
-#else
-	(void)fd;
-#endif
+static int clCredsLockTake(const char *suffix) {
+	char path[680], base[640]; clCredsPath(base, sizeof(base));
+	if (!base[0]) return -1;
+	snprintf(path, sizeof(path), "%s%s", base, suffix);
+	return hkLockTake(path);
 }
 
 static void clCredsLoad(void);
@@ -5645,7 +5657,7 @@ static void clCredsSave(void) {
 	clCredsLoad();
 	int changed = cl_creds_old_format;
 	for (int i = 0; i < cl_creds_n; i++) if (cl_creds[i].dirty) changed = 1;
-	if (!changed) { clCredsLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
+	if (!changed) { hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
 	if (cl_creds_unreadable) {
 		/* not readable by this build: keep it, it may hold logins */
 		char keep[680];
@@ -5655,7 +5667,7 @@ static void clCredsSave(void) {
 	}
 	size_t cap = 4096, len = 0;
 	char *plain = malloc(cap);
-	if (!plain) { clCredsLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
+	if (!plain) { hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
 	for (int i = 0; i < cl_creds_n; i++) {
 		clCred *c = &cl_creds[i];
 		if (!c->api_key && !c->oauth_refresh) continue;
@@ -5673,12 +5685,12 @@ static void clCredsSave(void) {
 	clXorBuf((unsigned char *)plain, len, key);
 	char *b64 = clB64Encode((unsigned char *)plain, len);
 	free(plain);
-	if (!b64) { clCredsLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
+	if (!b64) { hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
 	/* magic line, then base64 wrapped at 72 columns */
 	size_t blen = strlen(b64);
 	size_t outcap = blen + blen / 72 + 128, outlen = 0;
 	char *out = malloc(outcap);
-	if (!out) { free(b64); clCredsLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
+	if (!out) { free(b64); hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
 	outlen += (size_t)snprintf(out, outcap, "%s\n", CL_CREDS_MAGIC);
 	for (size_t i = 0; i < blen; i += 72) {
 		size_t n = blen - i; if (n > 72) n = 72;
@@ -5693,7 +5705,7 @@ static void clCredsSave(void) {
 #endif
 	for (int i = 0; i < cl_creds_n; i++) cl_creds[i].dirty = 0;
 	cl_creds_old_format = 0;
-	clCredsLockDrop(lock);
+	hkLockDrop(lock);
 	pthread_mutex_unlock(&cl_creds_mu);
 }
 
@@ -5930,7 +5942,11 @@ static void hkWriteSessionFile(const char *path, int include_secrets) {
 #endif
 }
 
+/* A subagent (the delegate tool): its own chat, and the folder's state is not its to change. */
+static int hk_subagent;
+
 static void hkSaveSession(void) {
+	if (hk_subagent) return;
 	char dir[512];
 	hkClawDirPath(dir, sizeof(dir));
 	if (dir[0]) {
@@ -6082,7 +6098,12 @@ static void hkLoadSession(void) {
 	}
 }
 
-static void hkLogMessage(const char *role, const char *content) {
+/* This hako's name among the hakos on its session (agents, below), "" when it is
+   the only kind of front end that has none (--pipe, --serve). Rows say who wrote
+   them ("by") and, for a line sent to another hako, who it is for ("to"). */
+static char hk_agent_name[24];
+
+static void hkLogMessageTo(const char *role, const char *content, const char *to) {
 	char path[PATH_MAX];
 	hkSessionLogPath(path, sizeof(path));
 	if (!path[0]) return;
@@ -6091,16 +6112,20 @@ static void hkLogMessage(const char *role, const char *content) {
 	char *esc = malloc(cap);
 	if (!esc) return;
 	hkJsonEscapeInto(content ? content : "", esc, cap);
-	size_t lcap = (size_t)cap + 128;
+	size_t lcap = (size_t)cap + 192;
 	char *line = malloc(lcap);
 	if (line) {
-		int n = snprintf(line, lcap, "{\"ts\":%ld,\"role\":\"%s\",\"content\":\"%s\"}\n",
-		                 hk_time_unix(), role, esc);
+		char who[80] = "";
+		if (hk_agent_name[0]) hkCatf(who, 0, sizeof who, ",\"by\":\"%s\"", hk_agent_name);
+		if (to && *to) hkCatf(who, strlen(who), sizeof who, ",\"to\":\"%s\"", to);
+		int n = snprintf(line, lcap, "{\"ts\":%ld,\"role\":\"%s\"%s,\"content\":\"%s\"}\n",
+		                 hk_time_unix(), role, who, esc);
 		hk_fs_write(path, line, (size_t)n, 1);      /* append */
 		free(line);
 	}
 	free(esc);
 }
+static void hkLogMessage(const char *role, const char *content) { hkLogMessageTo(role, content, NULL); }
 
 /* The chat's name and color are properties of the chat: they go into its… */
 static void hkLogSessionMeta(void) {
@@ -6616,6 +6641,7 @@ static int hkBuildPrompt(aiData *data) {
 		"  edit_lines(path, start, end, new)  Replace a 1-indexed line range. Use when you know line numbers.\n"
 		"  run_shell(cmd: string)         Run non-interactive shell command. Needs trust. 10s.\n"
 		"  read_skill(skill, path)        Read a file inside an installed skill.\n"
+		"  delegate(task, model)          Hand a self-contained subtask to a subagent; you get its answer.\n"
 		"\n"
 		"Tool names are EXACTLY as listed above. Do NOT invent names like `bash`, `create_file`, `list_files`, `view`, `Write`, `Read`, `LS`, `Bash` — those will be silently remapped but you should use the canonical names. `write_file` REQUIRES both `path` AND `content` params; never call it with path alone. To fix an existing file, prefer `edit_file`/`edit_lines` over rewriting it with `write_file`.\n"
 		"\n"
@@ -8708,13 +8734,25 @@ static char *hkMemCollect(int *out_count) {
 			char *body = hkReadFileAll(path, HK_MEM_MAX_FILE);
 			if (!body) continue;
 			if (len < HK_MEM_INLINE) {
+				/* who saved it, from its first line: several hakos on one folder share one memory */
+				char from[64] = "";
+				char *text = body;
+				if (!strncmp(body, "<!-- by ", 8)) {
+					char *end = strstr(body, "-->");
+					size_t i = 0;
+					for (const char *q = body + 8; *q && *q != ' ' && q < (end ? end : q) && i + 1 < sizeof from; q++) from[i++] = *q;
+					from[i] = '\0';
+					text = end ? end + 3 : body;
+					while (*text == '\n' || *text == ' ') text++;
+					if (!strcmp(from, "hako")) from[0] = '\0';      /* saved with no name on a session */
+				}
 				char head[256];
-				int k = snprintf(head, sizeof(head), "\n- (%s) ", g ? "global" : "project");
+				int k = snprintf(head, sizeof(head), "\n- (%s%s%s) ", g ? "global" : "project", from[0] ? ", from " : "", from);
 				hkSbAdd(&buf, &len, &cap, head, (size_t)k);
 				/* Trim trailing whitespace so the list stays one item per line. */
-				size_t bl = strlen(body);
-				while (bl && (body[bl-1] == '\n' || body[bl-1] == ' ')) body[--bl] = '\0';
-				hkSbAdd(&buf, &len, &cap, body, bl);
+				size_t bl = strlen(text);
+				while (bl && (text[bl-1] == '\n' || text[bl-1] == ' ')) text[--bl] = '\0';
+				hkSbAdd(&buf, &len, &cap, text, bl);
 			}
 			free(body);
 			count++;
@@ -8948,6 +8986,10 @@ static const hkToolDef HK_TOOLS[] = {
 	 "Save a durable fact so it is still known in later sessions: a decision and why, a convention this project follows, something the user told you about how they work, a trap you hit and how it was solved. One fact per call, written so it makes sense months from now. Do NOT save what the code or git already says, or anything that only matters in this conversation. Pass 'text' and a short 'title'. Set 'global' to 1 for something true everywhere, otherwise it is remembered for this project only.",
 	 "\"text\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"global\":{\"type\":\"integer\"}",
 	 "\"text\""},
+	{"delegate",
+	 "Hand one self-contained subtask to a subagent: a fresh hako with its own context, on this folder, which works on it and returns its answer to you. Use it for a side investigation (find where something is defined, read a large area and summarize it) so your own context stays clear. Say everything it needs in 'task'; it cannot see this conversation. It may read and search; it changes files only when you are in auto mode. Optional 'model' picks another model of this provider for it. A subagent cannot start another one.",
+	 "\"task\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"}",
+	 "\"task\""},
 	{"todo",
 	 "Record or update your plan for a multi-step task, so it survives even if the conversation is compacted. Pass 'items' as plain text, one step per line, each starting with [ ] for pending or [x] for done. Send the WHOLE list every time — it replaces the previous one. Update it as you finish steps. Use it for any task with more than about three steps.",
 	 "\"items\":{\"type\":\"string\"}",
@@ -9268,6 +9310,15 @@ static int hsAttachSettleChoice(int pick, const char **items, int n);
 static int hsAttachOn(void);
 static void hsAttachOff(void);
 static int hkInjectTake(char *out, size_t cap);
+enum { HK_IN_REMOTE = 1, HK_IN_AGENT = 2 };
+static int hkInjectPushKind(const char *line, int kind);
+static void hkAgentsTick(aiData *data);
+static void hkAgentsBusy(int busy);
+static int hkAgentsRoute(aiData *data, char *line, size_t cap);
+static char *hkAgentsPrompt(const char *line);
+static int hkAgentsNames(char out[][160], int max, const char *pfx, size_t plen);
+static int hkAgentsCmd(aiData *data, const char *cmd, int cmdlen, const char *arg);
+static void hkAgentsAtStart(aiData *data);
 static void hsAttachInfo(int *port, const char **token);
 static void hsAttachSetPort(int port);
 static int hrStart(void);
@@ -9296,12 +9347,13 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 	else if (strcmp(name, "edit_file")  == 0) kind = ALLOW_WRITE;
 	else if (strcmp(name, "edit_lines") == 0) kind = ALLOW_WRITE;
 	else if (strcmp(name, "run_shell")  == 0) kind = ALLOW_SHELL;
+	else if (strcmp(name, "delegate")   == 0) kind = ALLOW_SHELL;      /* it can run tools of its own */
 	else if (strcmp(name, "web_fetch")  == 0) kind = ALLOW_NET;
 	else                                      kind = ALLOW_READ;
 
 	char *subject = NULL;
 	if (kind == ALLOW_SHELL) {
-		subject = hkJsonFirst(input_json, "cmd", "command", "shell", "script", NULL);
+		subject = hkJsonFirst(input_json, "cmd", "command", "shell", "script", "task", NULL);
 	} else if (kind == ALLOW_NET) {
 		subject = hkJsonFirst(input_json, "url", "uri", NULL);
 	} else {
@@ -9582,6 +9634,7 @@ static char *hkWriteResolved(const char *full, const char *rel, const char *cont
 	if (clen > 0 && content[clen-1] != '\n') new_lines++;
 	if (hk_fs_write(full, content, clen, 0) != 0) return strdup("error: cannot open for write");
 	size_t wrote = clen;
+	hkSeenSet(full);
 	snprintf(hk_last_write_path, sizeof(hk_last_write_path), "%s", rel);
 	char *out = malloc(256);
 	if (out) snprintf(out, 256, "wrote %zu bytes to %.150s (%d lines)", wrote, hkProjectRel(full), new_lines);
@@ -9589,6 +9642,8 @@ static char *hkWriteResolved(const char *full, const char *rel, const char *cont
 }
 
 static char *hkExecToolInner(const char *name, const char *input_json);
+static char *hkExecToolLocked(const char *name, const char *input_json);
+static char *hkExecToolRun(const char *name, const char *input_json);
 static long hkContextWindow(void);
 
 /* One tool result may take a quarter of the context window. A small local model
@@ -9722,6 +9777,66 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 		if (d) snprintf(d, 160, "error: user denied tool '%s'. Do not retry it; explain or ask the user how to proceed.", name);
 		return d ? d : strdup("error: user denied tool");
 	}
+	return hkExecToolLocked(name, input_json);
+}
+
+/* ---- one writer at a time ----
+   Several hakos (and you, in an editor) can change one folder. A whole-file write
+   or a line-number edit made from a stale read undoes the other's change, so each
+   hako keeps what each file held when it last read or wrote it, and will not write
+   over a file that changed since: the model reads it again first. edit_file needs
+   its exact snippet to still be there, a check of its own. The check and the write
+   happen under one lock on the folder, so two hakos never write at once; an
+   approval is answered before the lock is taken. */
+#define HK_SEEN_MAX 128
+static struct { char path[PATH_MAX]; uint64_t h; } hk_seen[HK_SEEN_MAX];
+static int hk_seen_next;
+
+/* 8 bytes of blake2b (the relay's crypto) over what a file, or a text, holds; 0 = nothing there */
+static uint64_t hkDigest(const char *b, size_t n) {
+	uint64_t h = 0;
+	if (b) crypto_blake2b((uint8_t *)&h, sizeof h, (const uint8_t *)b, n);
+	return b && !h ? 1 : h;
+}
+static uint64_t hkFileHash(const char *full) {
+	long n = 0;
+	char *b = hk_fs_read(full, 0, &n);
+	uint64_t h = hkDigest(b, (size_t)n);
+	free(b);
+	return h;
+}
+static int hkSeenAt(const char *full) {
+	for (int i = 0; i < HK_SEEN_MAX; i++) if (hk_seen[i].path[0] && !strcmp(hk_seen[i].path, full)) return i;
+	return -1;
+}
+static void hkSeenSet(const char *full) {
+	int i = hkSeenAt(full);
+	if (i < 0) { i = hk_seen_next; hk_seen_next = (hk_seen_next + 1) % HK_SEEN_MAX; snprintf(hk_seen[i].path, sizeof hk_seen[i].path, "%s", full); }
+	hk_seen[i].h = hkFileHash(full);
+}
+/* What to say instead of writing, or NULL: this hako read the file, and it changed since. */
+static char *hkSeenStale(const char *full) {
+	int i = hkSeenAt(full);
+	if (i < 0 || hkFileHash(full) == hk_seen[i].h) return NULL;
+	char *m = malloc(420);
+	if (m) snprintf(m, 420, "error: %.160s changed since you last read it (another hako on this folder, "
+	                "or the user, edited it). Nothing was written. read_file it again and make your change "
+	                "on what it holds now.", hkProjectRel(full));
+	return m ? m : strdup("error: the file changed since you last read it; read it again");
+}
+
+static char *hkExecToolLocked(const char *name, const char *input_json) {
+	int lk = -1;
+	char dir[PATH_MAX], p[PATH_MAX + 16];
+	if ((!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "edit_lines"))
+	    && hkProjectStateDir(dir, sizeof dir) && hkFmtFits(p, sizeof p, "%s/write.lock", dir) && hk_fs_mkdirp(dir) == 0)
+		lk = hkLockTake(p);
+	char *r = hkExecToolRun(name, input_json);
+	hkLockDrop(lk);
+	return r;
+}
+
+static char *hkExecToolRun(const char *name, const char *input_json) {
 	if (strncmp(name, "mcp", 3) == 0) {
 		const char *q = hkMcpResolveName(name);
 		if (q) return hkMcpCallTool(q, input_json);
@@ -9743,6 +9858,7 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 		}
 		char *c = hkReadFileAll(full, HK_READ_MAX);
 		if (!c) return strdup("error: cannot read");
+		hkSeenSet(full);                               /* what it held when this model read it */
 		if (!*c) { free(c); return strdup("(the file exists and is empty — 0 bytes)"); }
 		/* Truncation used to be SILENT: the model got the first 100 KB of a
 		   large file with nothing to say so, and would then "edit" or rewrite
@@ -9797,6 +9913,7 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 	if (strcmp(name, "ask_user") == 0) {
 		return hkToolAskUser(input_json);
 	}
+	if (strcmp(name, "delegate") == 0) return hkToolDelegate(input_json);
 	if (strcmp(name, "remember") == 0) {
 		char *raw = hkJsonFirst(input_json, "text", "fact", "content", "memory", NULL);
 		if (!raw) return strdup("error: missing text");
@@ -9820,7 +9937,21 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 		}
 		size_t tl = strlen(text);
 		if (tl > HK_MEM_MAX_FILE) tl = HK_MEM_MAX_FILE;
-		int rc = hk_fs_write(path, text, tl, 0);
+		/* who saved it: the hako (named on its session), its model, the day */
+		char prov[256], day[16] = "";
+		time_t now = (time_t)hk_time_unix();
+		struct tm *tmv = localtime(&now);       /* plain C: windows and wasm have no _r */
+		if (tmv) strftime(day, sizeof day, "%Y-%m-%d", tmv);
+		int pl = snprintf(prov, sizeof prov, "<!-- by %s \xC2\xB7 %s %s \xC2\xB7 %s -->\n",
+		                  hk_agent_name[0] ? hk_agent_name : "hako", hkProviderLabel(), E.ai_model ? E.ai_model : "", day);
+		char *whole = malloc((size_t)pl + tl + 1);
+		int rc = -1;
+		if (whole) {
+			memcpy(whole, prov, (size_t)pl);
+			memcpy(whole + pl, text, tl);
+			rc = hk_fs_write(path, whole, (size_t)pl + tl, 0);
+			free(whole);
+		}
 		free(text); free(title);
 		if (rc != 0) return strdup("error: cannot write memory");
 		hkPromptInvalidate();
@@ -9945,6 +10076,8 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 			free(path); free(content);
 			return out ? out : strdup("no change: already applied");
 		}
+		char *stale = hkSeenStale(full);
+		if (stale) { free(path); free(content); return stale; }
 		size_t clen = strlen(content);
 		int new_lines = 0;
 		for (size_t i = 0; i < clen; i++) if (content[i] == '\n') new_lines++;
@@ -9966,6 +10099,7 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 			return strdup("error: cannot open for write");
 		}
 		size_t wrote = clen;
+		hkSeenSet(full);
 		snprintf(hk_last_write_path, sizeof(hk_last_write_path), "%s", path);
 		char *out = malloc(256);
 		if (old_size < 0)
@@ -10061,6 +10195,8 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 			free(path); free(new_raw);
 			return strdup("error: path outside project");
 		}
+		char *stale = hkSeenStale(full);                /* line numbers from a stale read land on the wrong lines */
+		if (stale) { free(path); free(new_raw); return stale; }
 		char *news = hkJsonUnescape(new_raw, (int)strlen(new_raw)); free(new_raw);
 		char *buf  = news ? hkReadFileAll(full, 4 * 1024 * 1024) : NULL;
 		if (!news || !buf) { free(path); free(news); free(buf); return strdup("error: cannot read file / bad escapes in new"); }
@@ -14733,6 +14869,11 @@ static const hkCmd HK_CMDS[] = {
 	{ "use",       ':', "skill",    "<skill|none>",    "a skill as a mode (= /<skill>)",   0 },
 	{ "memory",    ':', "app",      "[forget <name>]", "what it remembers",                HK_CF_TURN },
 	{ "remote",    ':', "app",      "[on|off|pair]",   "use this session from a phone",    HK_CF_TURN },
+	{ "agents",    ':', "session",  "",                "the hakos on this session",        HK_CF_TURN },
+	{ "as",        ':', "session",  "<name>",          "this hako's name on the session",  HK_CF_TURN },
+	{ "route",     ':', "session",  "[name|off]",      "who answers a line without @",     HK_CF_TURN },
+	{ "join",      ':', "session",  "[name|chat]",     "work on another hako's chat",      HK_CF_TURN },
+	{ "say",       ':', "session",  "<text>",          "a line for the people here, no model answers", HK_CF_TURN },
 	{ "mcp",       ':', "app",      "[reload]",        "MCP servers",                      HK_CF_TURN },
 	{ "e",         ':', "app",      "[editor]",        "write the next message in $EDITOR", HK_CF_TURN | HK_CF_TTY },
 	{ "o",         ':', "app",      "",                "the last tool output in full",     HK_CF_TURN },
@@ -15819,6 +15960,9 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		aiSayf(data, "using '%s' — its instructions apply to every reply until :use none", arg);
 		return 1;
 	}
+#if HK_ATTACH
+	if (hkAgentsCmd(data, cmd, cmdlen, arg)) return 1;
+#endif
 	if (strncmp(cmd, "remote", cmdlen) == 0 && cmdlen == 6) {
 #ifdef HAKO_WASM
 		aiAddHistory(data, "remote access needs the native hako — run :remote in a terminal");
@@ -16956,6 +17100,9 @@ static int clCompletions(const char *buf, int len, int *wstart,
 	int n = 0;
 
 	if (wlen == 0 && !(len > 0 && (buf[0] == ':' || buf[0] == '/'))) return 0;
+#if HK_ATTACH
+	if (ws == 0 && word[0] == '@') return hkAgentsNames(out, max, word, wlen);   /* the hakos live on this session */
+#endif
 
 	if ((buf[0] == ':' || buf[0] == '/') && ws == 0) {
 		*wstart = 1;
@@ -18668,7 +18815,7 @@ static int clOAuthRefresh(aiData *data) {
 	         && (!E.ai_oauth_expires_at || hk_time_unix() < E.ai_oauth_expires_at)) rc = 0;
 	else rc = clOAuthRefreshNow(data);
 	free(was);
-	clCredsLockDrop(lock);
+	hkLockDrop(lock);
 	return rc;
 }
 
@@ -18704,6 +18851,74 @@ static int clOwnPath(char *out, size_t cap) {
 #else
 	(void)out; (void)cap;
 	return -1;
+#endif
+}
+
+/* ---- subagents: the delegate tool ----
+   The task goes to `hako -p - --output-format json` in this folder, run the way
+   run_shell runs a command (its own process group, a deadline, a capped capture,
+   ctrl-c stops it): a fresh chat of its own, logged as one so it can be read later,
+   named for this hako, and it never saves the folder's state. It may not start
+   another; it stops past HAKO_SUB_SECS (600 s, the shell's most). It reads and
+   searches, and changes files only when this hako is in auto mode, since nobody is
+   at its terminal to approve a change. */
+static char *hkToolDelegate(const char *input_json) {
+#if defined(_WIN32) || defined(HAKO_WASM)
+	(void)input_json;
+	return strdup("error: subagents need the native hako on macOS, Linux or BSD");
+#else
+	if (hk_subagent) return strdup("error: a subagent cannot start another one. Do the work yourself, or say what is left.");
+	char *raw = hkJsonFirst(input_json, "task", "prompt", "text", "instructions", NULL);
+	char *task = raw ? hkJsonUnescape(raw, (int)strlen(raw)) : NULL;
+	free(raw);
+	if (!task || !*task) { free(task); return strdup("error: delegate needs 'task': everything the subagent needs to know"); }
+	char *mraw = hkExtractJsonString(input_json, "model");
+	char *model = mraw ? hkJsonUnescape(mraw, (int)strlen(mraw)) : NULL;
+	free(mraw);
+	char exe[PATH_MAX], tf[] = "/tmp/hako-task-XXXXXX";
+	int tfd = clOwnPath(exe, sizeof exe) == 0 ? mkstemp(tf) : -1;     /* the task, as the subagent's stdin */
+	size_t tl = strlen(task);
+	int ok = tfd >= 0 && write(tfd, task, tl) == (ssize_t)tl;
+	if (tfd >= 0) close(tfd);
+	free(task);
+	if (!ok) { if (tfd >= 0) unlink(tf); free(model); return strdup("error: cannot start a subagent"); }
+	char name[40];
+	snprintf(name, sizeof name, "%.16s-sub", hk_agent_name[0] ? hk_agent_name : "hako");
+	int autom = hkAutoNow(), secs = getenv("HAKO_SUB_SECS") ? atoi(getenv("HAKO_SUB_SECS")) : 600;
+	/* one command line; each value in single quotes, a quote inside as '\'' */
+	char *cmd = NULL;
+	size_t cl = 0, cc = 0;
+	const char *part[] = { "HAKO_AGENT_DEPTH=1 HAKO_UPDATE_CHECK=0 HAKO_AGENT_NAME=", name, " HAKO_SUB_MODE=", autom ? "auto" : "plan",
+	                       model && *model ? " HAKO_MODEL=" : NULL, model, " ", exe, " -p - --output-format json --no-color <", tf, " 2>/dev/null" };
+	for (size_t i = 0; i < sizeof part / sizeof part[0]; i++) {
+		if (!part[i]) { i++; continue; }               /* no model: skip its name and value */
+		if (i % 2 == 0) { hkSbAdd(&cmd, &cl, &cc, part[i], strlen(part[i])); continue; }
+		hkSbAdd(&cmd, &cl, &cc, "'", 1);
+		for (const char *q = part[i]; *q; q++) hkSbAdd(&cmd, &cl, &cc, *q == '\'' ? "'\\''" : q, *q == '\'' ? 4 : 1);
+		hkSbAdd(&cmd, &cl, &cc, "'", 1);
+	}
+	long t0 = hk_time_ms();
+	char *out = cmd ? hkRunShellCapture(cmd, 1 << 20, secs > 0 ? secs : 600) : NULL;
+	free(cmd);
+	unlink(tf);
+	long took = (hk_time_ms() - t0 + 500) / 1000;
+	char head[200];
+	snprintf(head, sizeof head, "subagent %s (%s %s, %s, %lds)", name, hkProviderLabel(),
+	         model && *model ? model : (E.ai_model ? E.ai_model : ""), autom ? "auto" : "read only", took);
+	free(model);
+	char *resp = out ? hkExtractJsonString(out, "response") : NULL;
+	char *err = !resp && out ? hkExtractJsonString(out, "error") : NULL;
+	const char *why = !out ? NULL : strstr(out, "error: stopped:") ? "you pressed ctrl-c"
+	                : strstr(out, "error: command timed out") ? "it ran past its time limit" : NULL;
+	free(out);
+	char *body = resp ? hkJsonUnescape(resp, (int)strlen(resp)) : err ? hkJsonUnescape(err, (int)strlen(err)) : NULL;
+	free(resp); free(err);
+	size_t n = (body ? strlen(body) : 0) + strlen(head) + 160;
+	char *res = malloc(n);
+	if (res && why && !body) snprintf(res, n, "%s: stopped, %s. Nothing it found came back; do it yourself or give it a smaller task.", head, why);
+	else if (res) snprintf(res, n, "%s%s\n%s", head, body ? (resp ? ":" : " failed:") : " returned nothing", body ? body : "");
+	free(body);
+	return res ? res : strdup("error: the subagent's answer was lost");
 #endif
 }
 
@@ -20012,7 +20227,7 @@ static int hkSlashRefusedRemote(const char *cmd) {
 	   switch it to another, start a new one or delete the past ones. A headless
 	   --serve has no terminal, and there the page picks */
 	if (hs_attached) {
-		static const char *chats[] = { "resume", "session new", "sessions clear", NULL };
+		static const char *chats[] = { "resume", "session new", "sessions clear", "join", NULL };
 		for (int i = 0; chats[i]; i++) {
 			size_t n = strlen(chats[i]);
 			if (!strncmp(cmd, chats[i], n) && (!cmd[n] || cmd[n] == ' ')) return 1;
@@ -20987,6 +21202,9 @@ static void hsServeState(int fd, const char *req) {
 		hsPut(&b, caps[i]);
 		hsPut(&b, "\"");
 	}
+#if HK_ATTACH
+	hsPut(&b, ",\"agents\"");                 /* GET /api/agents: the hakos on this session */
+#endif
 	hsPut(&b, "]");
 	{   /* §4: session_name, theme (?for=studio asks for the studio's), slots, voice, update, commands */
 		char forw[16];
@@ -21098,26 +21316,571 @@ static char *hs_inject[HS_INJECT_MAX];
 static int hs_inject_n;
 static pthread_mutex_t hs_inject_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void hsInjectPush(const char *line) {
+/* kind: HK_IN_REMOTE (a linked device) or HK_IN_AGENT (another hako on this session) */
+static int hkInjectPushKind(const char *line, int kind) {
 	pthread_mutex_lock(&hs_inject_lock);
 	int ok = hs_inject_n < HS_INJECT_MAX;
-	if (ok) hs_inject[hs_inject_n++] = strdup(line);
+	char *e = ok ? malloc(strlen(line) + 2) : NULL;
+	if (e) { e[0] = (char)kind; strcpy(e + 1, line); hs_inject[hs_inject_n++] = e; }
 	pthread_mutex_unlock(&hs_inject_lock);
-	if (!ok) { clPipeEmitMsg("system", "16 lines are already waiting on the desktop"); return; }
+	if (!e) return 0;
 	if (hk_line_wait && g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
+	return 1;
+}
+static void hsInjectPush(const char *line) {
+	if (!hkInjectPushKind(line, HK_IN_REMOTE)) clPipeEmitMsg("system", "16 lines are already waiting on the desktop");
 }
 
+/* The next waiting line and where it came from, or 0. */
 static int hkInjectTake(char *out, size_t cap) {
 	pthread_mutex_lock(&hs_inject_lock);
-	int got = hs_inject_n > 0;
-	if (got) {
-		snprintf(out, cap, "%s", hs_inject[0]);
+	int kind = 0;
+	if (hs_inject_n > 0) {
+		kind = (unsigned char)hs_inject[0][0];
+		snprintf(out, cap, "%s", hs_inject[0] + 1);
 		free(hs_inject[0]);
 		memmove(hs_inject, hs_inject + 1, sizeof(hs_inject[0]) * (size_t)(--hs_inject_n));
 	}
 	pthread_mutex_unlock(&hs_inject_lock);
-	return got;
+	return kind;
 }
+/* ---- agents: several hakos on one session ----
+   Hakos in one folder share the session's log: two panes, two models, one chat.
+   Each says it is there with a file, <state>/agents/<session id>/<pid>: its name,
+   provider, model and whether a turn is running, so `@name` reaches only one that
+   is live and the list follows a model switch. Every row says who wrote it ("by");
+   a line for another hako also says who it is for ("to"). Each hako reads what the
+   others append: a line for it runs here as a turn, and the rest is shown and handed
+   to this model with its next turn, so each knows what was said. A line without @
+   goes to this hako's own model, or wherever :route points it. */
+#define HK_AGENTS_MAX 16
+#define HK_SHARED_MAX 16000
+typedef struct { int pid; char name[24], prov[32], model[96], state[8]; } hkAgent;
+static int hkAgentsWho(const hkAgent *a, int n, char *out, size_t cap, const char *pfx);
+static char hk_agent_file[PATH_MAX + 96];        /* ours, so a session switch moves it */
+static char hk_agent_wrote[256];                 /* what it says, so an unchanged one is not rewritten */
+static int  hk_agent_named, hk_agent_busy;
+static char hk_route[24];                        /* "" = this hako's own model */
+static long hk_tail_off = -1;                    /* how much of the log this hako has read */
+static char hk_tail_sid[24];
+static char *hk_shared;                          /* what the others said since this model's last turn */
+static char hk_tail_path[PATH_MAX];              /* the log, for the watcher thread */
+static pthread_mutex_t hk_tail_lock = PTHREAD_MUTEX_INITIALIZER;
+static int hk_tail_thread;
+
+/* <state>/agents, or <state>/agents/<sid>: beside sessions/, which holds logs only */
+static int hkAgentsDirFor(const char *sid, char *out, size_t cap) {
+	char dir[PATH_MAX];
+	if (!hkProjectStateDir(dir, sizeof dir)) return 0;
+	return sid ? hkFmtFits(out, cap, "%s/agents/%s", dir, sid) : hkFmtFits(out, cap, "%s/agents", dir);
+}
+static int hkAgentsDir(char *out, size_t cap) { return E.session_id && hkAgentsDirFor(E.session_id, out, cap); }
+
+/* A name here: 1 to 16 of a-z, 0-9 and '-', starting with a letter. */
+static int hkAgentNameOk(const char *s) {
+	size_t n = strlen(s);
+	if (n < 1 || n > 16 || !islower((unsigned char)s[0])) return 0;
+	for (size_t i = 0; i < n; i++) if (!islower((unsigned char)s[i]) && !isdigit((unsigned char)s[i]) && s[i] != '-') return 0;
+	return 1;
+}
+
+/* The live hakos on a session (sid, or this one's), this one included. A file
+   whose process is gone goes. */
+static int hkAgentsListFor(const char *sid, hkAgent *out, int max) {
+	char dir[PATH_MAX + 64];
+	if (sid ? !hkAgentsDirFor(sid, dir, sizeof dir) : !hkAgentsDir(dir, sizeof dir)) return 0;
+	DIR *d = opendir(dir);
+	if (!d) return 0;
+	int n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) && n < max) {
+		int pid = atoi(e->d_name);
+		if (pid <= 0 || strspn(e->d_name, "0123456789") != strlen(e->d_name)) continue;
+		char p[PATH_MAX + 96];
+		if (!hkFmtFits(p, sizeof p, "%s/%s", dir, e->d_name)) continue;
+		if (pid != (int)getpid() && kill(pid, 0) != 0 && errno == ESRCH) { unlink(p); continue; }
+		char *b = hk_fs_read(p, 512, NULL);
+		if (!b) continue;
+		hkAgent a;
+		memset(&a, 0, sizeof a);
+		a.pid = pid;
+		char *f[4] = { a.name, a.prov, a.model, a.state };
+		size_t fc[4] = { sizeof a.name, sizeof a.prov, sizeof a.model, sizeof a.state };
+		const char *q = b;
+		for (int i = 0; i < 4 && q; i++) {
+			const char *t = strpbrk(q, "\t\n");
+			size_t l = t ? (size_t)(t - q) : strlen(q);
+			snprintf(f[i], fc[i], "%.*s", (int)l, q);
+			q = t && *t == '\t' ? t + 1 : NULL;
+		}
+		free(b);
+		if (hkAgentNameOk(a.name)) out[n++] = a;
+	}
+	closedir(d);
+	return n;
+}
+static int hkAgentsList(hkAgent *out, int max) { return hkAgentsListFor(NULL, out, max); }
+
+/* The other chats in this folder that a live hako is on: their ids, and who is there. */
+typedef struct { char sid[24]; char who[96]; } hkAgentChat;
+static int hkAgentsChats(hkAgentChat *out, int max) {
+	char dir[PATH_MAX + 64];
+	if (!hkAgentsDirFor(NULL, dir, sizeof dir)) return 0;
+	DIR *d = opendir(dir);
+	if (!d) return 0;
+	int n = 0;
+	struct dirent *e;
+	while ((e = readdir(d)) && n < max) {
+		if (e->d_name[0] == '.' || strlen(e->d_name) >= sizeof out[0].sid) continue;
+		if (E.session_id && !strcmp(e->d_name, E.session_id)) continue;
+		hkAgent a[HK_AGENTS_MAX];
+		int k = hkAgentsListFor(e->d_name, a, HK_AGENTS_MAX);
+		if (!hkAgentsWho(a, k, out[n].who, sizeof out[n].who, "")) { char p[PATH_MAX + 96]; if (hkFmtFits(p, sizeof p, "%s/%s", dir, e->d_name)) rmdir(p); continue; }
+		snprintf(out[n].sid, sizeof out[n].sid, "%s", e->d_name);
+		n++;
+	}
+	closedir(d);
+	return n;
+}
+
+/* At start: the folder's recent chat already has a live hako on it, so this one
+   starts its own and says how to join. Two hakos share a chat only when asked. */
+static void hkAgentsAtStart(aiData *data) {
+	if (E.pipe_mode || E.serve_mode || !E.session_resumed || !E.session_id) return;
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX);
+	char who[96];
+	if (!hkAgentsWho(a, n, who, sizeof who, "")) return;
+	hkSessionFresh(data);
+	printf("  %s%s %s on this folder's recent chat, so this hako starts its own. :join works with %s.%s\n",
+	       E.color_enabled ? ANSI_DIM : "", who, strchr(who, ',') ? "are" : "is", strchr(who, ',') ? "them" : "it",
+	       E.color_enabled ? ANSI_RESET : "");
+}
+
+static int hkAgentLive(const char *name, hkAgent *a, int n) {
+	for (int i = 0; i < n; i++) if (!strcmp(a[i].name, name)) return i;
+	return -1;
+}
+
+/* The other hakos' names, "a, b" (each after pfx): how many. */
+static int hkAgentsWho(const hkAgent *a, int n, char *out, size_t cap, const char *pfx) {
+	int k = 0;
+	out[0] = '\0';
+	for (int i = 0; i < n; i++)
+		if (a[i].pid != (int)getpid()) hkCatf(out, strlen(out), cap, "%s%s%s", k++ ? ", " : "", pfx, a[i].name);
+	return k;
+}
+
+/* A name as typed (after any @), lowercased, up to a space: how much of s it took. */
+static size_t hkAgentWord(const char *s, char out[24]) {
+	size_t i = *s == '@', o = 0;
+	for (; s[i] && s[i] != ' ' && o + 1 < 24; i++) out[o++] = (char)tolower((unsigned char)s[i]);
+	out[o] = '\0';
+	return i;
+}
+
+/* The model's family is its name (claude, gpt, sho), or the provider's. */
+static void hkAgentBaseName(char *out, size_t cap) {
+	static const char *W[] = { "claude", "gpt", "deepseek", "gemini", "llama", "mistral", "grok", "qwen",
+	                           "kimi", "glm", "gemma", "phi", "sho", "koi", NULL };
+	char m[128];
+	const char *src = E.ai_model ? E.ai_model : "";
+	size_t i = 0;
+	for (; src[i] && i < sizeof m - 1; i++) m[i] = (char)tolower((unsigned char)src[i]);
+	m[i] = '\0';
+	for (int k = 0; W[k]; k++) if (strstr(m, W[k])) { snprintf(out, cap, "%s", W[k]); return; }
+	const char *lab = hkProviderLabel();
+	size_t o = 0;
+	for (const char *p = lab ? lab : ""; *p && o + 1 < cap && o < 16; p++)
+		if (isalnum((unsigned char)*p) || *p == '-') out[o++] = (char)tolower((unsigned char)*p);
+	out[o] = '\0';
+	if (!o || !isalpha((unsigned char)out[0]) || !strcmp(out, "none")) snprintf(out, cap, "hako");
+}
+
+/* Another live hako holds c: the older one keeps a name both took at once. */
+static int hkAgentTaken(const hkAgent *a, int n, const char *c) {
+	int me = (int)getpid();
+	for (int i = 0; i < n; i++)
+		if (a[i].pid != me && !strcmp(a[i].name, c) && (a[i].pid < me || strcmp(hk_agent_name, c))) return 1;
+	return 0;
+}
+
+/* Its own name: kept while no other live hako has it, and it follows the model
+   unless :as named it. */
+static void hkAgentPickName(hkAgent *a, int n) {
+	char base[24];
+	if (hk_agent_named) snprintf(base, sizeof base, "%s", hk_agent_name);
+	else hkAgentBaseName(base, sizeof base);
+	size_t bl = strlen(base);
+	int ours = hk_agent_name[0] && !strncmp(hk_agent_name, base, bl)
+	           && strspn(hk_agent_name + bl, "0123456789") == strlen(hk_agent_name + bl);
+	if (ours && !hkAgentTaken(a, n, hk_agent_name)) return;
+	for (int k = 1; k < 100; k++) {
+		char c[24];
+		if (k == 1) snprintf(c, sizeof c, "%s", base);
+		else snprintf(c, sizeof c, "%.13s%d", base, k);
+		if (!hkAgentTaken(a, n, c)) { snprintf(hk_agent_name, sizeof hk_agent_name, "%s", c); return; }
+	}
+}
+
+static void hkAgentsGone(void) { if (hk_agent_file[0]) unlink(hk_agent_file); }
+
+/* Says this hako is here (and what it runs), in this session's list. */
+static void hkAgentsBeat(void) {
+	char dir[PATH_MAX + 64], p[PATH_MAX + 96];
+	if (!hkAgentsDir(dir, sizeof dir) || !hkFmtFits(p, sizeof p, "%s/%d", dir, (int)getpid())) return;
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX);
+	hkAgentPickName(a, n);
+	if (hk_agent_file[0] && strcmp(hk_agent_file, p)) { unlink(hk_agent_file); hk_agent_wrote[0] = '\0'; }   /* another session now */
+	char body[256];
+	snprintf(body, sizeof body, "%s\t%s\t%s\t%s\n", hk_agent_name, hkProviderLabel(),
+	         E.ai_model ? E.ai_model : "", hk_agent_busy ? "busy" : "idle");
+	for (char *q = body + strlen(hk_agent_name) + 1; *q && q[1]; q++) if (*q == '\n') *q = ' ';
+	if (!strcmp(p, hk_agent_file) && !strcmp(body, hk_agent_wrote) && hk_fs_exists(p, NULL, NULL, NULL)) return;
+	char tmp[PATH_MAX + 112];
+	if (hk_fs_mkdirp(dir) != 0 || !hkFmtFits(tmp, sizeof tmp, "%s.tmp", p)) return;
+	if (hk_fs_write(tmp, body, strlen(body), 0) != 0 || rename(tmp, p) != 0) { unlink(tmp); return; }
+	snprintf(hk_agent_file, sizeof hk_agent_file, "%s", p);
+	snprintf(hk_agent_wrote, sizeof hk_agent_wrote, "%s", body);
+}
+
+static void hkAgentsBusy(int busy) {
+	if (E.pipe_mode || E.serve_mode || !hk_tail_thread) return;
+	hk_agent_busy = busy;
+	hkAgentsBeat();
+}
+
+/* A short field of a log row (a role, a name), through the JSON reader: "" when absent. */
+static void hkRowField(const char *row, const char *key, char *out, size_t cap) {
+	char *v = hkExtractJsonString(row, key);
+	snprintf(out, cap, "%s", v && !strchr(v, '\\') ? v : "");
+	free(v);
+}
+
+/* What this model is told with its next turn: the newest, when there is a lot. */
+static size_t hk_shared_len, hk_shared_cap;
+static void hkAgentsShare(const char *head, const char *text) {
+	size_t tl = strlen(text), cut = tl > 4000 ? 4000 : tl;
+	hkSbAdd(&hk_shared, &hk_shared_len, &hk_shared_cap, head, strlen(head));
+	hkSbAdd(&hk_shared, &hk_shared_len, &hk_shared_cap, ": ", 2);
+	hkSbAdd(&hk_shared, &hk_shared_len, &hk_shared_cap, text, cut);
+	if (cut < tl) hkSbAdd(&hk_shared, &hk_shared_len, &hk_shared_cap, " [...]", 6);
+	hkSbAdd(&hk_shared, &hk_shared_len, &hk_shared_cap, "\n\n", 2);
+	if (hk_shared && hk_shared_len > HK_SHARED_MAX) {
+		memmove(hk_shared, hk_shared + hk_shared_len - HK_SHARED_MAX, HK_SHARED_MAX + 1);
+		hk_shared_len = HK_SHARED_MAX;
+	}
+}
+static void hkAgentsShareClear(void) { free(hk_shared); hk_shared = NULL; hk_shared_len = hk_shared_cap = 0; }
+
+/* The prompt this model gets for line: what the others said first, if anything. NULL = line as is. */
+static char *hkAgentsPrompt(const char *line) {
+	if (!hk_shared || !*hk_shared) return NULL;
+	size_t n = strlen(hk_shared) + strlen(line) + 200;
+	char *out = malloc(n);
+	if (out) snprintf(out, n, "[Meanwhile on this session, from the other hakos and their models:]\n\n%s[Now, to you (%s):]\n%s",
+	                  hk_shared, hk_agent_name, line);
+	hkAgentsShareClear();
+	return out;
+}
+
+/* One row another hako wrote: a line for this one runs here; the rest is shown and shared. */
+static void hkAgentsRow(aiData *data, const char *row, int *said) {
+	char role[16], by[24], to[24];
+	hkRowField(row, "role", role, sizeof role);
+	hkRowField(row, "by", by, sizeof by);
+	hkRowField(row, "to", to, sizeof to);
+	if (!by[0] || !strcmp(by, hk_agent_name)) return;
+	int user = !strcmp(role, "user"), ai = !strcmp(role, "assistant"), chat = !strcmp(role, "chat");
+	if (!user && !ai && !chat) return;
+	char *c = hkRowContent(row);
+	if (!c || !*c) { free(c); return; }
+	if (chat) {                                   /* between the people here: shown, never a model's */
+		if (!*said) clOutBegin();
+		*said = 1;
+		aiSayf(data, "chat from %s: %.400s", by, c);
+		free(c);
+		return;
+	}
+	if (user && !strcmp(to, hk_agent_name)) {
+		size_t n = strlen(c) + 48;
+		char *l = malloc(n);
+		if (l) {
+			snprintf(l, n, "[from %s] %s", by, c);
+			for (char *q = l; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';    /* one typed line */
+			if (!hkInjectPushKind(l, HK_IN_AGENT)) { if (!*said) clOutBegin(); *said = 1; aiSayf(data, "%s asked something, but 16 lines are already waiting here", by); }
+		}
+		free(l);
+		free(c);
+		return;
+	}
+	char head[64];
+	if (user && to[0]) snprintf(head, sizeof head, "%s asked %s", by, to);
+	else if (user) snprintf(head, sizeof head, "%s was asked", by);
+	else snprintf(head, sizeof head, "%s", by);
+	hkAgentsShare(head, c);
+	/* shown short: all of it is in the log, and goes with this model's next turn */
+	char shown[420];
+	int lines = 0;
+	size_t o = 0;
+	for (const char *q = c; *q && o + 4 < sizeof shown - 8 && lines < 6; q++) {
+		if (*q == '\n') lines++;
+		shown[o++] = *q;
+	}
+	while (o && (shown[o - 1] == '\n' || shown[o - 1] == ' ')) o--;
+	shown[o] = '\0';
+	if (!*said) clOutBegin();
+	*said = 1;
+	aiSayf(data, "%s: %s%s", head, shown, strlen(c) > o ? " \xE2\x80\xA6" : "");
+	free(c);
+}
+
+/* What the others appended since the last look. */
+static void hkAgentsPoll(aiData *data) {
+	char path[PATH_MAX];
+	hkSessionLogPath(path, sizeof path);
+	pthread_mutex_lock(&hk_tail_lock);
+	snprintf(hk_tail_path, sizeof hk_tail_path, "%s", path);
+	pthread_mutex_unlock(&hk_tail_lock);
+	if (!path[0]) return;
+	if (strcmp(hk_tail_sid, E.session_id)) {                 /* another chat: its past is not news */
+		snprintf(hk_tail_sid, sizeof hk_tail_sid, "%s", E.session_id);
+		hk_tail_off = -1;
+		hkAgentsShareClear();
+	}
+	struct stat st;
+	if (stat(path, &st) != 0) { if (hk_tail_off < 0) hk_tail_off = 0; return; }
+	if (hk_tail_off < 0 || st.st_size < hk_tail_off) { hk_tail_off = (long)st.st_size; return; }
+	if ((long)st.st_size == hk_tail_off) return;
+	FILE *fp = fopen(path, "rb");
+	if (!fp) return;
+	long want = (long)st.st_size - hk_tail_off;
+	if (want > (1L << 20)) want = 1L << 20;
+	char *buf = malloc((size_t)want + 1);
+	size_t got = 0;
+	if (buf && fseek(fp, hk_tail_off, SEEK_SET) == 0) got = fread(buf, 1, (size_t)want, fp);
+	fclose(fp);
+	if (!buf) return;
+	buf[got] = '\0';
+	char *end = NULL;
+	for (size_t k = got; k > 0 && !end; k--) if (buf[k - 1] == '\n') end = buf + k - 1;
+	if (!end) {                                              /* half a row: the rest comes */
+		if (got == (size_t)want && want == (1L << 20)) hk_tail_off += (long)got;   /* a row past 1 MB is skipped */
+		free(buf);
+		return;
+	}
+	hk_tail_off += (long)(end - buf) + 1;
+	*end = '\0';
+	int said = 0;
+	for (char *l = buf, *nl; l && *l; l = nl) {
+		nl = strchr(l, '\n');
+		if (nl) *nl++ = '\0';
+		hkAgentsRow(data, l, &said);
+	}
+	free(buf);
+	if (said) clOutEnd(data);
+}
+
+/* Wakes the prompt when the log grows, so a line from another hako shows (or runs) now. */
+static void *hkTailThread(void *arg) {
+	(void)arg;
+	hkBlockWinch();
+	long last = -1;
+	for (;;) {
+		cl_sleep_ms(300);
+		char p[PATH_MAX];
+		pthread_mutex_lock(&hk_tail_lock);
+		snprintf(p, sizeof p, "%s", hk_tail_path);
+		pthread_mutex_unlock(&hk_tail_lock);
+		struct stat st;
+		if (!p[0] || stat(p, &st) != 0) continue;
+		if (last >= 0 && (long)st.st_size != last && hk_line_wait && g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
+		last = (long)st.st_size;
+	}
+	return NULL;
+}
+
+/* A note another hako saved (or changed, or forgot) reaches this model's next
+   turn: the folder's memory is one, and the prompt holding it is cached. */
+static void hkAgentsMemWatch(void) {
+	static uint64_t seen;
+	int n = 0;
+	char *m = hkMemCollect(&n);                    /* exactly what the prompt would say */
+	uint64_t sig = hkDigest(m ? m : "", m ? strlen(m) : 0);
+	free(m);
+	if (seen && sig != seen) hkPromptInvalidate();
+	seen = sig;
+}
+
+/* Each time the terminal waits for a line: say this hako is here, and catch up. */
+static void hkAgentsTick(aiData *data) {
+	if (E.pipe_mode || E.serve_mode) return;
+	if (!hk_tail_thread) {
+		pthread_t t;
+		if (pthread_create(&t, NULL, hkTailThread, NULL) == 0) pthread_detach(t);
+		hk_tail_thread = 1;
+		atexit(hkAgentsGone);
+	}
+	hk_agent_busy = 0;
+	hkAgentsBeat();
+	hkAgentsPoll(data);
+	hkAgentsMemWatch();
+}
+
+/* A typed line for another hako: `@name text`, or any line while :route points
+   elsewhere. 1 = sent there, and nothing runs here; 0 = it runs here (an @ for
+   this hako itself loses its @). A word with '.' or '/' is a file, not a name. */
+static int hkAgentsRoute(aiData *data, char *line, size_t cap) {
+	(void)cap;
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX);
+	char to[24] = "";
+	const char *text = line;
+	if (line[0] == '@') {
+		size_t i = hkAgentWord(line, to);
+		if ((line[i] && line[i] != ' ') || strpbrk(to, "./~") || !to[0]) return 0;
+		while (line[i] == ' ') i++;
+		text = line + i;
+		if (!strcmp(to, hk_agent_name)) { memmove(line, text, strlen(text) + 1); return 0; }
+		if (hkAgentLive(to, a, n) < 0) {
+			char live[160];
+			int k = hkAgentsWho(a, n, live, sizeof live, "@");
+			aiSayf(data, "no hako named %s on this session. %s%s", to, k ? "here now: " : "only this one is here", live);
+			return 1;
+		}
+		if (!*text) { aiSayf(data, "say what to ask %s: @%s <text>", to, to); return 1; }
+	} else if (hk_route[0] && strcmp(hk_route, hk_agent_name)) {
+		if (hkAgentLive(hk_route, a, n) < 0) {
+			aiSayf(data, ":route points to %s, which is not on this session now, so %s answers", hk_route, hk_agent_name);
+			return 0;
+		}
+		snprintf(to, sizeof to, "%s", hk_route);
+	} else return 0;
+	clPrintRoleLine(HK_ROLE_USER, line);
+	aiPushHistoryStore(data, line, HK_ROLE_USER);
+	if (hs_attached) clPipeEmitMsg("user", line);
+	hkLogMessageTo("user", text, to);
+	char h[48];
+	snprintf(h, sizeof h, "you asked %s", to);
+	hkAgentsShare(h, text);
+	aiSayf(data, "\xE2\x86\x92 %s", to);
+	return 1;
+}
+
+/* @ completes the other live hakos on this session. */
+static int hkAgentsNames(char out[][160], int max, const char *pfx, size_t plen) {
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX), c = 0;
+	for (int i = 0; i < n && c < max; i++) {
+		if (!strcmp(a[i].name, hk_agent_name)) continue;
+		char w[32];
+		snprintf(w, sizeof w, "@%s", a[i].name);
+		c = clCompAdd(out, c, w, pfx, plen);
+	}
+	return c;
+}
+
+/* GET /api/agents: {"me", "route", "agents": [{name, provider, model, state, me}]} */
+static void hsServeAgents(int fd) {
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX);
+	hsBuf b = { 0 };
+	hsPut(&b, "{\"me\":\"");
+	hsPutEsc(&b, hk_agent_name);
+	hsPut(&b, "\",\"route\":\"");
+	hsPutEsc(&b, hk_route);
+	hsPut(&b, "\",\"agents\":[");
+	for (int i = 0; i < n; i++) {
+		hsPut(&b, i ? ",{\"name\":\"" : "{\"name\":\"");
+		hsPutEsc(&b, a[i].name);
+		hsPut(&b, "\",\"provider\":\"");
+		hsPutEsc(&b, a[i].prov);
+		hsPut(&b, "\",\"model\":\"");
+		hsPutEsc(&b, a[i].model);
+		hsPutFmt(&b, "\",\"state\":\"%s\",\"me\":%d}", strcmp(a[i].state, "busy") ? "idle" : "busy", a[i].pid == (int)getpid());
+	}
+	hsPut(&b, "]}");
+	hsSendJson(fd, b.buf ? b.buf : "{}");
+	free(b.buf);
+}
+
+static void hkAgentsShow(aiData *data) {
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX);
+	aiSayf(data, "on this session (%d):", n);
+	for (int i = 0; i < n; i++)
+		aiSayf(data, "  %s%s \xC2\xB7 %s %s \xC2\xB7 %s", a[i].name, a[i].pid == (int)getpid() ? " (this one)" : "",
+		       a[i].prov, a[i].model, strcmp(a[i].state, "busy") ? "idle" : "working");
+	aiSayf(data, "a line without @ goes to %s. @name <text> asks another, :route <name> sends them all there, :as <name> renames this one",
+	       hk_route[0] && strcmp(hk_route, hk_agent_name) ? hk_route : "this one");
+}
+
+/* :agents, :as <name>, :route [name|off]. 1 = it was one of them. */
+static int hkAgentsCmd(aiData *data, const char *cmd, int cmdlen, const char *arg) {
+	if (cmdlen == 6 && !strncmp(cmd, "agents", 6)) { if (!E.pipe_mode && !E.serve_mode) hkAgentsBeat(); hkAgentsShow(data); return 1; }
+	if (cmdlen == 2 && !strncmp(cmd, "as", 2)) {
+		char nm[24];
+		hkAgentWord(arg ? arg : "", nm);
+		if (!hkAgentNameOk(nm)) { aiSayf(data, "this hako is %s here. :as <name>: a-z, 0-9 and -, up to 16", hk_agent_name[0] ? hk_agent_name : "unnamed"); return 1; }
+		hkAgent a[HK_AGENTS_MAX];
+		int n = hkAgentsList(a, HK_AGENTS_MAX), at = hkAgentLive(nm, a, n);
+		if (at >= 0 && a[at].pid != (int)getpid()) { aiSayf(data, "another hako on this session is %s already", nm); return 1; }
+		snprintf(hk_agent_name, sizeof hk_agent_name, "%s", nm);
+		hk_agent_named = 1;
+		hkAgentsBeat();
+		aiSayf(data, "this hako is %s on this session: the others reach it with @%s", nm, nm);
+		return 1;
+	}
+	if (cmdlen == 3 && !strncmp(cmd, "say", 3)) {
+		if (!arg || !*arg) { aiAddHistory(data, ":say <text>: a line for the people on this chat; no model answers it"); return 1; }
+		hkLogMessageTo("chat", arg, NULL);       /* resume and the models skip a chat row */
+		return 1;
+	}
+	if (cmdlen == 4 && !strncmp(cmd, "join", 4)) {
+		hkAgentChat c[16];
+		int n = hkAgentsChats(c, 16), at = -1;
+		const char *want = arg && *arg ? (*arg == '@' ? arg + 1 : arg) : "";
+		for (int i = 0; i < n && at < 0; i++) {
+			if (!*want) { if (n == 1) at = i; continue; }
+			if (!strcmp(c[i].sid, want)) at = i;
+			for (const char *w = c[i].who; *w && at < 0; ) {
+				size_t l = strcspn(w, ",");
+				if (l == strlen(want) && !strncmp(w, want, l)) at = i;
+				w += l; while (*w == ',' || *w == ' ') w++;
+			}
+		}
+		if (at < 0) {
+			if (!n) { aiAddHistory(data, "no other hako is on a chat in this folder"); return 1; }
+			aiAddHistory(data, *want ? "no hako by that name or chat here. the chats with a hako on them:" : "more than one chat has a hako on it. :join <name> picks one:");
+			for (int i = 0; i < n; i++) aiSayf(data, "  %s \xC2\xB7 %s", c[i].sid, c[i].who);
+			return 1;
+		}
+		char who[96], r[64];
+		snprintf(who, sizeof who, "%s", c[at].who);
+		snprintf(r, sizeof r, ":resume %s", c[at].sid);
+		hkHandleSlashCmd(data, r);
+		if (!E.pipe_mode && !E.serve_mode) { hkAgentsBeat(); hkAgentsPoll(data); }
+		aiSayf(data, "joined %s on this chat. this hako is %s here; @%s asks %s", who, hk_agent_name,
+		       strchr(who, ',') ? "<name>" : who, strchr(who, ',') ? "one of them" : "it");
+		return 1;
+	}
+	if (cmdlen == 5 && !strncmp(cmd, "route", 5)) {
+		const char *r = arg ? arg : "";
+		if (!*r) { aiSayf(data, "a line without @ goes to %s", hk_route[0] ? hk_route : "this hako's own model"); return 1; }
+		if (!strcmp(r, "off") || !strcmp(r, "me") || !strcmp(r, hk_agent_name)) { hk_route[0] = '\0'; aiSayf(data, "a line without @ goes to this hako's own model (%s)", hk_agent_name); return 1; }
+		char nm[24];
+		hkAgentWord(r, nm);
+		hkAgent a[HK_AGENTS_MAX];
+		int n = hkAgentsList(a, HK_AGENTS_MAX);
+		if (hkAgentLive(nm, a, n) < 0) { aiSayf(data, "no hako named %s on this session (:agents lists them)", nm); return 1; }
+		snprintf(hk_route, sizeof hk_route, "%s", nm);
+		aiSayf(data, "a line without @ now goes to %s; @%s still reaches this one, :route off undoes it", nm, hk_agent_name);
+		return 1;
+	}
+	return 0;
+}
+
 
 /* The terminal popup closed: say who answered. -3 = the phone did. */
 static int hsAttachSettle(int pick) {
@@ -21391,6 +22154,10 @@ static void *hsConnThread(void *arg) {
 		hsServeState(fd, req);
 	} else if (!strncmp(req, "GET /api/sessions", 17)) {
 		hsServeSessions(fd);
+#if HK_ATTACH
+	} else if (!strncmp(req, "GET /api/agents", 15)) {
+		hsServeAgents(fd);
+#endif
 	} else if (!strncmp(req, "GET /api/history", 16)) {
 		char sid[128];
 		hsQueryParam(req, "id", sid, sizeof(sid));
@@ -22637,6 +23404,39 @@ static void hkRestoreTerm(void) {
 	fflush(stdout);
 }
 
+/* One turn for a line: shown, kept, logged (unless it is already), sent, waited
+   for. A typed line, one queued during a turn and one from another hako all come here. */
+static void clTurn(aiData *data, const char *line, int logged, const char *prompt) {
+	clPrintRoleLine(HK_ROLE_USER, line);
+	aiPushHistoryStore(data, line, HK_ROLE_USER);
+	if (hs_attached) clPipeEmitMsg("user", line);
+	if (!logged) hkLogMessage("user", line);
+	E.session_turn_count++;
+	hkSaveSession();
+	free(data->current_prompt);
+	data->current_prompt = strdup(line);
+#if HK_ATTACH
+	char *withshared = hkAgentsPrompt(line);       /* the model hears what the other hakos said */
+	if (withshared) { free(data->current_prompt); data->current_prompt = withshared; }
+#endif
+	if (E.ai_provider_type == AI_PROVIDER_NONE) {
+		aiAddHistory(data, "Set ai_provider in ~/.hakorc or /provider <name>");
+		return;
+	}
+#if HK_ATTACH
+	hkAgentsBusy(1);
+#endif
+	hkVoiceStop();                               /* a new turn ends the last one's reading */
+	aiWorkerSend(data);
+	clComposeWhileBusy(data, prompt);
+	clWaitWorker(data);
+	hkVoiceAfterTurn(data);
+	if (E.interrupt) {
+		E.interrupt = 0;
+		aiAddHistory(data, "(interrupted)");
+	}
+}
+
 static int clRepl(aiData *data) {
 	g_main_thread = pthread_self();
 	g_main_thread_set = 1;
@@ -22651,6 +23451,9 @@ static int clRepl(aiData *data) {
 	clSplash();
 	clBanner(data);
 	hkBootMark("banner");
+#if HK_ATTACH
+	hkAgentsAtStart(data);   /* a live hako on the recent chat: this one starts its own */
+#endif
 	if (!clDetectKoiDefault()) clFirstRunWizard(data);
 	hkBootMark("local-model probe + first-run wizard");
 	clStartupMenu(data);
@@ -22683,12 +23486,16 @@ static int clRepl(aiData *data) {
 		cl_bar_want = 1;
 		if (!cl_bar_h) clBarShow(data);
 		const char *prompt = E.color_enabled ? prompt_color : prompt_plain;
-		int n, from_remote = 0;
+		int n, from_remote = 0, from_agent = 0;
 #if HK_ATTACH
-		if (hs_attached && hkInjectTake(line, sizeof(line))) {
+		hkAgentsTick(data);                  /* here for the other hakos, and what they said */
+		int kind = hkInjectTake(line, sizeof(line));
+		if (kind == HK_IN_REMOTE && !hs_attached) kind = 0;     /* left from a remote that ended */
+		if (kind) {
 			n = (int)strlen(line);
 			from_remote = 1;                 /* its images come by /api/image, never by a path on this disk */
-			hkLogMessage("system", "remote: the next line came from a remote device");
+			from_agent = kind == HK_IN_AGENT;
+			if (!from_agent) hkLogMessage("system", "remote: the next line came from a remote device");
 		} else {
 			hk_line_wait = 1;
 			n = clReadLineRaw(prompt, line, sizeof(line));
@@ -22697,6 +23504,7 @@ static int clRepl(aiData *data) {
 #else
 		n = clReadLineRaw(prompt, line, sizeof(line));
 #endif
+		(void)from_agent;
 		int input_rows = cl_redraw_oldrows > 0 ? cl_redraw_oldrows : 1;
 		(void)input_rows;
 		if (n == -4) {                       /* shift-tab cycles the mode */
@@ -22745,35 +23553,15 @@ static int clRepl(aiData *data) {
 			snprintf(line, sizeof(line), "%s", hk_slash_prompt);   /* /<skill> <text>: the text is the turn */
 		}
 
+#if HK_ATTACH
+		/* @name, or :route: the line goes to another hako on this session */
+		if (!from_agent && hkAgentsRoute(data, line, sizeof line)) continue;
+#endif
 		/* Wipe the composing area, then print what was written as part of the
 		   conversation. */
 		char *imaged = from_remote ? NULL : hkImagesFromLine(data, line);
 		if (imaged) { snprintf(line, sizeof(line), "%s", imaged); free(imaged); }
-		clPrintRoleLine(HK_ROLE_USER, line);
-		aiPushHistoryStore(data, line, HK_ROLE_USER);
-		if (hs_attached) clPipeEmitMsg("user", line);
-		hkLogMessage("user", line);
-		E.session_turn_count++;
-		hkSaveSession();
-
-		free(data->current_prompt);
-		data->current_prompt = strdup(line);
-
-		if (E.ai_provider_type == AI_PROVIDER_NONE) {
-			aiAddHistory(data, "Set ai_provider in ~/.hakorc or /provider <name>");
-			continue;
-		}
-
-		hkVoiceStop();                       /* a new turn ends the last one's reading */
-		aiWorkerSend(data);
-		clComposeWhileBusy(data, prompt);
-		clWaitWorker(data);
-		hkVoiceAfterTurn(data);
-
-		if (E.interrupt) {
-			E.interrupt = 0;
-			aiAddHistory(data, "(interrupted)");
-		}
+		clTurn(data, line, from_agent, prompt);   /* a line from another hako is in the log as it sent it */
 
 		if (hk_quit_requested) break;
 		/* Whatever was typed during the turn now becomes the next one. */
@@ -22793,22 +23581,18 @@ static int clRepl(aiData *data) {
 				}
 				continue;
 			}
+#if HK_ATTACH
+			{
+				char routed[4096];                   /* @name typed during the turn goes there too */
+				snprintf(routed, sizeof routed, "%s", next);
+				if (hkAgentsRoute(data, routed, sizeof routed)) { free(next); continue; }
+				if (strcmp(routed, next)) { free(next); next = strdup(routed); if (!next) continue; }   /* its own @name, dropped */
+			}
+#endif
 			char *imaged = hkImagesFromLine(data, next);
 			if (imaged) { free(next); next = imaged; }
-			clPrintRoleLine(HK_ROLE_USER, next);
-			aiPushHistoryStore(data, next, HK_ROLE_USER);
-			if (hs_attached) clPipeEmitMsg("user", next);
-			hkLogMessage("user", next);
-			E.session_turn_count++;
-			hkSaveSession();
-			free(data->current_prompt);
-			data->current_prompt = next;      /* takes ownership */
-			hkVoiceStop();
-			aiWorkerSend(data);
-			clComposeWhileBusy(data, prompt);
-			clWaitWorker(data);
-			hkVoiceAfterTurn(data);
-			if (E.interrupt) { E.interrupt = 0; aiAddHistory(data, "(interrupted)"); }
+			clTurn(data, next, 0, prompt);
+			free(next);
 		}
 		if (hk_quit_requested) break;
 	}
@@ -23001,6 +23785,19 @@ int main(int argc, char **argv) {
 			clCredsRestoreFor(hkProviderLabel());
 			hkHealEndpoint();
 		}
+	}
+
+	/* a subagent of another hako (delegate): a fresh chat of its own; read only
+	   unless that hako is in auto mode, with nobody at a terminal to ask */
+	if (getenv("HAKO_AGENT_DEPTH") && atoi(getenv("HAKO_AGENT_DEPTH")) > 0) {
+		hk_subagent = atoi(getenv("HAKO_AGENT_DEPTH"));
+		hkSessionFresh(NULL);
+		const char *nm = getenv("HAKO_AGENT_NAME");
+		if (nm && strlen(nm) < sizeof hk_agent_name && strspn(nm, "abcdefghijklmnopqrstuvwxyz0123456789-") == strlen(nm))
+			snprintf(hk_agent_name, sizeof hk_agent_name, "%s", nm);
+		const char *md = getenv("HAKO_SUB_MODE");
+		E.ai_auto_approve = 1;
+		E.ai_plan_mode = !(md && !strcmp(md, "auto"));
 	}
 
 	int rc;
