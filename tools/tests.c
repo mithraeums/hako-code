@@ -138,6 +138,8 @@ static void diff_tests(void) {
 	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", root); if (system(cmd)) {} }
 }
 
+static void *shell_ctrl_c(void *a) { (void)a; usleep(400000); E.interrupt = 1; return NULL; }
+
 /* --- shell timeout: the cap has to be real on every platform, not only where
    coreutils `timeout` happens to exist --- */
 static void shell_tests(void) {
@@ -174,6 +176,20 @@ static void shell_tests(void) {
 	/* exit status survives the capture */
 	r = hkRunShellCapture("exit 3", 4096, 5);
 	ckstr(r, "exit code 3", "a silent failing command reports its exit code");
+	free(r);
+
+	/* ctrl-c stops a running command (and a subagent, which runs this way): it waited out the deadline */
+	t0 = hk_time_ms();
+	{
+		pthread_t th;
+		pthread_create(&th, NULL, shell_ctrl_c, NULL);
+		r = hkRunShellCapture("sleep 30", 4096, 20);
+		pthread_join(th, NULL);
+	}
+	dt = hk_time_ms() - t0;
+	E.interrupt = 0;
+	ckstr(r, "stopped: the user pressed ctrl-c", "ctrl-c stops a running command, and says so");
+	ck(dt < 5000, "at once, not at its deadline");
 	free(r);
 
 	/* the ceiling holds even when the model asks for more */
@@ -330,6 +346,136 @@ static void long_msg_free(aiData *d) {
 	for (int i = 0; i < d->message_count; i++) { free(d->messages[i].role); free(d->messages[i].content); }
 	free(d->messages); free(d->system_prompt);
 	pthread_mutex_destroy(&d->lock);
+}
+
+/* A process started while a model stream is open must not keep that stream's pipe:
+   hanging up at a tool call then waits on a curl that never gets SIGPIPE. `:remote on`
+   in the middle of a turn hung that way, for good, behind an idle looking bar. */
+static void stream_pipe_tests(void) {
+	char path[] = "/tmp/hako-stream-XXXXXX";
+	int fd = mkstemp(path);
+	ck(fd >= 0, "stream pipe: a scratch file");
+	if (fd < 0) return;
+	static char chunk[65536];
+	memset(chunk, 'x', sizeof chunk);
+	for (int i = 0; i < 16; i++) if (write(fd, chunk, sizeof chunk) < 0) break;   /* far more than a pipe holds */
+	close(fd);
+	char url[64];
+	snprintf(url, sizeof url, "file://%s", path);
+	hkHttpReq req;
+	memset(&req, 0, sizeof req);
+	req.method = "GET";
+	req.url = url;
+	req.stream = 1;
+	void *h = hk_http_open(&req);
+	ck(h != NULL, "stream pipe: opens");
+	if (!h) { unlink(path); return; }
+	char line[256];
+	ck(hk_http_gets(h, line, sizeof line) != NULL, "stream pipe: reads");
+	pid_t kid = fork();
+	if (kid == 0) { execlp("sleep", "sleep", "4", (char *)NULL); _exit(127); }
+	time_t t0 = time(NULL);
+	hk_http_close(h);
+	ck(time(NULL) - t0 < 2, "stream pipe: hanging up does not wait on a process started since");
+	kill(kid, SIGKILL);
+	waitpid(kid, NULL, 0);
+	unlink(path);
+}
+
+/* Resume used to send the model the last 40 rows of the log and nothing else: the
+   goal and every decision before them were gone, and a model asked about them made
+   some up. The opening request and a digest of the rest come back now. */
+static void resume_tests(void) {
+	char keep[PATH_MAX], tmpl[] = "/tmp/hakoresumeXXXXXX", cmd[PATH_MAX + 16], path[PATH_MAX];
+	if (!getcwd(keep, sizeof keep)) keep[0] = '\0';
+	char *root = mkdtemp(tmpl);
+	ck(root != NULL, "resume: a scratch folder");
+	if (!root || chdir(root)) return;
+	char *was_id = E.session_id;
+
+	/* a log from before digests were logged: 300 turns after the opening request */
+	E.session_id = strdup("resumeold");
+	hkLogMessage("user", "the codename is brass heron, build tally");
+	for (int i = 0; i < 300; i++) {
+		char u[64], a[64];
+		snprintf(u, sizeof u, "turn %d", i);
+		snprintf(a, sizeof a, "done %d", i);
+		hkLogMessage("user", u);
+		hkLogMessage("assistant", a);
+	}
+	aiData a;
+	memset(&a, 0, sizeof a);
+	clInitAI(&a);
+	hkLoadHistoryTail(&a, AI_HISTORY_MAX, 40);
+	ck(a.message_count > 2 && strstr(a.messages[0].content, "brass heron"), "resume: the opening request comes back first");
+	ck(a.message_count > 2 && !strncmp(a.messages[1].content, HK_CTX_DIGEST_HEAD, strlen(HK_CTX_DIGEST_HEAD)), "resume: then a digest of what the tail leaves out");
+	ck(a.message_count > 2 && strstr(a.messages[1].content, "turn "), "resume: the digest says what was asked");
+	ck(a.message_count > 2 && strstr(a.messages[a.message_count - 1].content, "done 299"), "resume: the tail is still verbatim");
+	ck(a.message_count < 60, "resume: and the whole is small");
+	int shown = 0;
+	for (int i = 0; i < a.history_count; i++) if (a.history[i] && strstr(a.history[i], HK_CTX_DIGEST_HEAD)) shown++;
+	ck(shown == 0, "resume: the digest is for the model, not the transcript");
+	clCleanupAI(&a);
+
+	/* a short chat has nothing to add */
+	E.session_id = strdup("resumeshort");
+	hkLogMessage("user", "just this");
+	hkLogMessage("assistant", "ok");
+	memset(&a, 0, sizeof a);
+	clInitAI(&a);
+	hkLoadHistoryTail(&a, AI_HISTORY_MAX, 40);
+	ck(a.message_count == 2 && !strcmp(a.messages[0].content, "just this"), "resume: a short chat comes back as it was");
+	clCleanupAI(&a);
+
+	/* a fold logs its digest, so what it folded survives a kill */
+	E.session_id = strdup("resumefold");
+	memset(&a, 0, sizeof a);
+	clInitAI(&a);
+	hkLogMessage("user", "the goal is a tally tool");
+	aiPushMessage(&a, "user", "the goal is a tally tool");
+	for (int i = 0; i < 30; i++) {
+		char u[80], r[900];
+		snprintf(u, sizeof u, "%s %d", i == 3 ? "we rejected hsearch because it is not reentrant, step" : "step", i);
+		snprintf(r, sizeof r, "ok %d %0800d", i, 0);
+		aiPushMessage(&a, "user", u);
+		aiPushMessage(&a, "assistant", r);
+	}
+	ck(hkCompactHistory(&a) > 0, "resume: the chat folds");
+	clCleanupAI(&a);
+	for (int i = 0; i < 60; i++) { hkLogMessage("user", "later"); hkLogMessage("assistant", "fine"); }
+	memset(&a, 0, sizeof a);
+	clInitAI(&a);
+	hkLoadHistoryTail(&a, AI_HISTORY_MAX, 40);
+	ck(a.message_count > 2 && strstr(a.messages[1].content, "hsearch"), "resume: what a fold kept survives a kill");
+	clCleanupAI(&a);
+
+	/* two hakos on one log: every row whole, however long */
+	E.session_id = strdup("resumetwo");
+	hkSessionLogPath(path, sizeof path);
+	static char big[120000];
+	memset(big, 'x', sizeof big - 1);
+	pid_t kids[2];
+	for (int k = 0; k < 2; k++) {
+		kids[k] = fork();
+		if (kids[k] == 0) { for (int i = 0; i < 60; i++) hkLogMessage("user", big); _exit(0); }
+	}
+	for (int k = 0; k < 2; k++) waitpid(kids[k], NULL, 0);
+	char *log = hk_fs_read(path, 64 * 1024 * 1024, NULL);
+	int rows = 0, whole = 0;
+	for (char *l = log; l && *l; ) {
+		char *nl = strchr(l, '\n');
+		if (!nl) break;
+		rows++;
+		if (nl - l > 100000 && !strncmp(l, "{\"ts\":", 6) && !strncmp(nl - 2, "\"}", 2) && !memchr(l + 6, '{', (size_t)(nl - l - 6))) whole++;
+		l = nl + 1;
+	}
+	free(log);
+	ck(rows == 120 && whole == 120, "two hakos on one log: every row whole");
+
+	E.session_id = was_id;
+	if (keep[0] && chdir(keep)) {}
+	snprintf(cmd, sizeof cmd, "rm -rf %s", root);
+	if (system(cmd)) {}
 }
 
 static void long_session_tests(void) {
@@ -813,6 +959,78 @@ static void todo_tests(void) {
 	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", dir); if (system(cmd)) {} }
 }
 
+/* --- one writer at a time: a hako does not write over a file that changed since
+   it read it (another hako, or the user), and two never write at once --- */
+static void guard_tests(void) {
+	char tmpl[] = "/tmp/hakoguardXXXXXX";
+	char *dir = mkdtemp(tmpl);
+	if (!dir) { printf("FAIL guard mkdtemp\n"); fails++; return; }
+	char cmd[512], proj[PATH_MAX], f[PATH_MAX + 16];
+	char *keep = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+	setenv("HOME", dir, 1);
+	snprintf(proj, sizeof proj, "%s/work", dir);
+	snprintf(cmd, sizeof cmd, "mkdir -p %s", proj);
+	if (system(cmd)) {}
+	if (chdir(proj)) {}
+	hkGrantProjectTrust();
+	E.ai_auto_approve = 1;
+	snprintf(f, sizeof f, "%s/notes.txt", proj);
+	hk_fs_write(f, "one\ntwo\nthree\n", 14, 0);
+
+	char *r = hkExecTool("read_file", "{\"path\":\"notes.txt\"}"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"one\\ntwo\\nthree\\nfour\\n\"}");
+	ckstr(r, "wrote", "a write after this hako's own read goes through"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"one\\ntwo\\nthree\\nfour\\nfive\\n\"}");
+	ckstr(r, "wrote", "and after its own write, without reading again"); free(r);
+
+	hk_fs_write(f, "ONE (theirs)\n", 13, 0);                  /* another hako changes it */
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"mine\\n\"}");
+	ckstr(r, "changed since you last read it", "a whole-file write over a change made since is refused");
+	free(r);
+	char *now = hkReadFileAll(f, 4096);
+	ck(now && !strcmp(now, "ONE (theirs)\n"), "and the other's change is kept"); free(now);
+	r = hkExecTool("edit_lines", "{\"path\":\"notes.txt\",\"start\":1,\"new\":\"mine\"}");
+	ckstr(r, "changed since you last read it", "so is a line-number edit"); free(r);
+	r = hkExecTool("edit_file", "{\"path\":\"notes.txt\",\"old\":\"ONE (theirs)\",\"new\":\"ONE (theirs, then mine)\"}");
+	ckstr(r, "wrote", "an edit of an exact snippet that is still there goes through"); free(r);
+	hk_fs_write(f, "changed again\n", 14, 0);
+	r = hkExecTool("read_file", "{\"path\":\"notes.txt\"}"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"mine, on what it holds\\n\"}");
+	ckstr(r, "wrote", "read again, the write goes through"); free(r);
+	r = hkExecTool("write_file", "{\"path\":\"fresh.txt\",\"content\":\"new\\n\"}");
+	ckstr(r, "new file", "a file this hako never read is written as before"); free(r);
+
+	/* the lock: while another holds the folder's write lock, a write waits for it */
+	char dirst[PATH_MAX], lk[PATH_MAX + 16];
+	if (hkProjectStateDir(dirst, sizeof dirst)) {
+		snprintf(lk, sizeof lk, "%s/write.lock", dirst);
+		int pfd[2];
+		if (pipe(pfd) == 0) {
+			pid_t c = fork();
+			if (c == 0) {
+				int fd = open(lk, O_RDWR | O_CREAT, 0600);
+				flock(fd, LOCK_EX);
+				if (write(pfd[1], "x", 1) < 0) {}
+				usleep(900000);
+				_exit(0);
+			}
+			char x;
+			if (read(pfd[0], &x, 1) < 0) {}
+			long t0 = hk_time_ms();
+			r = hkExecTool("write_file", "{\"path\":\"fresh.txt\",\"content\":\"after the other\\n\"}");
+			long waited = hk_time_ms() - t0;
+			ckstr(r, "wrote", "a write while another hako writes still lands");
+			ck(waited >= 600, "after the other one is done: the two never write at once");
+			free(r);
+			waitpid(c, NULL, 0);
+			close(pfd[0]); close(pfd[1]);
+		}
+	}
+	E.ai_auto_approve = 0;
+	if (keep) { setenv("HOME", keep, 1); free(keep); } else unsetenv("HOME");
+	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", dir); if (system(cmd)) {} }
+}
+
 /* --- memory: the thing that makes it grow across sessions. Project beats
    global, and it rides in the system prompt so compaction cannot lose it. --- */
 static void memory_tests(void) {
@@ -873,6 +1091,32 @@ static void memory_tests(void) {
 	ck(system(cmd) != 0, "a global memory does NOT land in the project directory");
 	snprintf(cmd, sizeof(cmd), "test -f %s/.hako/memory/editor-pref.md", dir);
 	ck(system(cmd) == 0, "a global memory lands under HOME");
+
+	/* several hakos share one memory: each note says which saved it */
+	snprintf(hk_agent_name, sizeof hk_agent_name, "sho");
+	r = hkExecTool("remember", "{\"title\":\"Test runner\",\"text\":\"Run make test before a push.\"}");
+	free(r);
+	{
+		char p[PATH_MAX];
+		snprintf(p, sizeof p, "%s/.hako/memory/test-runner.md", proj);
+		char *b = hkReadFileAll(p, 4096);
+		ck(b && !strncmp(b, "<!-- by sho \xC2\xB7 ", 15) && strstr(b, "-->\nRun make test before a push."), "a note's first line says which hako saved it, with its model");
+		free(b);
+	}
+	int mc = 0;
+	char *mem = hkMemCollect(&mc);
+	ckstr(mem, "(project, from sho) Run make test before a push.", "the model is told who saved a note");
+	cknot(mem, "<!--", "and never sees the marker itself");
+	ckstr(mem, "(project) This project builds with make all", "a note from before keeps its plain label");
+	free(mem);
+	snprintf(hk_agent_name, sizeof hk_agent_name, "gpt");
+	r = hkExecTool("remember", "{\"title\":\"Test runner\",\"text\":\"Run make check, it runs the tests too.\"}");
+	free(r);
+	mem = hkMemCollect(&mc);
+	ckstr(mem, "(project, from gpt) Run make check", "another hako's update to a note says it is from that one");
+	cknot(mem, "make test before a push", "and replaces the old text");
+	free(mem);
+	hk_agent_name[0] = '\0';
 
 	/* a slug cannot escape the directory */
 	r = hkExecTool("remember", "{\"title\":\"../../etc/passwd\",\"text\":\"nope\"}");
@@ -1353,9 +1597,40 @@ static void rc_unified_tests(void) {
 
 	/* a phone (relay) may not widen what the desk allows: :editor and :e run a command there */
 	hs_remote = 1;
+	/* a device that can approve every call may stop being asked: for as long as remote is on */
+	{
+		int saved_auto = E.ai_auto_approve, saved_plan = E.ai_plan_mode, saved_remote = hs_remote;
+		hs_remote = 1; hs_remote_auto = 0; E.ai_auto_approve = 1; E.ai_plan_mode = 0;
+		ck(!hkAutoNow(), "remote on: the session's own auto does not count");
+		ck(!hkSlashRefusedRemote(":mode auto") && !hkSlashRefusedRemote(":mode ask") && !hkSlashRefusedRemote(":mode plan"),
+		   "remote on: a device may pick a mode");
+		ck(hkSlashRefusedRemote(":auto") && hkSlashRefusedRemote(":mode") && hkSlashRefusedRemote(":trust"),
+		   "remote on: but not a bare cycle, :auto (saved) or :trust");
+		E.ai_auto_approve = 0;
+		hkSetMode(0, 1);
+		ck(hkAutoNow() && !E.ai_auto_approve, "remote on: :mode auto holds for remote and is not saved to the session");
+		hkSetMode(1, 0);
+		ck(!hkAutoNow() && E.ai_plan_mode, "remote on: plan ends it");
+		hkSetMode(0, 1);
+		hsAttachOff();
+		ck(!hs_remote_auto, "remote off: a device's auto ends with it");
+		E.ai_auto_approve = saved_auto; E.ai_plan_mode = saved_plan; hs_remote = saved_remote;
+	}
 	ck(hkSlashRefusedRemote(":editor sh -c x") && hkSlashRefusedRemote(":e") && hkSlashRefusedRemote("/e vim"),
 	   "a phone cannot set or open the desk's editor");
 	ck(!hkSlashRefusedRemote(":edit") && !hkSlashRefusedRemote(":name x"), "but :edit and :name still work");
+	{
+		int was = hs_attached;
+		hs_attached = 1;
+		ck(hkSlashRefusedRemote(":resume abc123") && hkSlashRefusedRemote(":session new") && hkSlashRefusedRemote(":sessions clear all")
+		   && hkSlashRefusedRemote(":join sho2") && !hkSlashRefusedRemote(":say hi") && !hkSlashRefusedRemote(":agents"),
+		   "remote on: a device cannot switch the terminal's chat, start another or clear the past ones");
+		ck(!hkSlashRefusedRemote(":session") && !hkSlashRefusedRemote(":sessions") && !hkSlashRefusedRemote(":clear"),
+		   "remote on: but can see this chat, and clear it");
+		hs_attached = 0;
+		ck(!hkSlashRefusedRemote(":resume abc123"), "a headless --serve: the page picks the chat");
+		hs_attached = was;
+	}
 	hs_remote = 0;
 }
 
@@ -1936,7 +2211,7 @@ static void paste_tests(void) {
 	snprintf(b, sizeof b, "  abc123\n   def#456 \t\r\n");
 	hkSqueezeSpace(b);
 	ck(!strcmp(b, "abc123def#456"), "a wrapped, indented paste comes back as one code");
-	ck(hkLooksLikeToken("sk-ant-api03-abcdefghijklmnop", 29), "an API key is token-shaped");
+	ck(hkLooksLikeToken("sk-ant-FAKE-EXAMPLE-not-a-key", 29), "an API key is token-shaped");
 	ck(hkLooksLikeToken("Xy12abcdefghij#state0123456789", 30), "a <code>#<state> is token-shaped");
 	ck(!hkLooksLikeToken("https://example.com/abcdefghijkl", 32), "a link is not taken as a key");
 	ck(!hkLooksLikeToken("two words, both long enough", 27), "a sentence is not taken as a key");
@@ -2122,7 +2397,7 @@ static int relay_status(const char *url, const char *extra) {
 }
 
 static long relay_recv_from(hkRelay *r, const char *want, uint8_t *buf, size_t cap) {
-	char from[33];
+	char from[HR_ADDR];
 	long n;
 	while ((n = hkRelayRecv(r, from, buf, cap)) == -2) {}
 	if (n >= 0 && strcmp(from, want)) return -3;
@@ -2216,7 +2491,7 @@ static void relay_tests(const char *url, const char *invite, const char *log) {
 
 	/* the relay says when nobody is there */
 	{
-		char from[33];
+		char from[HR_ADDR];
 		uint8_t z[1] = {0};
 		hkRelaySend(&A, "0123456789abcdef0123456789abcdef", z, 1);
 		ck(hkRelayRecv(&A, from, m, sizeof m) == -2 && !strcmp(from, "0123456789abcdef0123456789abcdef"),
@@ -2295,7 +2570,10 @@ static void relay_tests(const char *url, const char *invite, const char *log) {
 			ck(stat(rp, &st) == 0 && (st.st_mode & 077) == 0, "desktop: ~/.hako/remote is private");
 		}
 
-		/* the phone's session */
+		/* the phone's session. hako answers from its own stream, "<id>/<tag>" */
+		char hra[HR_ADDR];
+		snprintf(hra, sizeof hra, "%s/%s", hr.id, hr.tag);
+		ck(strlen(hr.tag) == 8, "desktop: this :remote on has a stream of its own");
 		hkNoise I;
 		memset(&I, 0, sizeof I);
 		memcpy(I.s, A.s, 32); I.has_s = 1;
@@ -2304,7 +2582,7 @@ static void relay_tests(const char *url, const char *invite, const char *log) {
 		m[0] = HR_HS;
 		n = hkNoiseWrite(&I, NULL, 0, m + 1, sizeof m - 1);
 		hkRelaySend(&A, hr.id, m, (size_t)n + 1);
-		n = relay_recv_from(&A, hr.id, m, sizeof m);
+		n = relay_recv_from(&A, hra, m, sizeof m);
 		ck(n > 1 && m[0] == HR_HS && hkNoiseRead(&I, m + 1, (size_t)n - 1, pl, sizeof pl) >= 0, "desktop: answers the session");
 		n = hkNoiseWrite(&I, NULL, 0, m + 1, sizeof m - 1);
 		hkRelaySend(&A, hr.id, m, (size_t)n + 1);
@@ -2320,7 +2598,7 @@ static void relay_tests(const char *url, const char *invite, const char *log) {
 		static char resp[65536];
 		size_t rl = 0;
 		int eof = 0;
-		while (!eof && (n = relay_recv_from(&A, hr.id, m, sizeof m)) > 1) {
+		while (!eof && (n = relay_recv_from(&A, hra, m, sizeof m)) > 1) {
 			long l = m[0] == HR_TP ? hkNoiseOpen(&prx, NULL, 0, m + 1, (size_t)n - 1, pl) : -1;
 			if (l < 5 || pl[3] != 7) break;
 			if (pl[4] == HR_EOF) eof = 1;
@@ -2329,11 +2607,389 @@ static void relay_tests(const char *url, const char *invite, const char *log) {
 		resp[rl] = '\0';
 		ck(eof && !strncmp(resp, "HTTP/1.1 200", 12) && strstr(resp, "\"version\""),
 		   "desktop: /api/state answers through the encrypted stream, no token needed");
+
+		/* two windows of one browser, one device key, each its own stream: both
+		   sessions stay up, neither takes the other's place */
+		{
+			hkRelay W[2];
+			hkNoiseCipher wtx[2], wrx[2];
+			int up = 1;
+			for (int w = 0; w < 2; w++) {
+				memset(&W[w], 0, sizeof W[w]);
+				snprintf(W[w].url, sizeof W[w].url, "%s", url);
+				memcpy(W[w].s, A.s, 32);
+				memcpy(W[w].s_pub, A.s_pub, 32);
+				snprintf(W[w].tag, sizeof W[w].tag, "w%d", w + 1);
+				up = up && hkRelaySignIn(&W[w]) == 0 && hkRelayOpen(&W[w]) == 0;
+			}
+			usleep(400000);
+			ck(up && !strcmp(W[0].id, A.id), "desktop: two windows of one browser sign in, same device");
+			/* both handshakes at once, interleaved: the second must not reset the first */
+			hkNoise H[2];
+			for (int w = 0; w < 2; w++) {
+				memset(&H[w], 0, sizeof H[w]);
+				memcpy(H[w].s, A.s, 32); H[w].has_s = 1;
+				hkSessionPsk(H[w].psk, K); H[w].has_psk = 1;
+				hkNoiseInit(&H[w], "XXpsk3", 1, (const uint8_t *)"hako session", 12);
+				m[0] = HR_HS;
+				n = hkNoiseWrite(&H[w], NULL, 0, m + 1, sizeof m - 1);
+				hkRelaySend(&W[w], hra, m, (size_t)n + 1);
+			}
+			int hs = 1;
+			for (int w = 0; w < 2; w++) {
+				n = relay_recv_from(&W[w], hra, m, sizeof m);
+				hs = hs && n > 1 && m[0] == HR_HS && hkNoiseRead(&H[w], m + 1, (size_t)n - 1, pl, sizeof pl) >= 0;
+			}
+			for (int w = 0; w < 2; w++) {
+				m[0] = HR_HS;
+				n = hkNoiseWrite(&H[w], NULL, 0, m + 1, sizeof m - 1);
+				hkRelaySend(&W[w], hra, m, (size_t)n + 1);
+				hkNoiseSplit(&H[w], &wtx[w], &wrx[w]);
+			}
+			ck(hs, "desktop: two windows open sessions at the same time");
+			usleep(200000);
+			int both = 1;
+			for (int round = 0; round < 2; round++)
+				for (int w = 0; w < 2; w++) {
+					uint8_t pt[128];
+					int sid = 20 + round * 2 + w;
+					pt[0] = pt[1] = pt[2] = 0; pt[3] = (uint8_t)sid; pt[4] = HR_DATA;
+					memcpy(pt + 5, rq, sizeof rq - 1);
+					m[0] = HR_TP;
+					hkNoiseSeal(&wtx[w], NULL, 0, pt, 5 + sizeof rq - 1, m + 1);
+					hkRelaySend(&W[w], hra, m, 1 + 5 + sizeof rq - 1 + 16);
+					rl = 0; eof = 0;
+					while (!eof && (n = relay_recv_from(&W[w], hra, m, sizeof m)) > 1) {
+						long l = m[0] == HR_TP ? hkNoiseOpen(&wrx[w], NULL, 0, m + 1, (size_t)n - 1, pl) : -1;
+						if (l < 5 || pl[3] != (uint8_t)sid) break;
+						if (pl[4] == HR_EOF) eof = 1;
+						else if (rl + (size_t)l - 5 < sizeof resp) { memcpy(resp + rl, pl + 5, (size_t)l - 5); rl += (size_t)l - 5; }
+					}
+					resp[rl] = '\0';
+					both = both && eof && !strncmp(resp, "HTTP/1.1 200", 12);
+				}
+			ck(both, "desktop: each window gets its own answers, turn about, twice");
+			for (int w = 0; w < 2; w++) hkRelayClose(&W[w]);
+		}
 		hsAttachOff();
 		ck(!hr_on, "desktop: remote off ends the link");
 	}
 	hkRelayClose(&A);
 	alarm(0);
+}
+
+/* --- ~/.hako/credentials is shared by every running hako: a save, a provider swap or
+   a refresh in one must never log another out, for any provider. */
+static void creds_wipe(void) {
+	for (int i = 0; i < cl_creds_n; i++) {
+		clCredClear(&cl_creds[i]);
+		free(cl_creds[i].run_key);
+	}
+	memset(cl_creds, 0, sizeof cl_creds);
+	cl_creds_n = 0; cl_creds_loaded = 0; cl_creds_unreadable = 0; cl_creds_old_format = 0;
+	free(E.ai_api_key); E.ai_api_key = NULL;
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+	free(E.ai_oauth_provider); E.ai_oauth_provider = NULL;
+	E.ai_oauth_expires_at = 0;
+}
+
+static void creds_row(const char *name, const char *key, const char *refresh, long exp) {
+	clCred *c = clCredsUpsert(name);
+	clCredClear(c);
+	c->api_key = key ? strdup(key) : NULL;
+	c->oauth_refresh = refresh ? strdup(refresh) : NULL;
+	c->oauth_expires_at = exp;
+	c->dirty = 1;
+}
+
+/* another hako, a whole process with its own table, saves one row */
+static void creds_other(const char *name, const char *key, const char *refresh, long exp) {
+	pid_t k = fork();
+	if (k == 0) {
+		creds_wipe();
+		clCredsLoad();
+		creds_row(name, key, refresh, exp);
+		clCredsSave();
+		_exit(0);
+	}
+	waitpid(k, NULL, 0);
+}
+
+/* what a hako starting now would read */
+static int creds_disk_is(const char *name, const char *key, const char *refresh) {
+	pid_t k = fork();
+	if (k == 0) {
+		creds_wipe();
+		clCredsLoad();
+		clCred *c = clCredsFind(name);
+		_exit(c && clSameStr(c->api_key, key) && clSameStr(c->oauth_refresh, refresh) ? 0 : 1);
+	}
+	int st = 1;
+	waitpid(k, &st, 0);
+	return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+static void creds_write_v1(const char *path, const char *host, const char *plain) {
+	size_t n = strlen(plain);
+	unsigned char *b = (unsigned char *)strdup(plain), key[32];
+	clCredsKeyFor(host, key);
+	clXorBuf(b, n, key);
+	char *e = clB64Encode(b, n);
+	FILE *f = fopen(path, "w");
+	if (f) { fprintf(f, "%s\n%s\n", CL_CREDS_MAGIC_V1, e); fclose(f); }
+	free(e); free(b);
+}
+
+static void creds_tests(void) {
+	char tmpl[] = "/tmp/hakocredsXXXXXX", path[PATH_MAX], keep_file[PATH_MAX], empty[PATH_MAX];
+	char *dir = mkdtemp(tmpl);
+	ck(dir != NULL, "creds: a scratch home");
+	if (!dir) return;
+	char *keep_home = getenv("HOME") ? strdup(getenv("HOME")) : NULL;
+	char *keep_path = getenv("PATH") ? strdup(getenv("PATH")) : NULL;
+	char *was_key = E.ai_api_key, *was_refresh = E.ai_oauth_refresh, *was_prov = E.ai_oauth_provider, *was_ep = E.ai_endpoint;
+	long was_exp = E.ai_oauth_expires_at;
+	enum aiProviderType was_type = E.ai_provider_type;
+	E.ai_api_key = E.ai_oauth_refresh = E.ai_oauth_provider = NULL;
+	E.ai_endpoint = NULL;
+	E.ai_oauth_expires_at = 0;
+	setenv("HOME", dir, 1);
+	/* no curl to be found: a refresh that wrongly goes to the network just fails */
+	snprintf(empty, sizeof empty, "%s/nothing", dir);
+	mkdir(empty, 0700);
+	setenv("PATH", empty, 1);
+	clCredsPath(path, sizeof path);
+	snprintf(keep_file, sizeof keep_file, "%s.unreadable", path);
+	long later = hk_time_unix() + 3600;
+
+	static const char *const every[] = { "anthropic", "chatgpt", "nous", "copilot", "github-models",
+		"openrouter", "openai", "gemini", "deepseek", "groq", "custom" };
+	size_t n_every = sizeof every / sizeof *every;
+
+	/* a login made elsewhere survives a save here, for every provider */
+	creds_wipe();
+	clCredsLoad();
+	creds_row("mine", "k0", NULL, 0);
+	clCredsSave();
+	for (size_t i = 0; i < n_every; i++) {
+		char want[64];
+		snprintf(want, sizeof want, "other-%s", every[i]);
+		creds_other(every[i], want, "r", later);
+		creds_row("mine", want, NULL, 0);	/* this hako, stale, changes its own row */
+		clCredsSave();
+		char label[128];
+		snprintf(label, sizeof label, "creds: a save here keeps the %s login made elsewhere", every[i]);
+		ck(creds_disk_is(every[i], want, "r"), label);
+		ck(creds_disk_is("mine", want, NULL), "creds: and its own change");
+	}
+
+	/* a save with nothing changed never touches the file */
+	long m0 = 0, m1 = 0;
+	unlink(path);
+	creds_wipe();
+	clCredsSave();
+	hk_fs_exists(path, NULL, &m0, NULL);
+	ck(m0 == 0, "creds: nothing changed, nothing written");
+
+	/* a swap away from a provider this hako holds nothing for */
+	creds_wipe();
+	clCredsLoad();
+	hkApplyProviderAlias("deepseek");
+	creds_other("deepseek", "dk", NULL, 0);
+	clCredsSync();
+	free(E.ai_api_key); E.ai_api_key = NULL;
+	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
+	clCredsCaptureCurrent();
+	clCredsSave();
+	ck(creds_disk_is("deepseek", "dk", NULL), "creds: holding nothing is not a logout");
+
+	/* logging out is still a logout, here and elsewhere */
+	creds_wipe();
+	clCredsLoad();
+	creds_other("groq", "gk", NULL, 0);
+	creds_row("mine", "k1", NULL, 0);
+	clCredsSave();
+	ck(creds_disk_is("groq", "gk", NULL), "creds: groq saved");
+	pid_t lo = fork();
+	if (lo == 0) {
+		creds_wipe();
+		clCredsLoad();
+		creds_row("groq", NULL, NULL, 0);
+		clCredsSave();
+		_exit(0);
+	}
+	waitpid(lo, NULL, 0);
+	creds_row("mine", "k2", NULL, 0);
+	clCredsSave();
+	ck(!creds_disk_is("groq", "gk", NULL), "creds: a logout elsewhere is not undone by a save here");
+
+	/* a new login reaches a hako already running, and only if it held the old one */
+	creds_wipe();
+	hkApplyProviderAlias("anthropic");
+	creds_other("anthropic", "a1", "r1", later);
+	clCredsRestoreFor("anthropic");
+	ck(E.ai_api_key && !strcmp(E.ai_api_key, "a1"), "creds: login read");
+	creds_other("anthropic", "a2", "r2", later);
+	clCredsSync();
+	ck(E.ai_api_key && !strcmp(E.ai_api_key, "a2") && E.ai_oauth_refresh && !strcmp(E.ai_oauth_refresh, "r2"),
+		"creds: a login elsewhere reaches a running hako");
+
+	/* a refresh token another hako rotated is taken, not spent, for each that rotates */
+	static const char *const rotate[] = { "anthropic", "chatgpt", "nous" };
+	for (size_t i = 0; i < sizeof rotate / sizeof *rotate; i++) {
+		creds_wipe();
+		hkApplyProviderAlias(rotate[i]);
+		creds_other(rotate[i], "old", "r1", hk_time_unix() - 10);
+		clCredsRestoreFor(rotate[i]);
+		char *real_prov = E.ai_oauth_provider;
+		ck(real_prov && !strcmp(real_prov, rotate[i]), "creds: signed in to the rotating provider");
+		creds_other(rotate[i], "new", "r2", later);
+		/* this hako has the old one still: as if its turn began just before the rotation */
+		int rc = clOAuthRefresh(NULL);
+		char label[128];
+		snprintf(label, sizeof label, "creds: %s refresh takes the token another hako rotated", rotate[i]);
+		ck(rc == 0 && E.ai_api_key && !strcmp(E.ai_api_key, "new")
+			&& E.ai_oauth_refresh && !strcmp(E.ai_oauth_refresh, "r2"), label);
+	}
+
+	/* a failed refresh logs nobody out: no network here, so this one fails */
+	creds_wipe();
+	hkApplyProviderAlias("chatgpt");
+	creds_other("chatgpt", "ck", "cr", hk_time_unix() - 10);
+	clCredsRestoreFor("chatgpt");
+	ck(clOAuthRefresh(NULL) != 0, "creds: refresh fails with no network");
+	ck(E.ai_oauth_refresh && !strcmp(E.ai_oauth_refresh, "cr") && creds_disk_is("chatgpt", "ck", "cr"),
+		"creds: a failed refresh keeps the login");
+
+	/* a key from the environment is for this run: the saved sign-in stays */
+	creds_wipe();
+	hkApplyProviderAlias("anthropic");
+	creds_other("anthropic", "oa", "or", later);
+	E.ai_api_key = strdup("envkey");
+	clCredsAtStart(NULL);
+	ck(E.ai_api_key && !strcmp(E.ai_api_key, "envkey") && !E.ai_oauth_refresh, "creds: the environment's key is used");
+	ck(creds_disk_is("anthropic", "oa", "or"), "creds: and the saved sign-in is untouched");
+	clCredsCaptureCurrent();
+	clCredsSave();
+	ck(creds_disk_is("anthropic", "oa", "or"), "creds: a swap away does not save the environment's key");
+	hkApplyProviderAlias("deepseek");
+	clCredsRestoreFor(hkProviderLabel());
+	hkApplyProviderAlias("anthropic");
+	clCredsRestoreFor(hkProviderLabel());
+	ck(E.ai_api_key && !strcmp(E.ai_api_key, "envkey"), "creds: and a swap back still has it");
+
+	/* a key in an old session file is the only copy: it still moves */
+	creds_wipe();
+	hkApplyProviderAlias("openai");
+	E.ai_api_key = strdup("legacy");
+	clCredsAtStart("legacy");
+	ck(creds_disk_is("openai", "legacy", NULL), "creds: an old session file's key moves to the file");
+
+	/* v1: read, moved to v2, and from then on no host name in it */
+	char host[256] = "host";
+	gethostname(host, sizeof host - 1);
+	unlink(path);
+	creds_write_v1(path, host, "[nous]\noauth_refresh=nr\noauth_expires_at=99\n\n");
+	creds_wipe();
+	hkApplyProviderAlias("openai");
+	clCredsAtStart(NULL);
+	char *body = hk_fs_read(path, 65536, NULL);
+	ck(body && !strncmp(body, "HAKOCREDv2\n", 11), "creds: a v1 file moves to v2 at startup");
+	free(body);
+	ck(creds_disk_is("nous", NULL, "nr"), "creds: with its logins");
+
+	/* a v1 file from another host name reads as noise: kept, and not taken for empty */
+	unlink(path);
+	creds_write_v1(path, "a-hostname-from-another-network", "[nous]\noauth_refresh=nr\n\n");
+	char *noise = hk_fs_read(path, 65536, NULL);
+	creds_wipe();
+	clCredsLoad();
+	ck(cl_creds_unreadable, "creds: another host's file is unreadable");
+	hkApplyProviderAlias("deepseek");
+	clCredsCaptureCurrent();
+	clCredsSave();
+	char *still = hk_fs_read(path, 65536, NULL);
+	ck(still && noise && !strcmp(still, noise), "creds: a save with nothing to add leaves it alone");
+	free(still);
+	creds_row("mine", "k", NULL, 0);
+	clCredsSave();
+	char *kept = hk_fs_read(keep_file, 65536, NULL);
+	ck(kept && noise && !strcmp(kept, noise), "creds: a real save keeps it beside the new file");
+	free(kept); free(noise);
+	ck(creds_disk_is("mine", "k", NULL), "creds: and writes the new one");
+
+	/* many at once: every row lands, and the file is never half written */
+	creds_wipe();
+	creds_row("seed", "s", NULL, 0);
+	clCredsSave();
+	pid_t reader = fork();
+	if (reader == 0) {
+		for (;;) {
+			char *r = hk_fs_read(path, 65536, NULL);
+			if (!r || strncmp(r, CL_CREDS_MAGIC, strlen(CL_CREDS_MAGIC))) _exit(3);
+			free(r);
+		}
+	}
+	pid_t kids[8];
+	for (int k = 0; k < 8; k++) {
+		kids[k] = fork();
+		if (kids[k] == 0) {
+			char name[16], key[16];
+			snprintf(name, sizeof name, "p%d", k);
+			snprintf(key, sizeof key, "k%d", k);
+			for (int i = 0; i < 40; i++) {
+				creds_wipe();
+				clCredsLoad();
+				if (cl_creds_unreadable) _exit(3);
+				creds_row(name, key, NULL, 0);
+				clCredsSave();
+				snprintf(key, sizeof key, "k%d", k);
+				creds_row(name, i & 1 ? key : "x", NULL, 0);
+				clCredsSave();
+			}
+			_exit(0);
+		}
+	}
+	int torn = 0;
+	for (int k = 0; k < 8; k++) { int st = 0; waitpid(kids[k], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) torn = 1; }
+	int reader_st = 0;
+	kill(reader, SIGKILL);
+	waitpid(reader, &reader_st, 0);
+	if (WIFEXITED(reader_st)) torn = 1;
+	ck(!torn, "creds: no hako ever reads a half written file");
+	int all = 1;
+	for (int k = 0; k < 8; k++) {
+		char name[16], key[16];
+		snprintf(name, sizeof name, "p%d", k);
+		snprintf(key, sizeof key, "k%d", k);
+		if (!creds_disk_is(name, key, NULL)) all = 0;
+	}
+	ck(all, "creds: eight hakos saving at once lose no row");
+	struct stat st;
+	ck(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600, "creds: the file stays 0600");
+	char tmp_left[PATH_MAX + 8];
+	snprintf(tmp_left, sizeof tmp_left, "%s.tmp", path);
+	ck(!hk_fs_exists(tmp_left, NULL, &m1, NULL), "creds: no temp file left");
+
+	/* a refresh is for a bad credential, not any error: each one spends a rotating token */
+	ck(!hkAuthFailure("{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\"}}"),
+		"creds: a usage limit spends no refresh");
+	ck(!hkAuthFailure("{\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}"), "creds: an outage spends no refresh");
+	ck(!hkAuthFailure("{\"detail\":\"rate limit\"}"), "creds: a rate limit spends no refresh");
+	ck(hkAuthFailure("{\"error\":{\"message\":\"Provided authentication token is expired. Please try signing in again.\"}}"),
+		"creds: an expired token does");
+	ck(hkAuthFailure("{\"error\":{\"type\":\"authentication_error\"}}"), "creds: a refused key does");
+	ck(hkAuthFailure(""), "creds: no answer at all still tries");
+
+	creds_wipe();
+	if (keep_home) { setenv("HOME", keep_home, 1); free(keep_home); } else unsetenv("HOME");
+	if (keep_path) { setenv("PATH", keep_path, 1); free(keep_path); }
+	free(E.ai_endpoint);
+	E.ai_api_key = was_key; E.ai_oauth_refresh = was_refresh; E.ai_oauth_provider = was_prov; E.ai_endpoint = was_ep;
+	E.ai_oauth_expires_at = was_exp; E.ai_provider_type = was_type;
+	char cmd[PATH_MAX + 16];
+	snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+	if (system(cmd)) {}
 }
 
 int main(int argc, char **argv) {
@@ -2467,12 +3123,16 @@ int main(int argc, char **argv) {
 	sse_tests();
 	compact_tests();
 	long_session_tests();
+	stream_pipe_tests();
+	resume_tests();
+	creds_tests();
 	skill_tests();
 	context_file_tests();
 	skill_roots_tests();
 	tap_parse_tests();
 	todo_tests();
 	memory_tests();
+	guard_tests();
 	render_tests();
 	orient_tests();
 	orphan_tool_close_tests();

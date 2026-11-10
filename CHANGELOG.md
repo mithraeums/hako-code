@@ -7,9 +7,38 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ### changed
 - `--serve` carries studio's phone fixes: taps instead of hovers on a touch screen, and sheets kept above the keyboard
+- `--serve` carries studio's home-screen fix: the app reaches the bottom of the screen on iOS 26
 - `--serve` carries studio's tidier menu (a folder holds its chats) and the home-screen icon that survives a tinted home screen
 
+### added
+- several hakos on one session, each with its own model: each knows the others are there (`:agents`), and each is named for its model (claude, gpt, sho, numbered when two match). a second hako in a folder starts its own chat and says so; `:join` puts it on the other's chat, so two share one only when asked
+- `GET /api/agents` lists the hakos on the session (caps `agents`), for studio
+- memory notes say which hako (and model) saved them, and a note one hako saves reaches the others' next turn
+- a hako never writes over a file that changed since it read it: a whole-file write or a line-number edit made from a stale read is refused and the model reads it again (an exact-snippet edit still goes through). the check and the write happen under one lock on the folder, so two hakos never write at once
+- `delegate`: a model hands a self-contained subtask to a subagent, a fresh hako on this folder with its own chat, and gets its answer back. it reads only unless you are in auto mode, cannot start another, stops after 10 minutes (`HAKO_SUB_SECS`) or at ctrl-c, and never changes the folder's saved state
+- `:say <text>`: a line for the people on the chat; no model is sent it or answers it
+- a linked device cannot `:join` the terminal's chat to another one
+- ctrl-c stops a running `run_shell` command at once (and a subagent, which runs the same way): it ran on to its deadline
+- `@name <text>` sends a line to another hako on the session, and `@` completes only the ones that are live; the answer shows where it was asked. a line without `@` goes to this hako's own model, or wherever `:route <name>` points it (so several people can share one model); `:as <name>` renames this one
+- each model hears what the others said since its last turn, and every row of the session log says which hako wrote it and who a line was for
+- hako.wasm holds up to 8 remote sessions at once (`hkw_use`, `hkw_drop`), so a studio window keeps every code session it opened connected; a page that never picks one has slot 0, as before
+- `:mode auto` works with remote on, from any linked device: it is said in the terminal, logged, never saved, and ends when remote turns off
+
 ### fixed
+- `:remote on` opens its own relay stream: two hakos in one folder, or on one computer, no longer take turns, and each browser window holds its own session with it (needs the relay from the same release)
+- while `:remote on` shares the terminal's chat, a linked device cannot switch it to another, start a new one or clear the past ones: tapping an old chat on a phone used to switch the terminal
+- one hako no longer logs another out, for any provider: a save rewrote the whole credentials file from that hako's own copy, so a login made elsewhere was lost; a save now merges with the file under a lock, and the write is whole or not at all
+- a login, a logout or a rotated token from another hako applies to a running one at its next turn, without a restart
+- refresh tokens rotate, so two hakos could spend one and end the sign-in (Nous revokes it on a reuse): one refreshes at a time, and the other takes the new token
+- a usage limit or an outage no longer spends a refresh: every failed call did, one rotating token per error
+- a key from the environment is for that run: it went to disk with a blank refresh, ending a saved sign-in for that provider
+- a changed host name no longer loses every login: it was part of the file's key, and a laptop's can change with the network, so the file read as noise and the next save replaced it. the file is now `HAKOCREDv2`, without the host name; a `CLAWCREDv1` file is read and moved, and one this build cannot read is kept as `credentials.unreadable`
+- a refresh that cannot reach the server says so instead of "sign-in expired"
+- a resumed chat keeps its opening request and a digest of what the last 40 rows leave out: it used to send only those rows, and a model asked about the start of the chat made things up. a fold now logs its digest, so it survives a kill
+- the digest tells the model what it does not have is unknown, to say so and not guess
+- rows in a session log land whole when two hakos share it
+- a turn could hang for good after a process started during a model stream, such as `:remote on` in the middle of a turn: that process kept the stream's pipe open, so curl never saw hako hang up at a tool call
+- `:remote` says it is waiting for the link instead of "can't reach your account"
 - `:remote on` no longer makes a new key for the folder on every failed bind: a rate limit, an expired token or a gateway error each left the old key bound, and the account filled up with dead devices. only a real refusal does now, and a full account says so
 - a long tool turn on a cloud provider now folds as it goes: it could not fold until the next prompt, because it looked for a plain message in the tail
 - a second fold no longer loses the first one's digest; the digest keeps what you said first, then the newest lines, and counts every message ever folded

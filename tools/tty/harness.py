@@ -843,5 +843,122 @@ check(not any("<observation" in l for l in r.all_lines()), "an echoed <observati
 check(any("Done, it printed the primes" in l for l in r.all_lines()), "the sentence after it is still shown", r)
 r.close()
 
+print("§agents two hakos on one session: own chat until :join, names, @name, what each other said, :route")
+fresh()
+def fake_has(s, secs=30):                 # what a model was sent, by either hako (they share FAKE_LOG)
+    end = time.time() + secs
+    while time.time() < end:
+        if os.path.exists(FAKE_LOG) and s in open(FAKE_LOG).read(): return True
+        r1.pump(0.2); r2.pump(0.01) if 'r2' in globals() and r2 else None
+    return False
+def both_wait(r, text, secs=30):         # read both terminals: one left unread fills its pty and stalls its turn
+    end = time.time() + secs
+    while time.time() < end:
+        r1.pump(0.1); r2.pump(0.1)
+        if any(text in l for l in r.all_lines()): return True
+    return False
+r2 = None
+r1 = start(); r1.send("hello there\r"); r1.wait_for("What next?", 20); settle(r1)
+r2 = Run(); r2.wait_for("continue", 15)
+check(any("sho is on this folder's recent chat, so this hako starts its own" in l for l in r2.lines()),
+      "a second hako in the folder starts its own chat, and says how to join", r2)
+r2.send("\r"); r2.wait_for("▶▶", 15); r2.pump(1.0)
+r1.send(":agents\r"); r1.pump(1.0)
+check(any("on this session (1)" in l for l in r1.lines()), "so the first one is alone on its chat", r1)
+r2.send(":join\r"); r2.pump(1.5)
+check(any("joined sho on this chat" in l for l in r2.lines()), ":join puts it on the other hako's chat", r2)
+r1.send(":agents\r"); r1.pump(1.0)
+check(any("sho (this one)" in l for l in r1.lines()) and any("sho2 · mithraeum" in l for l in r1.lines()),
+      "each hako is listed by its model's name, the second one numbered", r1)
+r1.send("@sh\t"); r1.pump(0.6)
+check(any(l.startswith("> @sho2") for l in r1.lines()), "@ completes the other live hako", r1)
+r1.send("\x15"); r1.pump(0.3)
+r1.send("@sho2 what is here\r"); r1.pump(0.5)
+check(both_wait(r2, "[from sho] what is here", 10), "@sho2 runs as a turn in the other hako, saying who asked", r2)
+check(both_wait(r1, "sho2: Okay, here is the list"), "the asker sees the answer", r1)
+fl = open(FAKE_LOG).read()
+check(fl.count("what is here") >= 1 and "[user] what is here" not in fl, "only the asked one's model ran it")
+logs = [os.path.join(dp, f) for dp, _, fs in os.walk(os.path.join(HOME, ".hako", "projects")) for f in fs if f.endswith(".jsonl")]
+rows = "".join(open(p).read() for p in logs)
+check('"by":"sho","to":"sho2","content":"what is here"' in rows and '"role":"assistant","by":"sho2"' in rows,
+      "the log says who wrote each row and who a line was for")
+check(sum(1 for l in rows.splitlines() if '"role":"user"' in l and 'what is here' in l) == 1, "the asked line is logged once, not again by the one asked")
+open(FAKE_LOG, "w").close()
+r1.send("plain question\r"); fake_has("plain question"); settle(r1)
+fl = open(FAKE_LOG).read()
+check("Meanwhile on this session" in fl and "sho2: Okay, here is the list" in fl and "plain question" in fl,
+      "a line without @ goes to this hako's own model, told what the other said first")
+check(both_wait(r2, "sho was asked: plain question", 10), "the other hako sees it too", r2)
+r1.send(":route sho2\r"); r1.pump(0.6); open(FAKE_LOG, "w").close()
+r1.send("routed line\r")
+check(both_wait(r2, "[from sho] routed line", 10) and fake_has("routed line"), ":route sends a line without @ to the other hako", r2)
+both_wait(r1, "sho2: Okay", 15)
+r1.send("@sho to myself\r"); settle(r1)
+check(fake_has("to myself") and not any("[from sho] to myself" in l for l in r2.all_lines()),
+      "@ its own name still reaches this hako's model while routed")
+r1.send(":route off\r"); r1.pump(0.4)
+open(FAKE_LOG, "w").close()
+r1.send(":say lunch at noon\r")
+check(both_wait(r2, "chat from sho: lunch at noon", 10), ":say reaches the people on the other hako", r2)
+r2.send("after the chat\r"); fake_has("after the chat"); settle(r2)
+fl = open(FAKE_LOG).read()
+check("lunch at noon" not in fl, "and no model is sent it, or answers it")
+os.makedirs(os.path.join(PROJ, ".hako", "memory"), exist_ok=True)     # a note the other hako saved
+open(os.path.join(PROJ, ".hako", "memory", "build.md"), "w").write("<!-- by sho2 \u00b7 mithraeum hako-sho \u00b7 2026-11-08 -->\nFAKEMEM the build uses ninja\n")
+r1.send("\r"); r1.pump(0.5); open(FAKE_LOG, "w").close()
+r1.send("about the build\r")
+check(fake_has("(project, from sho2) FAKEMEM the build uses ninja"), "a note another hako saved reaches this model's next turn, saying who saved it")
+settle(r1)
+r1.send("@nobody hi\r"); both_wait(r1, "no hako named nobody", 20)
+check(any("no hako named nobody" in l and "@sho2" in l for l in r1.lines()), "an unknown @name says who is here", r1)
+r2.close(); r1.pump(1.0)
+r1.send(":agents\r"); r1.pump(0.8)
+check(any("on this session (1)" in l for l in r1.lines()), "a hako that quit leaves the list", r1)
+r1.close()
+
+print("§delegate a subagent: its own chat, read only unless auto, no nesting, a time limit")
+def sess_rows():
+    out = []
+    for dp, _, fs in os.walk(os.path.join(HOME, ".hako", "projects")):
+        for f in fs:
+            if f.endswith(".jsonl"): out.append(open(os.path.join(dp, f)).read())
+    return out
+def state_sid():
+    for dp, _, fs in os.walk(os.path.join(HOME, ".hako", "projects")):
+        if "state" in fs:
+            m = re.search(r"session_id=(\w+)", open(os.path.join(dp, "state")).read())
+            if m: return m.group(1)
+    return ""
+r = start(auto=False)
+r.send("hello\r"); r.wait_for("What next?", 20); settle(r)
+sid = state_sid()
+r.send("DELEGATE please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
+r.wait_for("Done. The directory", 40); settle(r)
+logs = sess_rows()
+check(any("subagent sho-sub (mithraeum hako-sho, read only" in l and "Okay, here is the list" in l for l in r.all_lines() + logs),
+      "delegate runs the task in a subagent and its answer comes back", r)
+check(any('"by":"sho-sub"' in x and "SUBTASK what files are here" in x for x in logs) and state_sid() == sid
+      and not any('"by":"sho-sub"' in x and '"content":"hello"' in x for x in logs),
+      "the subagent has a chat of its own, named for this hako, and leaves the folder's state alone")
+r.send("DELEGATE WRITE please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
+r.wait_for("Done. The directory", 40); settle(r)
+check(not os.path.exists(os.path.join(PROJ, "sub.txt")) and any("plan mode is on" in x for x in sess_rows()),
+      "outside auto mode the subagent changes nothing (it reads only)")
+r.send("DELEGATE TWICE please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
+r.wait_for("Done. The directory", 40); settle(r)
+check(any("cannot start another one" in x for x in sess_rows()), "a subagent cannot start another one")
+r.close()
+os.environ["HAKO_SUB_SECS"] = "3"
+r = start()                                  # auto mode: no approval, and its subagent may write
+r.send("DELEGATE WRITE please\r"); r.wait_for("Done. The directory", 40); settle(r)
+check(os.path.exists(os.path.join(PROJ, "sub.txt")), "in auto mode the subagent may change files")
+t0 = time.time(); r.send("DELEGATE LONG please\r")
+try: r.wait_for("ran past its time limit", 30)
+except SystemExit: pass
+check(any("ran past its time limit" in l for l in r.all_lines()) and time.time() - t0 < 20,
+      "a subagent past its time limit is stopped (%.0fs)" % (time.time() - t0), r)
+os.environ.pop("HAKO_SUB_SECS")
+r.close()
+
 shutil.rmtree(WORK, ignore_errors=True)
 print("RESULT:", "PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)
