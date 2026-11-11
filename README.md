@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.3.3-ece7da?style=flat-square&labelColor=14130f" alt="v0.3.3"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.0-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.0"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -366,15 +366,14 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest: v0.3.3
-v0.3.1, built: the release builds of v0.3.1 and v0.3.2 failed two Linux-only test setups, so neither has binaries.
-
-- **Pinned and archived chats.** hako keeps them beside each chat (`POST /api/session/mark`), so every browser on that computer sees the same list; the chat list and the resume picker show the newest first.
-- **Paths for cloud models.** The file tools still stay inside the project, but `run_shell` may now name a path outside it when you ask; a model no longer refuses that. The local model keeps the strict rule its bench scores best with.
-- **A crash found by the fuzzer.** A tool call cut short after an escaped backslash could make the context slimmer read and write past its buffer.
-- **A strict installer.** `install.sh` stops when a release has no `.sha256`, and macOS tarballs carry no `._` files.
-- **Clean gcc builds.** No `-Wformat-truncation` warnings at `-O0` (seen on iSh); the Windows gate fails on any warning.
-- Ships with **hako studio v0.1.1** (pinned chats, view all, a user menu, the mithraeum theme by default).
+### Latest: v0.4.0
+- **Several models on one chat.** Start a second hako on a folder and `:join` the first one's chat: each keeps its own model and is named for it, `@name` asks one of them, and each hears what the others said. `:say` is a line for the people only. Memory notes say which hako saved them and reach the others.
+- **One writer at a time.** A hako never writes over a file that changed since it read it, and two never write at once.
+- **Subagents.** A model can hand a self-contained task to a fresh hako (`delegate`), read only unless you are in auto mode.
+- **Remote for many windows.** `:remote on` shares one live chat on its own relay stream, so two hakos on one computer no longer take turns, a phone cannot switch the terminal's chat, and every studio window keeps each session it opened.
+- **No more random sign-outs.** One hako no longer logs another out, for any provider: logins merge under a lock and a running hako picks up a new one at its next turn.
+- **Long chats that hold.** A resumed chat keeps its opening request and a digest of the rest, and folds keep working through long tool turns.
+- Ships with **hako studio v0.2.0** (sessions switch without a reload, the hakos on a session, home-screen fixes on iOS 26).
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 

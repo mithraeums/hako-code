@@ -3,7 +3,7 @@
 3-char `T` frames with a small delay, so the terminal UI can be exercised with
 no weights, no model and no GPU. The reply is chosen by the LAST user message:
   "TOOL"        -> one list_dir tool call
-  "DELEGATE"    -> a delegate call (WRITE: its task writes a file, TWICE: it delegates again,
+  "DELEGATE"    -> a delegate call (NAMED: a hako's name as its model, PICKED: another model, WRITE: its task writes a file, TWICE: it delegates again,
                    LONG: its task is SLOW); "SUBWRITE" -> a write_file call
   "TWOTOOLS"    -> two tool calls in one reply (tests the approval handover)
   "ASK"         -> an ask_user question with two options
@@ -23,7 +23,9 @@ def reply_for(last):
     if "DELEGATE" in last:
         task = ("SUBWRITE please" if "WRITE" in last else "DELEGATE again" if "TWICE" in last
                 else "SLOW one" if "LONG" in last else "SUBTASK what files are here")
-        return '<tool_call>{"name": "delegate", "arguments": {"task": "%s"}}</tool_call>' % task
+        model = (', "model": "sho2"' if "NAMED" in last           # a hako's name where a model id goes
+                 else ', "model": "hako-koi"' if "PICKED" in last else "")
+        return '<tool_call>{"name": "delegate", "arguments": {"task": "%s"%s}}</tool_call>' % (task, model)
     if "SUBWRITE" in last:
         return '<tool_call>{"name": "write_file", "arguments": {"path": "sub.txt", "content": "from the subagent"}}</tool_call>'
     if "TWOTOOLS" in last:
