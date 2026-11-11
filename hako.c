@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.3.3"
+#define HAKO_VERSION "0.4.0"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -8987,7 +8987,7 @@ static const hkToolDef HK_TOOLS[] = {
 	 "\"text\":{\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"global\":{\"type\":\"integer\"}",
 	 "\"text\""},
 	{"delegate",
-	 "Hand one self-contained subtask to a subagent: a fresh hako with its own context, on this folder, which works on it and returns its answer to you. Use it for a side investigation (find where something is defined, read a large area and summarize it) so your own context stays clear. Say everything it needs in 'task'; it cannot see this conversation. It may read and search; it changes files only when you are in auto mode. Optional 'model' picks another model of this provider for it. A subagent cannot start another one.",
+	 "Hand one self-contained subtask to a subagent: a fresh hako with its own context, on this folder, which works on it and returns its answer to you. Use it for a side investigation (find where something is defined, read a large area and summarize it) so your own context stays clear. Say everything it needs in 'task'; it cannot see this conversation. It may read and search; it changes files only when you are in auto mode. Optional 'model' picks another model id of this provider for it (one :models lists, never a hako's name); leave it out to use yours. A subagent cannot start another one.",
 	 "\"task\":{\"type\":\"string\"},\"model\":{\"type\":\"string\"}",
 	 "\"task\""},
 	{"todo",
@@ -12868,14 +12868,21 @@ static int hkModelsLive(char out[][96], int max, int force, long *age) {
    provider's model selected and the next turn failed on a model the new
    provider has never heard of — the user hit this on iSh after :login
    anthropic. Both paths call it now. */
-static void hkHealModelForProvider(aiData *data) {
-	static char live1[HK_MODELS_MAX][96];
-	clOAuthEnsureFresh(data);
-	int lv = hkModelsLive(live1, HK_MODELS_MAX, 0, NULL);
+static char hk_live1[HK_MODELS_MAX][96];
+/* A model this provider has: its family, and on the live list when there is one. */
+static int hkModelHere(const char *model, int *lv) {
+	*lv = hkModelsLive(hk_live1, HK_MODELS_MAX, 0, NULL);
 	int known = 0;
-	for (int i = 0; i < lv && E.ai_model; i++)
-		if (!strcmp(E.ai_model, live1[i])) { known = 1; break; }
-	if (hkModelFitsProvider(E.ai_provider_type, E.ai_model) && (lv == 0 || known)) return;
+	for (int i = 0; i < *lv && model; i++)
+		if (!strcmp(model, hk_live1[i])) { known = 1; break; }
+	return hkModelFitsProvider(E.ai_provider_type, model) && (*lv == 0 || known);
+}
+
+static void hkHealModelForProvider(aiData *data) {
+	char (*live1)[96] = hk_live1;
+	clOAuthEnsureFresh(data);
+	int lv;
+	if (hkModelHere(E.ai_model, &lv)) return;
 
 	const char *pref = hkProviderDefaultModel(E.ai_provider_type);
 	const char *dm = NULL;
@@ -18875,13 +18882,16 @@ static char *hkToolDelegate(const char *input_json) {
 	char *mraw = hkExtractJsonString(input_json, "model");
 	char *model = mraw ? hkJsonUnescape(mraw, (int)strlen(mraw)) : NULL;
 	free(mraw);
+	int lv;
+	char *notmodel = model && *model && !hkModelHere(model, &lv) ? model : NULL;   /* e.g. a hako's name: use ours */
+	if (notmodel) model = NULL;
 	char exe[PATH_MAX], tf[] = "/tmp/hako-task-XXXXXX";
 	int tfd = clOwnPath(exe, sizeof exe) == 0 ? mkstemp(tf) : -1;     /* the task, as the subagent's stdin */
 	size_t tl = strlen(task);
 	int ok = tfd >= 0 && write(tfd, task, tl) == (ssize_t)tl;
 	if (tfd >= 0) close(tfd);
 	free(task);
-	if (!ok) { if (tfd >= 0) unlink(tf); free(model); return strdup("error: cannot start a subagent"); }
+	if (!ok) { if (tfd >= 0) unlink(tf); free(model); free(notmodel); return strdup("error: cannot start a subagent"); }
 	char name[40];
 	snprintf(name, sizeof name, "%.16s-sub", hk_agent_name[0] ? hk_agent_name : "hako");
 	int autom = hkAutoNow(), secs = getenv("HAKO_SUB_SECS") ? atoi(getenv("HAKO_SUB_SECS")) : 600;
@@ -18905,7 +18915,8 @@ static char *hkToolDelegate(const char *input_json) {
 	char head[200];
 	snprintf(head, sizeof head, "subagent %s (%s %s, %s, %lds)", name, hkProviderLabel(),
 	         model && *model ? model : (E.ai_model ? E.ai_model : ""), autom ? "auto" : "read only", took);
-	free(model);
+	if (notmodel) hkCatf(head, strlen(head), sizeof head, "; %.40s is not a model of this provider, so it ran on this one", notmodel);
+	free(model); free(notmodel);
 	char *resp = out ? hkExtractJsonString(out, "response") : NULL;
 	char *err = !resp && out ? hkExtractJsonString(out, "error") : NULL;
 	const char *why = !out ? NULL : strstr(out, "error: stopped:") ? "you pressed ctrl-c"
@@ -23633,6 +23644,8 @@ static void clUsage(void) {
 int main(int argc, char **argv) {
 	static char outbuf[1 << 16];
 	setvbuf(stdout, outbuf, _IOFBF, sizeof outbuf);
+	/* set before anything saves: a subagent's model (HAKO_MODEL) is never the folder's */
+	hk_subagent = getenv("HAKO_AGENT_DEPTH") && atoi(getenv("HAKO_AGENT_DEPTH")) > 0 ? atoi(getenv("HAKO_AGENT_DEPTH")) : 0;
 	clInitConfig();
 	clLoadRc();
 	hkLoadSession();
@@ -23789,8 +23802,7 @@ int main(int argc, char **argv) {
 
 	/* a subagent of another hako (delegate): a fresh chat of its own; read only
 	   unless that hako is in auto mode, with nobody at a terminal to ask */
-	if (getenv("HAKO_AGENT_DEPTH") && atoi(getenv("HAKO_AGENT_DEPTH")) > 0) {
-		hk_subagent = atoi(getenv("HAKO_AGENT_DEPTH"));
+	if (hk_subagent) {
 		hkSessionFresh(NULL);
 		const char *nm = getenv("HAKO_AGENT_NAME");
 		if (nm && strlen(nm) < sizeof hk_agent_name && strspn(nm, "abcdefghijklmnopqrstuvwxyz0123456789-") == strlen(nm))

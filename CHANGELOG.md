@@ -5,6 +5,8 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-11-11
+
 ### changed
 - `--serve` carries studio's phone fixes: taps instead of hovers on a touch screen, and sheets kept above the keyboard
 - `--serve` carries studio's home-screen fix: the app reaches the bottom of the screen on iOS 26
@@ -15,7 +17,7 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - `GET /api/agents` lists the hakos on the session (caps `agents`), for studio
 - memory notes say which hako (and model) saved them, and a note one hako saves reaches the others' next turn
 - a hako never writes over a file that changed since it read it: a whole-file write or a line-number edit made from a stale read is refused and the model reads it again (an exact-snippet edit still goes through). the check and the write happen under one lock on the folder, so two hakos never write at once
-- `delegate`: a model hands a self-contained subtask to a subagent, a fresh hako on this folder with its own chat, and gets its answer back. it reads only unless you are in auto mode, cannot start another, stops after 10 minutes (`HAKO_SUB_SECS`) or at ctrl-c, and never changes the folder's saved state
+- `delegate`: a model hands a self-contained subtask to a subagent, a fresh hako on this folder with its own chat, and gets its answer back. it reads only unless you are in auto mode, cannot start another, stops after 10 minutes (`HAKO_SUB_SECS`) or at ctrl-c, and never changes the folder's saved state, its model included. a model that names a hako where a model goes (seen with a real one: `claude2`) gets its own model for the subagent instead of an error
 - `:say <text>`: a line for the people on the chat; no model is sent it or answers it
 - a linked device cannot `:join` the terminal's chat to another one
 - ctrl-c stops a running `run_shell` command at once (and a subagent, which runs the same way): it ran on to its deadline

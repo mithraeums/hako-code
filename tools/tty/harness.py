@@ -940,6 +940,20 @@ check(any("subagent sho-sub (mithraeum hako-sho, read only" in l and "Okay, here
 check(any('"by":"sho-sub"' in x and "SUBTASK what files are here" in x for x in logs) and state_sid() == sid
       and not any('"by":"sho-sub"' in x and '"content":"hello"' in x for x in logs),
       "the subagent has a chat of its own, named for this hako, and leaves the folder's state alone")
+r.send("DELEGATE NAMED please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
+r.wait_for("Done. The directory", 40); settle(r)
+check(any("sho2 is not a model of this provider" in x and "Okay, here is the list" in x for x in sess_rows()),
+      "a hako's name given as the model runs the subagent on this model")
+def state_model():
+    for dp, _, fs in os.walk(os.path.join(HOME, ".hako")):
+        if "state" in fs:
+            m = re.search(r"ai_model=(\S+)", open(os.path.join(dp, "state")).read())
+            if m and m.group(1) != "hako-sho": return m.group(1)
+    return "hako-sho"
+r.send("DELEGATE PICKED please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
+r.wait_for("Done. The directory", 40); settle(r)
+check(any("subagent sho-sub (mithraeum hako-koi" in x for x in sess_rows()) and state_model() == "hako-sho",
+      "a subagent on another model leaves the saved model alone (%s)" % state_model())
 r.send("DELEGATE WRITE please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
 r.wait_for("Done. The directory", 40); settle(r)
 check(not os.path.exists(os.path.join(PROJ, "sub.txt")) and any("plan mode is on" in x for x in sess_rows()),
