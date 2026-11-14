@@ -9,6 +9,9 @@ no weights, no model and no GPU. The reply is chosen by the LAST user message:
   "ASK"         -> an ask_user question with two options
   "SLOW"        -> the same short answer after 30 s (a cold local model)
   "ECHO"        -> a reply that repeats an <observation> before its sentence (small models do)
+  "DRIP"        -> one line streamed slowly, so another hako can write while it is half shown
+  "GREET"       -> a word, then a line to the other hako on the chat ("@sho2 hi from sho")
+  "PINGPONG"    -> a line back to the other hako, every time (models answering models)
   <observation> -> a one-line wrap-up
   anything else -> a short bulleted answer
 Every frame received is appended to $FAKE_LOG, so a test can see what the
@@ -16,7 +19,16 @@ model was given (e.g. that a resumed session carried its <observation>s)."""
 import os, sys, time
 log = open(os.environ.get("FAKE_LOG", "/dev/null"), "a")
 inp, out = sys.stdin.buffer, sys.stdout.buffer
-def reply_for(last):
+def reply_for(last, system=""):
+    import re
+    me = (re.search(r"You are ([a-z0-9-]+)\.", system) or [None, "me"])[1]
+    other = (re.search(r"Also on this chat: ([a-z0-9-]+)", system) or [None, "nobody"])[1]
+    if "GREET" in last:
+        return "Sure.\n@%s hi from %s" % (other, me)
+    if "PINGPONG" in last:
+        return "@%s PINGPONG from %s" % (other, me)
+    if "DRIP" in last:
+        return "one two three four five six seven eight nine ten\nend of drip"
     if "PLAN" in last:
         return ('<tool_call>{"name": "todo", "arguments": {"items": '
                 '"[x] read the file\\n[ ] change it\\n[ ] run the tests"}}</tool_call>')
@@ -48,22 +60,24 @@ while True:
     hdr = inp.readline()
     if not hdr: break
     n, _ntok, _mt, stream = hdr.split()
-    last = ""
+    last = system = ""
     for _ in range(int(n)):
         role = inp.readline().decode().strip()
         ln = int(inp.readline().decode().strip())
         body = inp.read(ln).decode("utf-8", "replace")
         log.write(f"[{role}] {body}\n")
         if role == "user": last = body
+        if role == "system": system = body
     log.write("---\n"); log.flush()
     time.sleep(float(os.environ.get("HAKO_FAKE_DELAY", "0")))   # a slow turn, on demand
     if "SLOW" in last: time.sleep(30)
-    rep = reply_for(last)
+    rep = reply_for(last, system)
+    drip = 0.4 if "DRIP" in last else 0.03
     if int(stream):
         for line in rep.split("\n"):
             for i in range(0, max(len(line), 1), 3):
                 b = line[i:i+3].encode()
-                out.write(f"T {len(b)}\n".encode() + b); out.flush(); time.sleep(0.03)
+                out.write(f"T {len(b)}\n".encode() + b); out.flush(); time.sleep(drip)
             b = b"\n"; out.write(f"T 1\n".encode() + b); out.flush()
     b = rep.encode()
     out.write(f"R {len(b)}\n".encode() + b); out.flush()

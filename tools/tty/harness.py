@@ -28,6 +28,7 @@ os.environ["HAKO_UPDATE_CHECK"] = "0"   # no GitHub calls from a test run (§upd
 os.environ.setdefault("HAKO_RELAY_URL", "http://127.0.0.1:9")   # nor the live relay: :remote off waited out its calls
 HOME, PROJ, FAKE_LOG = (os.path.join(WORK, d) for d in ("home", "proj", "fake.log"))
 COLS, ROWS = int(os.environ.get("COLS", 100)), int(os.environ.get("ROWS", 40))
+for _k in ("TERM_PROGRAM", "HAKO_STATUS"): os.environ.pop(_k, None)   # run from Rex or not, the same bytes (§status sets it)
 ok = True
 def check(cond, what, dump=None):
     global ok
@@ -319,6 +320,77 @@ check(any(l.startswith(">") and "abc" in l for l in r.lines()), "and typing afte
 r.close()
 os.environ["HAKO_FAKE_DELAY"] = "0"
 
+# ---- 3k2b. Rex shows a pane working, waiting on you or done from OSC 7501 (what
+# Claude Code sends). hako said nothing, so its pane looked idle through every
+# turn and every approval. Only where the terminal reads it: elsewhere, no bytes.
+def st7501(raw): return re.findall(rb"\x1b\]7501;([^\x1b]*)\x1b\\", raw)
+def st_wait(r, last, secs=20):                # the report is the signal: a loaded box ends the turn late
+    end = time.time() + secs
+    while time.time() < end and st7501(r.raw)[-1:] != [last]: r.pump(0.2)
+r = start(auto=False)
+r.send("TOOL please\r"); r.wait_for("Allow?", 20); r.pump(0.4); r.send("\r")
+r.wait_for("Done. The directory", 30); settle(r); r.close(); r.pump(0.5)
+check(st7501(r.raw) == [], "outside Rex hako sends no status report")
+os.environ["TERM_PROGRAM"] = "rex"
+r = start(auto=False)
+check(st7501(r.raw) == [b"app=hako:state=idle"], "in Rex hako starts idle (%r)" % st7501(r.raw))
+r.send("TOOL please\r"); r.wait_for("Allow?", 20); r.pump(0.4)
+check(st7501(r.raw)[-2:] == [b"app=hako:state=working", b"app=hako:state=blocked:kind=permission"],
+      "a turn says working, and the approval says it waits on you (%r)" % st7501(r.raw)[-2:])
+r.send("\r"); r.wait_for("Done. The directory", 30); st_wait(r, b"app=hako:state=done")
+check(st7501(r.raw)[-2:] == [b"app=hako:state=working", b"app=hako:state=done"],
+      "after the approval it is working again, then done (%r)" % st7501(r.raw)[-2:])
+# three questions: the menu's enter raced the line reader for the tty (ask_user
+# never claimed it) and won only about half the time
+asked = []
+for _ in range(3):
+    m = len(r.raw)
+    r.send("ASK me\r"); r.wait_for("Which one?", 20); st_wait(r, b"app=hako:state=blocked:kind=question")
+    blocked = st7501(r.raw)[-1:] == [b"app=hako:state=blocked:kind=question"]
+    r.send("\r"); st_wait(r, b"app=hako:state=done")
+    asked.append((blocked, st7501(r.raw[m:])[-1:] == [b"app=hako:state=done"]))
+check(all(a for a, _ in asked), "a question from the model says it waits on you (%r)" % asked)
+check(all(d for _, d in asked), "answered, each turn ends done: the enter reached the menu (%r)" % asked)
+r.close(); st_wait(r, b"state=clear", 5)
+check(st7501(r.raw)[-1:] == [b"state=clear"], "quitting clears it (%r)" % st7501(r.raw)[-1:])
+os.environ.pop("TERM_PROGRAM")
+
+# ---- 3k2c. every redraw is one frame. A menu key erased the bar, climbed 20
+# rows, painted the box and the bar and climbed back, all on screen with the
+# cursor showing: Rex's cursor trail drew each hop, and the spinner hopped to its
+# row and back every 80ms. Now synchronized output (2026) and a hidden cursor
+# hold each paint until it is whole, and no frame is left open across a wait for
+# a key (the command's bracket around a menu held the screen until the
+# terminal timed out).
+def unframed(seg):
+    out = b""; on = False
+    for part in re.split(rb"(\x1b\[\?2026[hl])", seg):
+        if part == b"\x1b[?2026h": on = True
+        elif part == b"\x1b[?2026l": on = False
+        elif not on: out += part
+    return out
+def hops(b): return len(re.findall(rb"\x1b\[\d*A|\x1b7|\x1b\[J", b))
+os.environ["HAKO_FAKE_DELAY"] = "2"
+r = start()
+n = len(r.raw); r.send("TOOL please\r"); r.wait_for("Done. The directory", 30); settle(r); r.pump(0.5)
+seg = r.raw[n:]
+check(seg.count(b"\x1b[?2026h") >= 3 and hops(unframed(seg)) == 0,
+      "a turn (spinner, tool, stream, bar) moves the cursor only inside frames (%d outside)" % hops(unframed(seg)))
+r.send(":provider\r"); r.wait_for("Provider", 10); r.pump(0.5)
+check(r.raw.rfind(b"\x1b[?2026l") > r.raw.rfind(b"\x1b[?2026h") and r.raw.rfind(b"\x1b[?25h") > r.raw.rfind(b"\x1b[?25l"),
+      "a menu waits for a key with no frame open and the cursor shown")
+n = len(r.raw); r.send("\x1b[B"); r.pump(0.8); seg = r.raw[n:]
+check(seg.startswith(b"\x1b[?2026h\x1b[?25l") and seg.endswith(b"\x1b[?25h\x1b[?2026l") and seg.count(b"\x1b[?2026h") == 1,
+      "a menu key repaints as one frame (%r ... %r)" % (seg[:16], seg[-16:]))
+r.send("\x1b"); r.pump(0.5); r.close()
+os.environ["HAKO_FAKE_DELAY"] = "0"
+r = start(auto=False)                        # an approval's menu has no command around it: its own frames
+r.send("TOOL please\r"); r.wait_for("Allow?", 20); r.pump(0.6)
+n = len(r.raw); r.send("\x1b[B"); r.pump(0.8); seg = r.raw[n:]
+check(seg.startswith(b"\x1b[?2026h\x1b[?25l") and seg.endswith(b"\x1b[?25h\x1b[?2026l") and seg.count(b"\x1b[?2026h") == 1,
+      "an approval's menu key repaints as one frame too (%r ... %r)" % (seg[:16], seg[-16:]))
+r.send("\x1b[A\r"); r.wait_for("Done. The directory", 30); r.close()
+
 # ---- 3k3. a model that says nothing after its tool ran has finished, not failed.
 os.environ["FAKE_QUIET_AFTER_TOOL"] = "1"
 r = start()
@@ -526,6 +598,27 @@ L = r.all_lines()
 check(any("the provider said the context was full" in l for l in L), "a provider's \"prompt is too long\" folds the chat", r)
 check(sum("Done." in l for l in L) > seen and not any("prompt is too long" in l for l in L), "and the turn answers, no error on screen", r)
 r.close()
+# a sign-in its server has ended: said once, with the reason, the dead token not tried again
+os.environ["HAKO_ANTHROPIC_TOKEN_URL"] = "http://127.0.0.1:%d/v1/oauth/token" % APORT
+anth_home(APORT)
+open(os.path.join(HOME, ".hako", "state"), "w").write(
+    "ai_provider=anthropic\nai_oauth_provider=anthropic\nai_api_key=fake-token\n"
+    "ai_oauth_refresh=r\nai_oauth_expires_at=4102444800\n")
+r = Run(); r.wait_for("Trust this directory", 10); r.send("y\r"); r.wait_for("\u25b6\u25b6", 10)
+r.send("CLAUDEEXPIRED one\r"); r.wait_for("signs in again", 20); settle(r)
+r.send("CLAUDEEXPIRED two\r"); r.pump(0.5)
+end = time.time() + 20
+while time.time() < end and sum("signs in again" in l for l in r.all_lines()) < 2: r.pump(0.1)
+settle(r)
+L = r.all_lines()
+refreshes = open(os.path.join(WORK, "anth.log.refresh")).read().count("refresh") if os.path.exists(os.path.join(WORK, "anth.log.refresh")) else 0
+check(sum("sign-in expired (Refresh token expired); run :login anthropic again" in l for l in L) == 1 and not any("refresh failed" in l for l in L),
+      "a refused sign-in refresh is said once, with the server's reason", r)
+check(sum("the anthropic sign-in has ended: :login anthropic signs in again" in l for l in L) == 2,
+      "each turn after says how to sign in again", r)
+check(refreshes == 1, "and the refused token is not sent again (%d refreshes)" % refreshes)
+r.close()
+os.environ.pop("HAKO_ANTHROPIC_TOKEN_URL")
 anth_home(APORT)
 os.makedirs(PROJ, exist_ok=True)
 pp = subprocess.run([HAKO, "--pipe"], input=b'{"type":"prompt","text":"CLAUDETOOL"}\n', capture_output=True,
@@ -575,8 +668,14 @@ L = r.all_lines()
 sent = open(GLOG, errors="replace").read()
 check("no project directory" not in sent and not any("no project directory" in l for l in L),
       "hako hangs up at </tool>, so an invented result goes nowhere", r)
-r.send(":models refresh\r"); r.wait_for("gpt-5.4-mini", 10); settle(r)
-check(any("gpt-5.4-mini" in l for l in r.all_lines()), "the model list reads the codex catalog's slugs", r)
+r.send("GPTLIMIT\r"); r.wait_for("usage limit", 20); settle(r)
+check(any("The usage limit has been reached (resets in 3h 12m)" in l for l in r.all_lines()), "a usage limit says when it resets", r)
+r.send(":models refresh\r"); r.wait_for("gpt-fake-mini", 10); settle(r)
+L = r.all_lines()
+check(any("gpt-fake-mini" in l for l in L), "the model list reads the codex catalog's slugs", r)
+check(any("gpt-fake-hidden" in l for l in L), "and still offers the ones codex hides", r)
+iv = [i for i, l in enumerate(L) if "gpt-fake-mini" in l]; ih = [i for i, l in enumerate(L) if "gpt-fake-hidden" in l]
+check(iv and ih and ih[-1] > iv[-1], "after the ones it lists", r)
 r.close()
 srv.kill()
 
@@ -859,14 +958,24 @@ def both_wait(r, text, secs=30):         # read both terminals: one left unread 
     return False
 r2 = None
 r1 = start(); r1.send("hello there\r"); r1.wait_for("What next?", 20); settle(r1)
-r2 = Run(); r2.wait_for("continue", 15)
-check(any("sho is on this folder's recent chat, so this hako starts its own" in l for l in r2.lines()),
+r2 = Run(); r2.wait_for("starts its own", 15); r2.wait_for("▶▶", 15); r2.pump(1.0)
+check(any("sho is on this folder's recent chat, so this hako starts its own. :join sho puts it there" in l for l in r2.lines()),
       "a second hako in the folder starts its own chat, and says how to join", r2)
-r2.send("\r"); r2.wait_for("▶▶", 15); r2.pump(1.0)
+check(not any("continue" in l or "resume one of" in l for l in r2.all_lines()) and any("session new" in l for l in r2.all_lines()),
+      "and does not then ask which session, under a banner that said resumed", r2)
 r1.send(":agents\r"); r1.pump(1.0)
 check(any("on this session (1)" in l for l in r1.lines()), "so the first one is alone on its chat", r1)
-r2.send(":join\r"); r2.pump(1.5)
-check(any("joined sho on this chat" in l for l in r2.lines()), ":join puts it on the other hako's chat", r2)
+r1.send(":name chat a\r"); r1.pump(0.6)
+r2.send(':join "Chat A"\r'); r2.pump(1.5)
+check(any("joined sho on this chat" in l for l in r2.lines()), ":join puts it on the other hako's chat, by the chat's name", r2)
+check(any("sho was asked: hello there" in l for l in r2.all_lines()) and any("joined sho on this chat. this hako is sho2" in l for l in r2.lines()),
+      "the joiner takes its own name first, so the chat's past turns show as the other's", r2)
+check(sum("resumed:" in l for l in r2.all_lines()) == 1, "the switch says resumed once (%d)" % sum("resumed:" in l for l in r2.all_lines()), r2)
+check(any("\u00b7 alpha.txt" in l for l in r2.all_lines()) and not any("* `alpha.txt`" in l for l in r2.all_lines()),
+      "another hako's answer shows as words, not markdown marks", r2)
+check(both_wait(r1, "sho2 is on this chat now (mithraeum hako-sho)", 10), "the one already there is told who came", r1)
+r2.send(":join\r"); r2.pump(0.8)
+check(any("sho is on this chat with you already" in l for l in r2.lines()), "a :join once joined says who is here, not that nobody is", r2)
 r1.send(":agents\r"); r1.pump(1.0)
 check(any("sho (this one)" in l for l in r1.lines()) and any("sho2 · mithraeum" in l for l in r1.lines()),
       "each hako is listed by its model's name, the second one numbered", r1)
@@ -889,6 +998,9 @@ fl = open(FAKE_LOG).read()
 check("Meanwhile on this session" in fl and "sho2: Okay, here is the list" in fl and "plain question" in fl,
       "a line without @ goes to this hako's own model, told what the other said first")
 check(both_wait(r2, "sho was asked: plain question", 10), "the other hako sees it too", r2)
+rows = "".join(open(p).read() for p in logs)
+check(not any('"role":"system"' in l and ("was asked" in l or "sho2: Okay" in l) for l in rows.splitlines()),
+      "what a hako shows of the other's rows is not logged again")
 r1.send(":route sho2\r"); r1.pump(0.6); open(FAKE_LOG, "w").close()
 r1.send("routed line\r")
 check(both_wait(r2, "[from sho] routed line", 10) and fake_has("routed line"), ":route sends a line without @ to the other hako", r2)
@@ -911,7 +1023,61 @@ check(fake_has("(project, from sho2) FAKEMEM the build uses ninja"), "a note ano
 settle(r1)
 r1.send("@nobody hi\r"); both_wait(r1, "no hako named nobody", 20)
 check(any("no hako named nobody" in l and "@sho2" in l for l in r1.lines()), "an unknown @name says who is here", r1)
-r2.close(); r1.pump(1.0)
+def turns(r): return sum("worked for" in l for l in r.all_lines())
+def quiet(secs=1.5):                     # both idle: no turn ended for a while
+    n = (turns(r1), turns(r2)); end = time.time() + 60
+    while time.time() < end:
+        r1.pump(secs / 2); r2.pump(secs / 2)
+        if (turns(r1), turns(r2)) == n and not any("thinking" in l or "listening" in l for l in r1.lines() + r2.lines()): return
+        n = (turns(r1), turns(r2))
+quiet()
+t1 = turns(r1)
+r1.send("DRIP now\r"); both_wait(r1, "one two", 15)          # half a streamed line is up
+r1.send("draft"); r1.pump(0.3)
+r2.send(":say during the drip\r")
+check(both_wait(r1, "chat from sho2: during the drip", 15) and not any("end of drip" in l for l in r1.all_lines()),
+      "another hako's line shows during this one's turn, not after it", r1)
+end = time.time() + 3                         # the field is redrawn just after the row
+while time.time() < end and not any(l.startswith("> draft") for l in r1.lines()): r1.pump(0.1); r2.pump(0.02)
+check(any(l.startswith("> draft") for l in r1.lines()), "what was being typed stays in the field", r1)
+end = time.time() + 20
+while turns(r1) == t1 and time.time() < end: r1.pump(0.2); r2.pump(0.05)
+al = r1.all_lines()
+check(sum("one two three four five six seven eight nine ten" in l for l in al) == 1
+      and al.index(next(l for l in al if "during the drip" in l)) > al.index(next(l for l in al if "nine ten" in l)),
+      "it waits for the streamed line it would split, which stays whole", r1)
+r1.send("\x15"); quiet()
+r2.send("please fix the file\r"); quiet()
+open(FAKE_LOG, "w").close()
+r1.send("thanks\r"); fake_has("please fix the file"); quiet()
+check('<observation tool="list_dir">' not in open(FAKE_LOG).read(),
+      "a task in what another hako was asked does not set this model off on one (the line asked is judged)")
+open(FAKE_LOG, "w").close()
+r2.send("GREET him\r")
+check(both_wait(r1, "[from sho2] hi from sho2", 20), "a model's line that starts with @name runs as a turn in that hako", r1)
+check(fake_has("Also on this chat: sho (mithraeum hako-sho)") and fake_has("@sho hi!"),
+      "a model is told who else is on the chat, and how to talk to one")
+check(not any("@sho hi from sho2" in l for l in r1.all_lines()) and both_wait(r2, "→ sho", 5),
+      "the one it was for gets it once, as a line, and the sender says where it went", r1)
+quiet()
+r1.send("PINGPONG start\r")
+check(both_wait(r2, "not sent on", 60), "models answering each other stop after three, for a person to go on", r2)
+quiet()
+rows = "".join(open(p).read() for p in logs)
+hops = [l for l in rows.splitlines() if "PINGPONG from" in l and '"role":"user"' in l]
+check(len(hops) == 3 and '"hop":3' in hops[-1] and not any('"hop":4' in l for l in hops), "three lines, hop 1 to 3 (%d)" % len(hops))
+r1.send("TOOL now\r"); both_wait(r2, "sho: Done. The directory", 20); quiet()
+check(not any("<tool_call" in l for l in r2.all_lines()), "another hako's tool calls are not shown or shared as its words", r2)
+r2.send(":provider anthropic\r"); r2.pump(1.0)
+check(any("not signed in to anthropic yet: :login anthropic" in l for l in r2.lines()), "a switch to a provider with no sign-in says so then, not at the next turn", r2)
+check(any("this hako only: another works in this folder" in l for l in r2.lines())
+      and all("ai_provider=mithraeum" in open(os.path.join(dp, "state")).read() for dp, _, fs in os.walk(os.path.join(HOME, ".hako")) if "state" in fs),
+      "with another hako in the folder, a switch is this hako's alone: the folder keeps its provider", r2)
+check(both_wait(r1, "sho2 is claude now", 10), "and the other is told it was renamed", r1)
+r2.send("next line\r"); r2.pump(2.0)
+check(any("not signed in to anthropic. Run :login anthropic" in l for l in r2.lines()), "the turn's error names the : command", r2)
+os.kill(r2.pid, signal.SIGKILL); os.waitpid(r2.pid, 0); r1.pump(1.0)    # its terminal closed: no :q, its file stays behind (reaped, as a shell would)
+check(both_wait(r1, "claude left this chat", 10), "a hako that goes is said to have left, without a key pressed", r1)
 r1.send(":agents\r"); r1.pump(0.8)
 check(any("on this session (1)" in l for l in r1.lines()), "a hako that quit leaves the list", r1)
 r1.close()

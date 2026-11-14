@@ -449,6 +449,82 @@ static void resume_tests(void) {
 	ck(a.message_count > 2 && strstr(a.messages[1].content, "hsearch"), "resume: what a fold kept survives a kill");
 	clCleanupAI(&a);
 
+	/* a chat two hakos shared: the other one's turns are theirs, not this model's */
+	char was_name[24];
+	snprintf(was_name, sizeof was_name, "%s", hk_agent_name);
+	E.session_id = strdup("resumeshared");
+	snprintf(hk_agent_name, sizeof hk_agent_name, "claude");
+	hkLogMessage("user", "fix the bug in calc.py");
+	hkLogMessage("assistant", "on it");
+	hkSessionLogPath(path, sizeof path);
+	hk_fs_write(path, "{\"ts\":1,\"role\":\"join\",\"by\":\"sho\",\"with\":\"claude\"}\n", 50, 1);
+	snprintf(hk_agent_name, sizeof hk_agent_name, "sho");
+	hkLogMessage("user", "hey sho");
+	hkLogMessage("system", "worked for 2m 3s");
+	hkLogMessage("assistant", "Hello! How can I assist you today?");
+	hkLogMessageTo("user", "claude, check calc.py again", "claude", 0);
+	snprintf(hk_agent_name, sizeof hk_agent_name, "claude");
+	hkLogMessage("assistant", "calc.py is fine now");
+	snprintf(hk_agent_name, sizeof hk_agent_name, "sho");
+	hkLogMessage("assistant", "<tool_call>{\"name\": \"list_dir\"}</tool_call>a later remark\n@claude are you there");
+	snprintf(hk_agent_name, sizeof hk_agent_name, "claude");
+	memset(&a, 0, sizeof a);
+	clInitAI(&a);
+	hkLoadHistoryTail(&a, AI_HISTORY_MAX, 40);
+	int own_hello = 0, sho_notice = 0, shown_sho = 0;
+	for (int i = 0; i < a.message_count; i++) {
+		if (!strcmp(a.messages[i].role, "assistant") && strstr(a.messages[i].content, "How can I assist")) own_hello++;
+		if (strstr(a.messages[i].content, "worked for 2m")) sho_notice++;
+	}
+	for (int i = 0; i < a.history_count; i++) if (a.history[i] && !strcmp(a.history[i], "sho: Hello! How can I assist you today?")) shown_sho++;
+	ck(a.message_count == 4 && own_hello == 0, "shared chat: the other hako's answers are not this model's turns");
+	ck(a.message_count == 4 && !strcmp(a.messages[2].role, "user") && strstr(a.messages[2].content, "sho was asked: hey sho")
+	   && strstr(a.messages[2].content, "[from sho] claude, check calc.py again"), "shared chat: what it said reaches this model as notes, with the line it sent");
+	ck(sho_notice == 0 && shown_sho == 1, "shared chat: its notices stay out, its answer is shown as its own");
+	ck(hk_resume_notes && strstr(hk_resume_notes, "sho: a later remark"), "shared chat: what came after this model's last turn goes with its next");
+	ck(hk_resume_notes && !strstr(hk_resume_notes, "<tool_call") && !strstr(hk_resume_notes, "are you there"),
+	   "shared chat: the other's tool calls, and what it said to this one, are not in the notes");
+	clCleanupAI(&a);
+	free(hk_resume_notes); hk_resume_notes = NULL;
+
+	/* a model's line for another hako: where it starts and stops */
+	{
+		char to[24];
+		const char *b, *e, *r1 = "Sure.\n**@sho2:** hi there\nhow are you\n\nbye", *s = hkNextAddressed(r1, to, &b, &e);
+		ck(s && !strcmp(to, "sho2") && !strncmp(b, "hi there\nhow are you", (size_t)(e - b)) && e - b == 20,
+		   "@name: a line that starts with it, to a blank line, marks and all");
+		ck(!hkNextAddressed("@sho's idea was fine", to, &b, &e) && !hkNextAddressed("ask @sho later", to, &b, &e),
+		   "@name: a line about a hako, or one naming it midway, is for no one");
+		s = hkNextAddressed("@sho one\n@gpt two", to, &b, &e);
+		ck(s && !strcmp(to, "sho") && e - b == 3 && hkNextAddressed(e, to, &b, &e) && !strcmp(to, "gpt"), "@name: the next @ line starts the next one");
+		char d[] = "ok then\n@claude are you there\nstill\n\n@gpt hi\nthe end";
+		hkDropLinesTo(d, "claude");
+		ck(!strcmp(d, "ok then\n\n\n@gpt hi\nthe end"), "@name: what was said to one is dropped from what it is shown, the rest kept");
+	}
+
+	/* one hako that switched models: every row is still its own */
+	E.session_id = strdup("resumeswitch");
+	snprintf(hk_agent_name, sizeof hk_agent_name, "gpt");
+	hkLogMessage("user", "start here");
+	hkLogMessage("assistant", "gpt answered");
+	snprintf(hk_agent_name, sizeof hk_agent_name, "claude");
+	hkLogMessage("user", "go on");
+	memset(&a, 0, sizeof a);
+	clInitAI(&a);
+	hkLoadHistoryTail(&a, AI_HISTORY_MAX, 40);
+	ck(a.message_count == 3 && !strcmp(a.messages[1].role, "assistant") && !strcmp(a.messages[1].content, "gpt answered"),
+	   "one hako, two models: its chat comes back as it was");
+	clCleanupAI(&a);
+
+	/* a chat of notices only (a second hako's own, never used) is not listed */
+	E.session_id = strdup("onlynotices");
+	hkLogMessage("system", "no hako or chat by that name here");
+	clSessionInfo si[32];
+	int ns = clEnumerateSessions(si, 32), has_notices = 0, has_short = 0;
+	for (int i = 0; i < ns; i++) { if (!strcmp(si[i].id, "onlynotices")) has_notices = 1; if (!strcmp(si[i].id, "resumeshort")) has_short = 1; }
+	ck(has_short && !has_notices, "chat list: a chat of notices only is left out");
+	snprintf(hk_agent_name, sizeof hk_agent_name, "%s", was_name);
+
 	/* two hakos on one log: every row whole, however long */
 	E.session_id = strdup("resumetwo");
 	hkSessionLogPath(path, sizeof path);
@@ -1733,6 +1809,21 @@ static void env_probe_tests(void) {
 	pthread_mutex_destroy(&d.lock);
 }
 
+static void status_tests(void) {
+	ck(hkStatusWanted(NULL, "rex", "xterm-256color"), "status: rex is told (TERM_PROGRAM=rex)");
+	ck(hkStatusWanted(NULL, NULL, "xterm-rex"), "status: rex over ssh is told (TERM=xterm-rex)");
+	ck(!hkStatusWanted(NULL, "iTerm.app", "xterm-256color") && !hkStatusWanted(NULL, NULL, NULL),
+	   "status: other terminals are not (an unknown OSC can show as junk)");
+	ck(!hkStatusWanted("0", "rex", NULL) && hkStatusWanted("1", "tmux", "screen"), "status: HAKO_STATUS forces it off or on");
+	char s[96];
+	hkStatusSeq(s, sizeof s, "working", NULL);
+	ck(strcmp(s, "\x1b]7501;app=hako:state=working\x1b\\") == 0, "status: working is an OSC 7501 report as hako");
+	hkStatusSeq(s, sizeof s, "blocked", "permission");
+	ck(strcmp(s, "\x1b]7501;app=hako:state=blocked:kind=permission\x1b\\") == 0, "status: an approval says blocked on permission");
+	hkStatusSeq(s, sizeof s, "clear", NULL);
+	ck(strcmp(s, "\x1b]7501;state=clear\x1b\\") == 0, "status: exit clears it");
+}
+
 static void truncation_notice_tests(void) {
 	char tmpl[] = "/tmp/hakotruncXXXXXX";
 	char *dir = mkdtemp(tmpl);
@@ -1765,11 +1856,14 @@ static void catalog_tests(void) {
 	char *saved_m = E.ai_model;
 
 	E.ai_provider_type = AI_PROVIDER_ANTHROPIC;
+	ck(hkModelFitsProvider(AI_PROVIDER_ANTHROPIC, "claude-haiku-4-5") && !hkModelFitsProvider(AI_PROVIDER_ANTHROPIC, "anthropic/claude-haiku-5.5"),
+	   "catalog: a router's model id is not Anthropic's own (switching from Nous picks a real one)");
 	struct { const char *model; long want; const char *what; } ctx[] = {
 		{ "claude-opus-5",     1000000, "Opus 5 is 1M, not 200K" },
 		{ "claude-sonnet-5",   1000000, "Sonnet 5 is 1M" },
 		{ "claude-opus-4-7",   1000000, "Opus 4.7 is 1M" },
 		{ "claude-haiku-4-5",   200000, "Haiku 4.5 is the 200K exception" },
+		{ "claude-haiku-5-5",  1000000, "Haiku 5.5 is 1M, unlike Haiku 4.5" },
 		{ "claude-3-5-sonnet",  200000, "older models stay 200K" },
 		{ NULL, 0, NULL }
 	};
@@ -1786,7 +1880,11 @@ static void catalog_tests(void) {
 	struct { const char *model; double in; } price[] = {
 		{ "claude-opus-5",    5.0 }, { "claude-sonnet-5",  2.0 },
 		{ "claude-opus-4-8",  5.0 }, { "claude-haiku-4-5", 1.0 },
-		{ "claude-fable-5",  10.0 }, { NULL, 0 }
+		{ "claude-fable-5",  10.0 }, { "claude-fable-5-2", 8.0 },
+		{ "claude-opus-5-5",  4.0 }, { "claude-sonnet-5-5", 2.0 },
+		{ "claude-haiku-5-5", 0.10 }, { "gpt-6-luna", 0.10 },
+		{ "gpt-6.1-sol", 2.0 }, { "deepseek-flash", 0.15 },
+		{ "grok-4.7", 2.0 }, { "openai/gpt-oss-120b", 0.15 }, { NULL, 0 }
 	};
 	for (int i = 0; price[i].model; i++) {
 		double in = 0, out = 0;
@@ -1803,8 +1901,99 @@ static void catalog_tests(void) {
 		if (!strcmp(HK_MODEL_SUGG[i].prov, "anthropic")) {
 			ckstr(HK_MODEL_SUGG[i].models, "claude-opus-5", "Opus 5 is in the curated list");
 			ckstr(HK_MODEL_SUGG[i].models, "claude-sonnet-5", "Sonnet 5 is in the curated list");
+			ckstr(HK_MODEL_SUGG[i].models, "claude-opus-5-5", "Opus 5.5 is in the curated list");
+			ckstr(HK_MODEL_SUGG[i].models, "claude-haiku-5-5", "Haiku 5.5 is in the curated list");
 			cknot(HK_MODEL_SUGG[i].models, "-2025", "no date-suffixed ids in the curated list");
 		}
+
+	/* no default is a model its provider has retired (2026-11-13) */
+	{
+		static const char *gone[] = { "claude-haiku-4-5", "gpt-4o-mini", "gpt-5.5", "grok-2",
+			"deepseek-chat", "gemini-2.5", "llama3.1-8b", "llama-3.3-70b", NULL };
+		for (size_t i = 0; i < sizeof(HK_FAMILY) / sizeof(HK_FAMILY[0]); i++) {
+			const char *m = HK_FAMILY[i].model;
+			for (int g = 0; m && gone[g]; g++)
+				if (!strcmp(m, gone[g]) || (!strcmp(gone[g], "gemini-2.5") && strstr(m, gone[g]))) {
+					printf("FAIL %s's default %s is retired\n", HK_FAMILY[i].label, m);
+					fails++;
+				}
+			/* and fits its own family, or the first turn heals it away */
+			if (m && HK_FAMILY[i].family && !strstr(m, HK_FAMILY[i].family)) {
+				printf("FAIL %s's default %s is not a %s model\n", HK_FAMILY[i].label, m, HK_FAMILY[i].family);
+				fails++;
+			}
+		}
+		for (size_t i = 0; i < sizeof(HK_MODEL_SUGG) / sizeof(HK_MODEL_SUGG[0]); i++)
+			for (int g = 0; gone[g]; g++)
+				if (strstr(HK_MODEL_SUGG[i].models, gone[g])) {
+					printf("FAIL %s's curated list still offers %s\n", HK_MODEL_SUGG[i].prov, gone[g]);
+					fails++;
+				}
+	}
+
+	/* a retired default heals to the newest of its tier, not the first listed */
+	{
+		char live[4][96] = { "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-haiku-4-5" };
+		E.ai_provider_type = AI_PROVIDER_ANTHROPIC;
+		const char *got = hkLiveLike("claude-haiku-4-1", live, 4);
+		ck(got && !strcmp(got, "claude-haiku-5-5"), "a gone haiku heals to the newest haiku, not opus");
+		got = hkLiveLike("claude-haiku-4-5", live, 4);
+		ck(got && !strcmp(got, "claude-haiku-4-5"), "a default still on the list is kept");
+		ck(hkLiveLike("claude-haiku-4-5", live, 0) == NULL, "no live list, no pick");
+		char g2[3][96] = { "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-4-argon" };
+		char *ep0 = E.ai_endpoint;
+		E.ai_provider_type = AI_PROVIDER_OPENAI;
+		E.ai_endpoint = "https://generativelanguage.googleapis.com/v1beta/openai";
+		got = hkLiveLike("gemini-2.5-flash", g2, 3);
+		ck(got && !strcmp(got, "gemini-3.8-flash"), "a gone flash heals to a flash, not a flash-lite");
+		char g3[2][96] = { "anthropic/claude-haiku-5.5", "claude-haiku-5-5" };
+		E.ai_provider_type = AI_PROVIDER_ANTHROPIC; E.ai_endpoint = NULL;
+		got = hkLiveLike("claude-haiku-4-1", g3, 2);
+		ck(got && !strcmp(got, "claude-haiku-5-5"), "the pick fits the provider (no router ids)");
+		E.ai_endpoint = ep0;
+	}
+
+	/* the codex catalog: priority order, the slugs codex hides still offered, last */
+	{
+		char out[8][96];
+		int n = hkParseModelList("{\"models\":[{\"slug\":\"gpt-reserve\",\"visibility\":\"hide\",\"priority\":0},"
+			"{\"slug\":\"gpt-6-luna\",\"visibility\":\"list\",\"priority\":3},"
+			"{\"slug\":\"gpt-6.1-sol\",\"visibility\":\"list\",\"priority\":1},"
+			"{\"slug\":\"codex-auto-review\",\"visibility\":\"none\",\"priority\":2}]}", out, 8);
+		ck(n == 4 && !strcmp(out[2], "gpt-reserve") && !strcmp(out[3], "codex-auto-review"),
+		   "the slugs codex hides are offered, after the ones it lists");
+		ck(n >= 2 && !strcmp(out[0], "gpt-6.1-sol") && !strcmp(out[1], "gpt-6-luna"),
+		   "codex models come in its priority order");
+		n = hkParseModelList("{\"data\":[{\"id\":\"gpt-6-luna\",\"created\":5},{\"id\":\"gpt-6.1-sol\",\"created\":9}]}", out, 8);
+		ck(n == 2 && !strcmp(out[0], "gpt-6.1-sol"), "an openai list stays newest first");
+		n = hkParseModelList("{\"models\": [{\"slug\": \"b\", \"visibility\": \"hide\"}, {\"slug\" : \"a\", \"priority\": 1}]}", out, 8);
+		ck(n == 2 && !strcmp(out[0], "a") && !strcmp(out[1], "b"), "a list with spaces around its colons reads the same");
+	}
+
+	/* OpenAI's own API takes max_completion_tokens; other hosts keep max_tokens */
+	{
+		aiData d;
+		memset(&d, 0, sizeof(d));
+		pthread_mutex_init(&d.lock, NULL);
+		d.system_prompt = strdup("s");
+		aiPushMessage(&d, "user", "hi");
+		char *ep0 = E.ai_endpoint, *m0 = E.ai_model, *k0 = E.ai_api_key;
+		int t0 = E.ai_tools_enabled;
+		E.ai_provider_type = AI_PROVIDER_OPENAI; E.ai_tools_enabled = 0;
+		E.ai_endpoint = strdup("https://api.openai.com"); E.ai_model = strdup("gpt-6-luna");
+		E.ai_api_key = strdup("sk-FAKE-test");
+		hkReqParts rp;
+		ck(aiBuildRequest(&d, AI_PROVIDER_OPENAI, &rp) == 0, "an openai request builds");
+		ckstr(rp.body, "\"max_completion_tokens\":", "openai gets max_completion_tokens");
+		cknot(rp.body, "\"max_tokens\":", "and not max_tokens, which gpt-5 on refuse");
+		free(rp.url); free(rp.headers); free(rp.body);
+		free(E.ai_endpoint); E.ai_endpoint = strdup("https://api.groq.com/openai/v1");
+		ck(aiBuildRequest(&d, AI_PROVIDER_OPENAI, &rp) == 0, "a groq request builds");
+		ckstr(rp.body, "\"max_tokens\":", "other openai-shaped hosts keep max_tokens");
+		free(rp.url); free(rp.headers); free(rp.body);
+		free(E.ai_endpoint); free(E.ai_model); free(E.ai_api_key);
+		E.ai_endpoint = ep0; E.ai_model = m0; E.ai_api_key = k0; E.ai_tools_enabled = t0;
+	}
 
 	/* nous: a named openai-compat provider with its own default and a public catalog */
 	char *saved_ep = E.ai_endpoint;
@@ -2687,6 +2876,7 @@ static void creds_wipe(void) {
 	}
 	memset(cl_creds, 0, sizeof cl_creds);
 	cl_creds_n = 0; cl_creds_loaded = 0; cl_creds_unreadable = 0; cl_creds_old_format = 0;
+	cl_creds_locked = 0; cl_creds_store = 0; cl_creds_keep_merged = 0;
 	free(E.ai_api_key); E.ai_api_key = NULL;
 	free(E.ai_oauth_refresh); E.ai_oauth_refresh = NULL;
 	free(E.ai_oauth_provider); E.ai_oauth_provider = NULL;
@@ -2729,6 +2919,17 @@ static int creds_disk_is(const char *name, const char *key, const char *refresh)
 	return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
 
+static void creds_write_v2(const char *path, const char *plain) {
+	size_t n = strlen(plain);
+	unsigned char *b = (unsigned char *)strdup(plain), key[32];
+	clCredsKeyFor(NULL, key);
+	clXorBuf(b, n, key);
+	char *e = clB64Encode(b, n);
+	FILE *f = fopen(path, "w");
+	if (f) { fprintf(f, "%s\n%s\n", CL_CREDS_MAGIC_V2, e); fclose(f); }
+	free(e); free(b);
+}
+
 static void creds_write_v1(const char *path, const char *host, const char *plain) {
 	size_t n = strlen(plain);
 	unsigned char *b = (unsigned char *)strdup(plain), key[32];
@@ -2738,6 +2939,56 @@ static void creds_write_v1(const char *path, const char *host, const char *plain
 	FILE *f = fopen(path, "w");
 	if (f) { fprintf(f, "%s\n%s\n", CL_CREDS_MAGIC_V1, e); fclose(f); }
 	free(e); free(b);
+}
+
+/* What hako keeps under ~/.hako is this user's alone: the folder was 0755, so chats
+   (0644) and typed history were readable by anyone on the machine. A sign-in's PKCE
+   verifier left from an abandoned login is not used, and a key in a readable rc is said. */
+static void secrets_at_rest_tests(void) {
+	char tmpl[] = "/tmp/hakosecXXXXXX", *home = mkdtemp(tmpl), dir[600], was_home[PATH_MAX];
+	ck(home != NULL, "secrets at rest: a scratch home");
+	if (!home) return;
+	snprintf(was_home, sizeof was_home, "%s", getenv("HOME") ? getenv("HOME") : "");
+	setenv("HOME", home, 1);
+	snprintf(dir, sizeof dir, "%s/.hako", home);
+	mkdir(dir, 0755);
+	char got[600];
+	hkClawDirPath(got, sizeof got);
+	struct stat st;
+	ck(stat(dir, &st) == 0 && (st.st_mode & 0777) == 0700, "secrets at rest: ~/.hako is made 0700");
+
+	hkOAuthPendingSave("fresh-verifier");
+	char *v = hkOAuthPendingTake();
+	ck(v && !strcmp(v, "fresh-verifier"), "secrets at rest: a sign-in in progress keeps its verifier");
+	free(v);
+	hkOAuthPendingSave("old-verifier");
+	char pp[700];
+	hkOAuthPendingPath(pp, sizeof pp);
+	struct timeval old[2] = { { (long)hk_time_unix() - 3600, 0 }, { (long)hk_time_unix() - 3600, 0 } };
+	utimes(pp, old);
+	v = hkOAuthPendingTake();
+	ck(!v && access(pp, F_OK) != 0, "secrets at rest: a verifier from an abandoned sign-in is dropped, not used");
+	free(v);
+
+	char rc[700];
+	snprintf(rc, sizeof rc, "%s/.hakorc", home);
+	FILE *f = fopen(rc, "w");
+	if (f) { fputs("ai_api_key=sk-FAKE-EXAMPLE-0000\n", f); fclose(f); }
+	chmod(rc, 0644);
+	int fd[2];
+	if (pipe(fd) == 0) {
+		pid_t k = fork();
+		if (k == 0) { dup2(fd[1], 2); close(fd[0]); hkRcParse(rc, 0); _exit(0); }
+		close(fd[1]);
+		char buf[512] = "";
+		ssize_t n = read(fd[0], buf, sizeof buf - 1);
+		if (n > 0) buf[n] = '\0';
+		close(fd[0]);
+		waitpid(k, NULL, 0);
+		ck(strstr(buf, "other users can read it") && strstr(buf, "chmod 600") && !strstr(buf, "FAKE"),
+		   "secrets at rest: a key in a readable rc is said, the key is not");
+	}
+	setenv("HOME", was_home, 1);
 }
 
 static void creds_tests(void) {
@@ -2894,7 +3145,7 @@ static void creds_tests(void) {
 	hkApplyProviderAlias("openai");
 	clCredsAtStart(NULL);
 	char *body = hk_fs_read(path, 65536, NULL);
-	ck(body && !strncmp(body, "HAKOCREDv2\n", 11), "creds: a v1 file moves to v2 at startup");
+	ck(body && !strncmp(body, "HAKOCREDv3 file\n", 16), "creds: a v1 file moves to v3 at startup");
 	free(body);
 	ck(creds_disk_is("nous", NULL, "nr"), "creds: with its logins");
 
@@ -2917,6 +3168,116 @@ static void creds_tests(void) {
 	ck(kept && noise && !strcmp(kept, noise), "creds: a real save keeps it beside the new file");
 	free(kept); free(noise);
 	ck(creds_disk_is("mine", "k", NULL), "creds: and writes the new one");
+
+	/* v3: sealed with a key kept apart, which a test's home never takes from the keychain */
+	ck(clKeyStoreHere() == CL_KEY_FILE, "creds v3: a HOME that is not the account's own never reaches the keychain");
+	char keyf[PATH_MAX + 8];
+	snprintf(keyf, sizeof keyf, "%s.key", path);
+	unlink(path); unlink(keyf); unlink(keep_file);
+	creds_wipe();
+	creds_row("openai", "sk-FAKE-sealed-123", NULL, 0);
+	clCredsSave();
+	body = hk_fs_read(path, 65536, NULL);
+	struct stat kst;
+	ck(body && !strncmp(body, "HAKOCREDv3 file\n", 16) && !strstr(body, "sk-FAKE"), "creds v3: a save seals the file");
+	ck(stat(keyf, &kst) == 0 && (kst.st_mode & 0777) == 0600, "creds v3: its key is beside it, this user's alone");
+	{                                              /* what v2 could undo, v3 does not give up */
+		size_t n = 0;
+		char *nl = body ? strchr(body, '\n') : NULL, b64[4096] = "";
+		for (const char *q = nl ? nl + 1 : ""; *q && strlen(b64) < sizeof b64 - 1; q++) if (*q != '\n') strncat(b64, q, 1);
+		unsigned char *raw = clB64Decode(b64, &n), k2[32];
+		clCredsKeyFor(NULL, k2);
+		if (raw) clXorBuf(raw, n, k2);
+		ck(raw && !memmem(raw, n, "sk-FAKE", 7), "creds v3: the old obfuscation key does not open it");
+		free(raw);
+	}
+	ck(creds_disk_is("openai", "sk-FAKE-sealed-123", NULL), "creds v3: and a hako starting now reads it");
+	free(body);
+
+	/* v2 moves to v3 at start, with its logins */
+	unlink(path);
+	creds_write_v2(path, "[deepseek]\napi_key=dk-FAKE\n\n");
+	creds_wipe();
+	hkApplyProviderAlias("openai");
+	clCredsAtStart(NULL);
+	body = hk_fs_read(path, 65536, NULL);
+	ck(body && !strncmp(body, "HAKOCREDv3 file\n", 16) && creds_disk_is("deepseek", "dk-FAKE", NULL), "creds v3: a v2 file moves to v3 at startup, logins and all");
+	free(body);
+
+	/* a changed file opens as nothing: kept aside, never read as empty */
+	body = hk_fs_read(path, 65536, NULL);
+	if (body) { char *nl = strchr(body, '\n'); if (nl && nl[5]) nl[5] = nl[5] == 'A' ? 'B' : 'A'; FILE *f = fopen(path, "w"); if (f) { fputs(body, f); fclose(f); } }
+	creds_wipe();
+	clCredsLoad();
+	ck(cl_creds_unreadable && !clCredsFind("deepseek"), "creds v3: a file changed under its seal does not open");
+	creds_row("mine", "k", NULL, 0);
+	clCredsSave();
+	char *aside = hk_fs_read(keep_file, 65536, NULL);
+	ck(aside && body && !strcmp(aside, body) && creds_disk_is("mine", "k", NULL), "creds v3: a save keeps it aside and writes a new one");
+	free(aside); free(body);
+	unlink(keep_file);
+
+	/* its key out of reach (a locked keychain): read as nothing, and never written over */
+	chmod(keyf, 0000);
+	body = hk_fs_read(path, 65536, NULL);
+	creds_wipe();
+	clCredsLoad();
+	ck(cl_creds_locked && !cl_creds_unreadable, "creds v3: a key that cannot be read now locks the file");
+	creds_row("newer", "n", NULL, 0);
+	clCredsSave();
+	char *same = hk_fs_read(path, 65536, NULL);
+	ck(same && body && !strcmp(same, body) && access(keep_file, F_OK) != 0, "creds v3: a locked file is not saved over, or moved");
+	free(same); free(body);
+	chmod(keyf, 0600);
+	ck(creds_disk_is("mine", "k", NULL), "creds v3: and opens again once its key does");
+
+	/* its key gone: the file cannot open again, so it goes aside and logins can be made anew */
+	unlink(keyf);
+	creds_wipe();
+	clCredsLoad();
+	ck(cl_creds_unreadable && !cl_creds_locked, "creds v3: a file whose key is gone reads as unreadable, not locked");
+	creds_row("again", "a", NULL, 0);
+	clCredsSave();
+	ck(creds_disk_is("again", "a", NULL) && access(keep_file, F_OK) == 0, "creds v3: a new key, a new file, the old one kept aside");
+	unlink(keep_file);
+
+	/* an older hako (v2 only) moved our v3 file aside and wrote its own: both come back */
+	creds_wipe();
+	creds_row("anthropic", "ak-FAKE", NULL, 0);
+	clCredsSave();
+	rename(path, keep_file);
+	creds_write_v2(path, "[openai]\napi_key=ok-FAKE\n\n");
+	creds_wipe();
+	hkApplyProviderAlias("openai");
+	clCredsAtStart(NULL);
+	body = hk_fs_read(path, 65536, NULL);
+	ck(body && !strncmp(body, "HAKOCREDv3 file\n", 16) && creds_disk_is("anthropic", "ak-FAKE", NULL) && creds_disk_is("openai", "ok-FAKE", NULL)
+	   && access(keep_file, F_OK) != 0, "creds v3: logins an older hako moved aside come back, and the file it moved goes");
+	free(body);
+#ifdef __APPLE__
+	/* the real keychain, by hand only (HAKO_TEST_KEYCHAIN=1): an item named for this
+	   scratch home, removed after, so the person's own sign-ins are never touched */
+	if (getenv("HAKO_TEST_KEYCHAIN")) {
+		setenv("HAKO_KEYSTORE", "keychain", 1);
+		unlink(path); unlink(keyf);
+		creds_wipe();
+		creds_row("gemini", "gk-FAKE-chain", NULL, 0);
+		clCredsSave();
+		body = hk_fs_read(path, 65536, NULL);
+		ck(body && !strncmp(body, "HAKOCREDv3 keychain\n", 20) && access(keyf, F_OK) != 0, "creds keychain: sealed, its key in the keychain, no key file");
+		ck(creds_disk_is("gemini", "gk-FAKE-chain", NULL), "creds keychain: and read back through it");
+		free(body);
+		char acct[24], cmd[PATH_MAX + 200];
+		clKeyAccount(acct);
+		snprintf(cmd, sizeof cmd, "HOME='%s' /usr/bin/security delete-generic-password -a %s -s " CL_KEY_SERVICE " >/dev/null 2>&1", clChainHome(), acct);
+		ck(system(cmd) == 0, "creds keychain: the test's item is removed");
+		creds_wipe();
+		cl_key_cache_for[0] = '\0';                   /* a hako starting now */
+		clCredsLoad();
+		ck(cl_creds_unreadable && !cl_creds_locked, "creds keychain: a missing item is no key, not a locked keychain");
+		unsetenv("HAKO_KEYSTORE");
+	}
+#endif
 
 	/* many at once: every row lands, and the file is never half written */
 	creds_wipe();
@@ -3125,6 +3486,7 @@ int main(int argc, char **argv) {
 	long_session_tests();
 	stream_pipe_tests();
 	resume_tests();
+	secrets_at_rest_tests();
 	creds_tests();
 	skill_tests();
 	context_file_tests();
@@ -3144,6 +3506,7 @@ int main(int argc, char **argv) {
 	rc_unified_tests();
 	cmd_and_context_tests();
 	env_probe_tests();
+	status_tests();
 	truncation_notice_tests();
 	invoke_dialect_tests();
 	sse_longline_tests();

@@ -88,11 +88,14 @@ pid=$!; i=0; until curl -s -o /dev/null -H "$K" "$U/api/state" || [ $i -ge 50 ];
 curl -s -N -H "$K" "$U/api/events" >"$T/ev" 2>/dev/null &
 cp=$!; sleep 0.3
 post() { curl -s -H "$K" -X POST --data "$2" "$U/api/$1"; }
+# wait (up to 10 s) for at least $2 lines matching $1: a fixed sleep lost the race
+# on a slow machine (arm64 under qemu) and read "no request" as "ran without asking"
+evn() { i=0; until [ "$(grep -c "$1" "$T/ev")" -ge "$2" ] || [ $i -ge 100 ]; do sleep 0.1; i=$((i+1)); done; }
 case $(curl -s -H "$K" "$U/api/state") in *'"remote":1'*'"yolo":0'*) ok "state says remote, auto off";; *) no "state did not report remote";; esac
-post prompt 'TOOL list it' >/dev/null; sleep 1.2
+d0=$(dones); post prompt 'TOOL list it' >/dev/null; evn '"type":"tool_request"' 1
 [ "$(grep -c '"type":"tool_request"' "$T/ev")" = 1 ] && ok "auto mode from the rc still asks" || no "a tool ran without asking"
-post approve a >/dev/null; sleep 1.2
-post prompt 'TOOL again' >/dev/null; sleep 1.2
+post approve a >/dev/null; evn '"type":"done"' $((d0 + 1))
+post prompt 'TOOL again' >/dev/null; evn '"type":"tool_request"' 2
 [ "$(grep -c '"type":"tool_request"' "$T/ev")" = 2 ] && ok "\"always\" counted once" || no "\"always\" was remembered for a remote device"
 post approve n >/dev/null; sleep 0.8
 for c in ':auto on' ':mode' ':trust' ':remote'; do
