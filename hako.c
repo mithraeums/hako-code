@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.4.1"
+#define HAKO_VERSION "0.4.2"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"

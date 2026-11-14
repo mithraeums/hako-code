@@ -3217,19 +3217,24 @@ static void creds_tests(void) {
 	free(aside); free(body);
 	unlink(keep_file);
 
-	/* its key out of reach (a locked keychain): read as nothing, and never written over */
-	chmod(keyf, 0000);
-	body = hk_fs_read(path, 65536, NULL);
-	creds_wipe();
-	clCredsLoad();
-	ck(cl_creds_locked && !cl_creds_unreadable, "creds v3: a key that cannot be read now locks the file");
-	creds_row("newer", "n", NULL, 0);
-	clCredsSave();
-	char *same = hk_fs_read(path, 65536, NULL);
-	ck(same && body && !strcmp(same, body) && access(keep_file, F_OK) != 0, "creds v3: a locked file is not saved over, or moved");
-	free(same); free(body);
-	chmod(keyf, 0600);
-	ck(creds_disk_is("mine", "k", NULL), "creds v3: and opens again once its key does");
+	/* its key out of reach (a locked keychain): read as nothing, and never written over.
+	   root reads a 0000 file anyway (the FreeBSD release VM builds as root), so there
+	   the key cannot be put out of reach this way; every non-root run checks it */
+	if (geteuid() == 0) printf("  skip creds v3 locked key: running as root\n");
+	else {
+		chmod(keyf, 0000);
+		body = hk_fs_read(path, 65536, NULL);
+		creds_wipe();
+		clCredsLoad();
+		ck(cl_creds_locked && !cl_creds_unreadable, "creds v3: a key that cannot be read now locks the file");
+		creds_row("newer", "n", NULL, 0);
+		clCredsSave();
+		char *same = hk_fs_read(path, 65536, NULL);
+		ck(same && body && !strcmp(same, body) && access(keep_file, F_OK) != 0, "creds v3: a locked file is not saved over, or moved");
+		free(same); free(body);
+		chmod(keyf, 0600);
+		ck(creds_disk_is("mine", "k", NULL), "creds v3: and opens again once its key does");
+	}
 
 	/* its key gone: the file cannot open again, so it goes aside and logins can be made anew */
 	unlink(keyf);

@@ -3,6 +3,11 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.4.2] - 2026-11-13
+
+### fixed
+- v0.4.1 had no FreeBSD release: its build runs the tests as root, and root reads a key file set to 0000, so the test of a key out of reach failed there. that test is skipped as root (every other run still checks it), and the FreeBSD build is back
+
 ## [v0.4.1] - 2026-11-13
 
 ### added
