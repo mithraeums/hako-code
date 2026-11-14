@@ -42,8 +42,11 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.log_req(None)
         if "/models" in self.path:
-            out = json.dumps({"models": [{"slug": "gpt-5.5", "priority": 1},
-                                         {"slug": "gpt-5.4-mini", "priority": 2}]}).encode()
+            # spaced as json.dumps writes it; slugs no built-in list has, so the
+            # check cannot pass on the fallback list
+            out = json.dumps({"models": [{"slug": "gpt-fake-hidden", "visibility": "hide", "priority": 0},
+                                         {"slug": "gpt-fake-mini", "visibility": "list", "priority": 2},
+                                         {"slug": "gpt-5.5", "visibility": "list", "priority": 1}]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(out)))
@@ -61,6 +64,14 @@ class H(BaseHTTPRequestHandler):
         if body.get("store") is not False or "instructions" not in body:
             out = json.dumps({"detail": "Store must be false and instructions are required"}).encode()
             self.send_response(400)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if "GPTLIMIT" in json.dumps(body.get("input", [])):    # the plan's usage limit, as the codex backend says it
+            out = json.dumps({"error": {"type": "usage_limit_reached", "message": "The usage limit has been reached",
+                                        "plan_type": "plus", "resets_in_seconds": 11520}}).encode()
+            self.send_response(429)
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)

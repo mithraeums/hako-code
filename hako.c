@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.4.0"
+#define HAKO_VERSION "0.4.1"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -123,6 +123,10 @@ static char *strcasestr(const char *h, const char *n) {
 #include <sys/file.h>
 #include <termios.h>
 #include <signal.h>
+#ifdef __APPLE__
+#include <pwd.h>                   /* the account's own home: where the keychain is used */
+#include <dlfcn.h>                 /* the keychain's lock state, without linking Security */
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <ifaddrs.h>
@@ -310,7 +314,8 @@ typedef struct aiData {
 	unsigned char *history_role;
 	int history_count;
 
-	char *current_prompt;
+	char *current_prompt;         /* the line asked: what the turn's checks read */
+	char *current_notes;          /* what the other hakos said, sent to the model ahead of it */
 	char *current_response;
 
 	int active;
@@ -3108,6 +3113,68 @@ static void clTtyLockMake(void) {
 
 static void clTtyLock(void)   { pthread_once(&cl_tty_once, clTtyLockMake); pthread_mutex_lock(&cl_tty_lock); }
 static void clTtyUnlock(void) { pthread_mutex_unlock(&cl_tty_lock); }
+
+/* One screen update reaches the screen as one frame: synchronized output (DEC
+   2026) holds the paint until the end, and the cursor is hidden while it jumps
+   between the bar, the field and a popup. Each redraw used to show its steps: a
+   bar erased then painted again, and a cursor that visibly hopped up and back
+   (Rex animates every hop) on each popup key, spinner tick and streamed chunk.
+   A terminal without 2026 ignores it. Nested frames are one; the lock is held
+   for the frame, so the spinner cannot paint into the middle of one. */
+static int cl_frame_depth = 0;
+static int cl_frame_on = 0;      /* the begin sequence is out, the end is not */
+static int clFrameOk(void) { return E.color_enabled && !E.pipe_mode && !E.serve_mode && isatty(STDOUT_FILENO); }
+static void clFrameSeq(int on) {
+	if (on == cl_frame_on || (on && !clFrameOk())) return;
+	fflush(stdout);
+	if (write(STDOUT_FILENO, on ? "\x1b[?2026h\x1b[?25l" : "\x1b[?25h\x1b[?2026l", 14) < 0) {}
+	cl_frame_on = on;
+}
+static void clFrameBegin(void) {
+	clTtyLock();
+	if (cl_frame_depth++ == 0) clFrameSeq(1);
+}
+static void clFrameEnd(void) {
+	if (cl_frame_depth <= 0) return;
+	if (--cl_frame_depth == 0) clFrameSeq(0);
+	clTtyUnlock();
+}
+/* Around every wait for a key: a frame still open there (a command's output
+   bracket around a menu or a question) would hold the screen until the
+   terminal gave up on it. Paint now, and pick the frame up again after. */
+static void clFrameYield(void)  { if (cl_frame_on) clFrameSeq(0); }
+static void clFrameResume(void) { if (cl_frame_depth > 0) clFrameSeq(1); }
+
+/* Program status for a terminal that shows it: Rex marks a pane working, waiting
+   on you or done from the OSC 7501 report (the one Claude Code sends). Only the
+   interactive hako, and only in a terminal known to read it: some terminals (st,
+   old VTE) print an OSC they do not know as junk. HAKO_STATUS=1/0 forces it. */
+static int hk_status_on = 0;
+
+static int hkStatusWanted(const char *force, const char *term_program, const char *term) {
+	if (force && *force) return strcmp(force, "0") != 0;
+	if (term_program && strcmp(term_program, "rex") == 0) return 1;
+	return term && strncmp(term, "xterm-rex", 9) == 0;      /* rex over ssh */
+}
+
+static int hkStatusSeq(char *out, size_t cap, const char *state, const char *kind) {
+	if (strcmp(state, "clear") == 0) return snprintf(out, cap, "\x1b]7501;state=clear\x1b\\");
+	return snprintf(out, cap, "\x1b]7501;app=hako:state=%s%s%s\x1b\\",
+	                state, kind ? ":kind=" : "", kind ? kind : "");
+}
+
+/* state: idle, working, done, blocked (kind permission or question), clear at exit */
+static void hkStatus(const char *state, const char *kind) {
+	if (!hk_status_on) return;
+	char s[96];
+	int n = hkStatusSeq(s, sizeof s, state, kind);
+	if (n <= 0 || (size_t)n >= sizeof s) return;
+	if (strcmp(state, "clear") == 0) hk_status_on = 0;      /* said once, also from atexit */
+	clTtyLock();
+	fputs(s, stdout);
+	fflush(stdout);
+	clTtyUnlock();
+}
 static int cl_composing = 0;
 static const char *cl_line_prompt = NULL;
 static const char *cl_line_buf = NULL;
@@ -3392,6 +3459,7 @@ static int clBarStatus(const char *body) {
 	if (!cl_bar_h) return 0;
 	pthread_once(&cl_tty_once, clTtyLockMake);
 	if (pthread_mutex_trylock(&cl_tty_lock) != 0) return 1;   /* output owns the tty this frame */
+	clFrameBegin();
 	int cols = clTermCols();
 	char buf[192];
 	snprintf(buf, sizeof(buf), "%s", body ? body : "");
@@ -3409,7 +3477,7 @@ static int clBarStatus(const char *body) {
 	printf("%s%*s", buf, cols - 1 - w, "");
 	cl_status_up = up;
 	printf("\x1b" "8");
-	fflush(stdout);
+	clFrameEnd();
 	clTtyUnlock();
 	return 1;
 }
@@ -3417,12 +3485,12 @@ static int clBarStatus(const char *body) {
 /* Both take the tty lock themselves: the keyboard reader redraws the bar the
    moment an approval hands the keyboard back, while the worker is printing the
    tool's output — unlocked, the two interleaved and stranded half a bar. */
-static void clBarShow(aiData *data) { clTtyLock(); clBarShowRaw(data); clTtyUnlock(); }
-static void clBarHide(void)          { clTtyLock(); clBarHideRaw();     clTtyUnlock(); }
+static void clBarShow(aiData *data) { clFrameBegin(); clBarShowRaw(data); clFrameEnd(); }
+static void clBarHide(void)          { clFrameBegin(); clBarHideRaw();     clFrameEnd(); }
 
 static void clOutBegin(void) {
 	clTtyLock();                            /* recursive; released in clOutEnd */
-	if (cl_out_depth++ == 0) clBarHide();
+	if (cl_out_depth++ == 0) { clFrameBegin(); clBarHide(); }
 }
 
 static void clOutEnd(aiData *data) {
@@ -3436,6 +3504,7 @@ static void clOutEnd(aiData *data) {
 				clRedrawLine(cl_line_prompt, cl_line_buf, cl_line_len, cl_line_cur);
 			}
 		}
+		clFrameEnd();
 	}
 	clTtyUnlock();
 }
@@ -3452,6 +3521,8 @@ static volatile sig_atomic_t cl_turn_done = 0;
    both halves are relative, so both are correct at the new size. */
 static void clWinchHandler(int sig) { (void)sig; cl_winch = 1; }
 static void clTurnDoneHandler(int sig) { (void)sig; cl_turn_done = 1; }
+static volatile sig_atomic_t cl_tail_sig = 0;   /* SIGUSR2: another hako wrote during this one's turn */
+static void clTailSigHandler(int sig) { (void)sig; cl_tail_sig = 1; }
 #endif
 
 static pthread_t g_main_thread;
@@ -3491,6 +3562,7 @@ static void hkBlockWinch(void) {
 	sigemptyset(&set);
 	sigaddset(&set, SIGWINCH);
 	sigaddset(&set, SIGUSR1);
+	sigaddset(&set, SIGUSR2);
 	pthread_sigmask(SIG_BLOCK, &set, NULL);
 #endif
 }
@@ -3503,6 +3575,8 @@ static void clWinchInstall(void) {
 	sigaction(SIGWINCH, &sa, NULL);
 	sa.sa_handler = clTurnDoneHandler;
 	sigaction(SIGUSR1, &sa, NULL);
+	sa.sa_handler = clTailSigHandler;
+	sigaction(SIGUSR2, &sa, NULL);
 #endif
 }
 
@@ -4098,12 +4172,15 @@ static char *hkExtractJsonObject(const char *src, const char *key) {
 static int hkModelPriceUSDperM(const char *model, double *in_p, double *out_p) {
 	if (!model || !*model) return 0;
 	struct { const char *m; double in; double out; } table[] = {
+		{ "claude-fable-5-2",  8.0,  40.0 },
 		{ "claude-fable-5",   10.0,  50.0 },
+		{ "claude-opus-5-5",   4.0,  20.0 },
 		{ "claude-opus-5",     5.0,  25.0 },
 		{ "claude-opus-4-8",   5.0,  25.0 },
 		{ "claude-opus-4-7",   5.0,  25.0 },
 		{ "claude-opus-4-6",   5.0,  25.0 },
 		{ "claude-sonnet-5",   2.0,  10.0 },
+		{ "claude-haiku-5-5",  0.10,  0.50 },
 		{ "claude-sonnet-4-6", 3.0,  15.0 },
 		{ "claude-haiku-4-5",  1.0,   5.0 },
 		{ "claude-opus-4",    15.0,  75.0 },
@@ -4113,6 +4190,12 @@ static int hkModelPriceUSDperM(const char *model, double *in_p, double *out_p) {
 		{ "claude-3-5-haiku",  1.0,   5.0 },
 		{ "claude-3-opus",    15.0,  75.0 },
 		{ "claude",            3.0,  15.0 },
+		{ "gpt-6-astra",      10.0,  50.0 },
+		{ "gpt-6.1-sol",       2.0,  10.0 },
+		{ "gpt-6.1-terra",     1.0,   5.0 },
+		{ "gpt-6-luna",        0.10,  0.50 },
+		{ "gpt-oss-120b",      0.15,  0.60 },
+		{ "gpt-oss-20b",       0.075, 0.30 },
 		{ "gpt-4o-mini",       0.15,  0.60 },
 		{ "gpt-4o",            2.50, 10.0 },
 		{ "gpt-4.1",           2.0,   8.0 },
@@ -4124,9 +4207,16 @@ static int hkModelPriceUSDperM(const char *model, double *in_p, double *out_p) {
 		{ "gemini-2.5-flash",  0.075, 0.30 },
 		{ "gemini-1.5-flash",  0.075, 0.30 },
 		{ "gemini",            0.075, 0.30 },
+		{ "deepseek-v4-pro",   0.66,  1.98 },
+		{ "deepseek-flash",    0.15,  0.60 },
 		{ "deepseek-chat",     0.27,  1.10 },
 		{ "deepseek",          0.27,  1.10 },
 		{ "mistral-large",     2.0,   6.0 },
+		{ "grok-4.7",          2.0,   6.0 },
+		{ "grok-4.6",          2.0,   6.0 },
+		{ "grok-4.5",          2.0,   6.0 },
+		{ "grok-4.3",          1.25,  2.50 },
+		{ "grok-build",        1.0,   2.0 },
 		{ "grok",              5.0,  15.0 },
 	};
 	for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
@@ -4406,6 +4496,16 @@ static void hkClawDirPath(char *out, size_t n) {
 	_mkdir(out);
 #else
 	hk_fs_mkdirp(out);
+#ifndef HAKO_WASM
+	/* logins, chats, typed history and keys live here: this user's alone, whatever
+	   mode each file under it has (session logs and history were 0644) */
+	static char tight[512];
+	struct stat st;
+	if (strcmp(tight, out) && stat(out, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == getuid()) {
+		snprintf(tight, sizeof tight, "%s", out);
+		if (st.st_mode & 077) chmod(out, st.st_mode & 0700);
+	}
+#endif
 #endif
 }
 
@@ -4668,18 +4768,18 @@ static void hkApplyProviderAlias(const char *val) {
 static const struct {
 	const char *label, *model, *family;
 } HK_FAMILY[] = {
-	{ "anthropic",     "claude-haiku-4-5", "claude"   },
+	{ "anthropic",     "claude-haiku-5-5",          "claude"   },
 	{ "mithraeum",     "hako-sho",                  "hako-"    },
-	{ "openai",        "gpt-4o-mini",               "gpt"      },
-	{ "gemini",        "gemini-2.5-flash",          "gemini"   },
-	{ "groq",          "llama-3.3-70b-versatile",   "llama"    },
-	{ "deepseek",      "deepseek-chat",             "deepseek" },
-	{ "mistral",       "mistral-large-latest",      "mistral"  },
-	{ "cerebras",      "llama3.1-8b",               "llama"    },
-	{ "xai",           "grok-2-latest",             "grok"     },
-	{ "github-models", "gpt-4o-mini",               NULL       },
-	{ "copilot",       "gpt-4o-mini",               NULL       },
-	{ "chatgpt",       "gpt-5.5",                   "gpt"      },
+	{ "openai",        "gpt-6-luna",                "gpt"      },
+	{ "gemini",        "gemini-3.8-flash",          "gemini"   },
+	{ "groq",          "openai/gpt-oss-120b",       NULL       },
+	{ "deepseek",      "deepseek-flash",            "deepseek" },
+	{ "mistral",       "mistral-medium-latest",     "mistral"  },
+	{ "cerebras",      "gpt-oss-120b",              NULL       },
+	{ "xai",           "grok-4.7",                  "grok"     },
+	{ "github-models", "gpt-4.1-mini",              NULL       },
+	{ "copilot",       "gpt-4.1",                   NULL       },
+	{ "chatgpt",       "gpt-6-luna",                "gpt"      },
 	{ "openrouter",    NULL,                        NULL       },
 	{ "nous",          "anthropic/claude-haiku-5.5", NULL       },
 	{ "together",      NULL,                        NULL       },
@@ -4707,6 +4807,9 @@ static int hkModelFitsProvider(enum aiProviderType t, const char *model) {
 	if (!model || !*model) return 0;
 	int i = hkFamilyIndex(hkProviderKey(t));
 	if (i < 0 || !HK_FAMILY[i].family) return 1;
+	/* a router's id (`anthropic/claude-haiku-5.5` from Nous or OpenRouter) is not the
+	   vendor's own; groq's ids carry a vendor and are its own */
+	if (strchr(model, '/') && strcmp(HK_FAMILY[i].label, "groq")) return 0;
 	return strstr(model, HK_FAMILY[i].family) != NULL;
 }
 
@@ -4848,7 +4951,9 @@ static void clReadHidden(char *buf, size_t cap) {
 		neu.c_lflag &= ~ECHO;
 		tcsetattr(STDIN_FILENO, TCSANOW, &neu);
 	}
+	clFrameYield();
 	if (!fgets(buf, cap, stdin)) buf[0] = '\0';
+	clFrameResume();
 	if (isterm) tcsetattr(STDIN_FILENO, TCSANOW, &old);
 	printf("\n");
 #else
@@ -4909,7 +5014,8 @@ static void clApplyEnv(void) {
 }
 
 
-#define CL_CREDS_MAGIC "HAKOCREDv2"
+#define CL_CREDS_MAGIC "HAKOCREDv3"      /* sealed with a key kept apart from the file */
+#define CL_CREDS_MAGIC_V2 "HAKOCREDv2"   /* obfuscated: still read, moved to v3 */
 #define CL_CREDS_MAGIC_V1 "CLAWCREDv1"
 #define CL_PROV_MAX 32
 
@@ -4930,7 +5036,10 @@ static clCred cl_creds[CL_PROV_MAX];
 static int cl_creds_n = 0;
 static int cl_creds_loaded = 0;
 static int cl_creds_unreadable = 0;	/* a file that is not ours to overwrite */
-static int cl_creds_old_format = 0;	/* read as v1: save moves it to v2 */
+static int cl_creds_old_format = 0;	/* read as v1 or v2: save moves it to v3 */
+static int cl_creds_locked = 0;		/* sealed, and its key cannot be had now: never written over */
+static int cl_creds_store = 0;		/* where the file's key is (CL_KEY_*), from its header */
+static int cl_creds_keep_merged = 0;	/* rows came back from credentials.unreadable: it goes once saved */
 static pthread_mutex_t cl_creds_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* Obfuscation, not encryption: nothing here is secret from someone holding the file.
@@ -5627,12 +5736,12 @@ static void clCredsSync(void) {
 
 /* Whole or not at all: a reader never sees half a file, and the secrets are never
    there under the default mode, even for a moment. */
-static void clCredsWriteFile(const char *path, const char *out, size_t outlen) {
+static int clCredsWriteFile(const char *path, const char *out, size_t outlen) {
 #if !defined(HAKO_WASM) && !defined(_WIN32)
 	char tmp[700];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
 	int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-	if (fd < 0) return;
+	if (fd < 0) return 0;
 	size_t off = 0;
 	while (off < outlen) {
 		ssize_t w = write(fd, out + off, outlen - off);
@@ -5642,10 +5751,198 @@ static void clCredsWriteFile(const char *path, const char *out, size_t outlen) {
 	}
 	int ok = off == outlen && fsync(fd) == 0;
 	ok = close(fd) == 0 && ok;
-	if (!ok || rename(tmp, path) != 0) unlink(tmp);
+	if (!ok || rename(tmp, path) != 0) { unlink(tmp); return 0; }
+	return 1;
 #else
-	hk_fs_write(path, out, outlen, 0);
+	return hk_fs_write(path, out, outlen, 0) == 0;
 #endif
+}
+
+/* ---- the key that seals credentials (v3) ----
+   32 random bytes kept apart from the file: in the login keychain on a Mac, through
+   /usr/bin/security with the key on its stdin (an argument would show in ps), else in
+   credentials.key (0600) beside the file. The keychain is for the account's own
+   ~/.hako only: a test's or a sandbox's HOME never reaches it. HAKO_KEYSTORE=file
+   picks the file anywhere, =keychain the keychain for any home (an item per home).
+   Windows and the browser keep v2. */
+enum { CL_KEY_NONE = 0, CL_KEY_FILE = 1, CL_KEY_CHAIN = 2 };
+static const char *const CL_KEY_NAMES[] = { "", "file", "keychain" };
+#define CL_KEY_SERVICE "hako-code-credentials"
+
+#ifdef __APPLE__
+/* The account's own home, with a login keychain in it: "" when there is none to use.
+   `security` finds the keychain by HOME, and a home without one made it ask, on the
+   Mac's screen, to create one, and wait. */
+static const char *clChainHome(void) {
+	static char home[PATH_MAX];
+	static int done;
+	if (!done) {
+		done = 1;
+		struct passwd *pw = getpwuid(getuid());
+		char kc[PATH_MAX + 40];
+		if (pw && pw->pw_dir && !strchr(pw->pw_dir, '\'') && access("/usr/bin/security", X_OK) == 0
+		    && hkFmtFits(kc, sizeof kc, "%s/Library/Keychains/login.keychain-db", pw->pw_dir) && access(kc, R_OK) == 0)
+			snprintf(home, sizeof home, "%s", pw->pw_dir);
+	}
+	return home;
+}
+#endif
+
+static int clKeyStoreHere(void) {
+#if defined(_WIN32) || defined(HAKO_WASM)
+	return CL_KEY_NONE;
+#else
+	const char *f = getenv("HAKO_KEYSTORE");
+	if (f && !strcmp(f, "file")) return CL_KEY_FILE;
+#ifdef __APPLE__
+	const char *kh = clChainHome(), *home = getenv("HOME");
+	char a[PATH_MAX], b[PATH_MAX];
+	if (!kh[0]) return CL_KEY_FILE;
+	if (f && !strcmp(f, "keychain")) return CL_KEY_CHAIN;   /* its item is named for this home */
+	if (home && realpath(home, a) && realpath(kh, b) && !strcmp(a, b)) return CL_KEY_CHAIN;
+#endif
+	return CL_KEY_FILE;
+#endif
+}
+
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+/* The keychain item's account: one per credentials file, so two homes never share a key. */
+static void clKeyAccount(char out[24]) {
+	char path[640];
+	uint8_t h[64];
+	clCredsPath(path, sizeof path);
+	crypto_blake2b(h, 64, (const uint8_t *)path, strlen(path));
+	memcpy(out, "hako-", 5);
+	hkHexEnc(out + 5, h, 8);
+}
+
+#ifdef __APPLE__
+/* A locked keychain makes `security` put up an unlock dialog on the Mac and wait for
+   it, so a hako driven from a phone hung there. The lock state is asked first, of the
+   framework itself: that never prompts. 0 = locked, 1 = open, -1 = cannot tell. */
+static int clChainOpen(void) {
+	static void *h;
+	static int (*status)(void *, unsigned *);
+	if (!h) h = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY | RTLD_LOCAL);
+	if (h && !status) *(void **)&status = dlsym(h, "SecKeychainGetStatus");
+	unsigned s = 0;
+	if (!status || status(NULL, &s) != 0) return -1;   /* NULL: the default keychain */
+	return (s & 1) != 0;                               /* kSecUnlockStateStatus */
+}
+#endif
+
+/* The keychain's key, once a run: asking `security` every turn costs a process. */
+static unsigned char cl_key_cache[32];
+static char cl_key_cache_for[24];
+#endif
+
+/* 1 = the key, 0 = there is none (or what is there is not one), -1 = there is one
+   that cannot be had now (a locked keychain, an ssh session): its file must stay. */
+static int clKeyGet(int store, unsigned char key[32]) {
+#if defined(_WIN32) || defined(HAKO_WASM)
+	(void)store; (void)key;
+	return 0;
+#else
+	char hex[96] = "", acct[24] = "";
+	if (store == CL_KEY_CHAIN) {
+#ifdef __APPLE__
+		char cmd[PATH_MAX + 200];
+		clKeyAccount(acct);
+		if (cl_key_cache_for[0] && !strcmp(cl_key_cache_for, acct)) { memcpy(key, cl_key_cache, 32); return 1; }
+		if (!clChainHome()[0] || clChainOpen() == 0) return -1;   /* locked, or none: nothing that could prompt */
+		if (!hkFmtFits(cmd, sizeof cmd, "HOME='%s' /usr/bin/security find-generic-password -a %s -s " CL_KEY_SERVICE " -w 2>/dev/null",
+		               clChainHome(), acct)) return -1;
+#else
+		const char *cmd = "false";
+#endif
+		FILE *p = popen(cmd, "r");
+		if (!p) return -1;
+		if (!fgets(hex, sizeof hex, p)) hex[0] = '\0';
+		int st = pclose(p), code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+		if (code == 44) return 0;                     /* errSecItemNotFound */
+		if (code != 0) { crypto_wipe(hex, sizeof hex); return -1; }
+	} else if (store == CL_KEY_FILE) {
+		char path[680], base[640];
+		clCredsPath(base, sizeof base);
+		snprintf(path, sizeof path, "%s.key", base);
+		if (access(path, F_OK) != 0) return errno == ENOENT ? 0 : -1;
+		char *b = hk_fs_read(path, 256, NULL);
+		if (!b) return -1;
+		snprintf(hex, sizeof hex, "%s", b);
+		crypto_wipe(b, strlen(b));
+		free(b);
+	} else return 0;
+	int ok = strspn(hex, "0123456789abcdef") >= 64 && hkHexDec(key, hex, 32) == 0;
+	crypto_wipe(hex, sizeof hex);
+	if (ok && acct[0]) { memcpy(cl_key_cache, key, 32); snprintf(cl_key_cache_for, sizeof cl_key_cache_for, "%s", acct); }
+	return ok;
+#endif
+}
+
+/* Keeps key where store says, and reads it back: 1 only when it is really there. */
+static int clKeyPut(int store, const unsigned char key[32]) {
+#if defined(_WIN32) || defined(HAKO_WASM)
+	(void)store; (void)key;
+	return 0;
+#else
+	char hex[72];
+	hkHexEnc(hex, key, 32);
+	if (store == CL_KEY_CHAIN) {
+		char acct[24];
+		clKeyAccount(acct);
+		char cmd[PATH_MAX + 80] = "false";
+#ifdef __APPLE__
+		if (!clChainHome()[0] || clChainOpen() == 0) { crypto_wipe(hex, sizeof hex); return 0; }   /* it would prompt */
+		hkFmtFits(cmd, sizeof cmd, "HOME='%s' /usr/bin/security -i >/dev/null 2>&1", clChainHome());
+#endif
+		cl_key_cache_for[0] = '\0';                    /* read back from the keychain itself */
+		FILE *p = cmd[0] ? popen(cmd, "w") : NULL;
+		if (p) {
+			fprintf(p, "add-generic-password -U -a %s -s " CL_KEY_SERVICE " -l hako -w %s\n", acct, hex);
+			pclose(p);
+		}
+	} else if (store == CL_KEY_FILE) {
+		char path[680], base[640];
+		clCredsPath(base, sizeof base);
+		snprintf(path, sizeof path, "%s.key", base);
+		hex[64] = '\n';
+		clCredsWriteFile(path, hex, 65);
+	}
+	crypto_wipe(hex, sizeof hex);
+	unsigned char back[32];
+	int ok = store != CL_KEY_NONE && clKeyGet(store, back) == 1 && !memcmp(back, key, 32);
+	crypto_wipe(back, sizeof back);
+	return ok;
+#endif
+}
+
+/* XChaCha20-Poly1305: nonce, tag, then the text. The header line is bound to it, so
+   what it says about the key cannot be changed under it. */
+static unsigned char *clCredsSeal(const unsigned char key[32], const char *hdr, const unsigned char *plain, size_t n, size_t *outlen) {
+	unsigned char *o = malloc(n + 40);
+	if (!o || !hkRandomBytes(o, 24)) { free(o); return NULL; }
+	crypto_aead_lock(o + 40, o + 24, key, o, (const uint8_t *)hdr, strlen(hdr), plain, n);
+	*outlen = n + 40;
+	return o;
+}
+static unsigned char *clCredsOpen(const unsigned char key[32], const char *hdr, const unsigned char *in, size_t n, size_t *plen) {
+	unsigned char *p = n >= 40 ? malloc(n - 40 + 1) : NULL;
+	if (!p) return NULL;
+	if (crypto_aead_unlock(p, in + 24, key, in, (const uint8_t *)hdr, strlen(hdr), in + 40, n - 40) != 0) { free(p); return NULL; }
+	*plen = n - 40;
+	p[*plen] = '\0';
+	return p;
+}
+
+/* Said once a run, where the person can act on it. */
+static void clCredsSayLocked(void) {
+	static int said;
+	if (said++) return;
+	if (cl_creds_store == CL_KEY_CHAIN)
+		fprintf(stderr, "! hako cannot open the keychain, so your sign-ins are not read and nothing is saved over them. "
+		                "unlock it (security unlock-keychain) or run hako at the Mac\n");
+	else
+		fprintf(stderr, "! hako cannot read ~/.hako/credentials.key, so your sign-ins are not read and nothing is saved over them\n");
 }
 
 static void clCredsSave(void) {
@@ -5658,6 +5955,11 @@ static void clCredsSave(void) {
 	int changed = cl_creds_old_format;
 	for (int i = 0; i < cl_creds_n; i++) if (cl_creds[i].dirty) changed = 1;
 	if (!changed) { hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
+	if (cl_creds_locked) {                         /* its key is there but out of reach: it holds every login */
+		clCredsSayLocked();
+		hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu);
+		return;
+	}
 	if (cl_creds_unreadable) {
 		/* not readable by this build: keep it, it may hold logins */
 		char keep[680];
@@ -5681,9 +5983,32 @@ static void clCredsSave(void) {
 		if (c->oauth_expires_at) len += snprintf(plain + len, cap - len, "oauth_expires_at=%ld\n", c->oauth_expires_at);
 		if (len + 1 < cap) plain[len++] = '\n';
 	}
-	unsigned char key[32]; clCredsKeyFor(NULL, key);
-	clXorBuf((unsigned char *)plain, len, key);
-	char *b64 = clB64Encode((unsigned char *)plain, len);
+	/* the file's own key, else a new one; no keychain now means the key file beside it */
+	int store = cl_creds_store ? cl_creds_store : clKeyStoreHere(), have = 0;
+	unsigned char key[32];
+	for (int tries = 0; store != CL_KEY_NONE && !have && tries < 2; tries++) {
+		int g = clKeyGet(store, key);
+		if (g == 1) have = 1;
+		else if (g == 0 && hkRandomBytes(key, 32) && clKeyPut(store, key)) have = 1;
+		else if (store == CL_KEY_CHAIN) store = CL_KEY_FILE;
+		else break;
+	}
+	char hdr[48];
+	char *b64 = NULL;
+	if (have) {
+		snprintf(hdr, sizeof hdr, "%s %s", CL_CREDS_MAGIC, CL_KEY_NAMES[store]);
+		size_t sl = 0;
+		unsigned char *sealed = clCredsSeal(key, hdr, (unsigned char *)plain, len, &sl);
+		if (sealed) b64 = clB64Encode(sealed, sl);
+		free(sealed);
+	} else {                                       /* Windows, the browser: obfuscated as before */
+		snprintf(hdr, sizeof hdr, "%s", CL_CREDS_MAGIC_V2);
+		clCredsKeyFor(NULL, key);
+		clXorBuf((unsigned char *)plain, len, key);
+		b64 = clB64Encode((unsigned char *)plain, len);
+	}
+	crypto_wipe(key, sizeof key);
+	crypto_wipe(plain, len);
 	free(plain);
 	if (!b64) { hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
 	/* magic line, then base64 wrapped at 72 columns */
@@ -5691,20 +6016,28 @@ static void clCredsSave(void) {
 	size_t outcap = blen + blen / 72 + 128, outlen = 0;
 	char *out = malloc(outcap);
 	if (!out) { free(b64); hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }
-	outlen += (size_t)snprintf(out, outcap, "%s\n", CL_CREDS_MAGIC);
+	outlen += (size_t)snprintf(out, outcap, "%s\n", hdr);
 	for (size_t i = 0; i < blen; i += 72) {
 		size_t n = blen - i; if (n > 72) n = 72;
 		memcpy(out + outlen, b64 + i, n); outlen += n;
 		out[outlen++] = '\n';
 	}
-	clCredsWriteFile(path, out, outlen);
+	int wrote = clCredsWriteFile(path, out, outlen);
 	free(out);
 	free(b64);
+	if (!wrote) { hkLockDrop(lock); pthread_mutex_unlock(&cl_creds_mu); return; }   /* still dirty: the next save tries again */
 #ifndef _WIN32
 	chmod(path, 0600);
 #endif
 	for (int i = 0; i < cl_creds_n; i++) cl_creds[i].dirty = 0;
 	cl_creds_old_format = 0;
+	cl_creds_store = have ? store : CL_KEY_NONE;
+	if (cl_creds_keep_merged) {                    /* its logins are in the new file now */
+		char keep[680];
+		snprintf(keep, sizeof(keep), "%s.unreadable", path);
+		unlink(keep);
+		cl_creds_keep_merged = 0;
+	}
 	hkLockDrop(lock);
 	pthread_mutex_unlock(&cl_creds_mu);
 }
@@ -5719,6 +6052,91 @@ static void clCredClear(clCred *c) {
 	c->oauth_expires_at = 0;
 }
 
+/* A credentials file's text (buf is consumed). NULL with *why: 1 = not readable by
+   this build (kept aside on a save), 2 = sealed and its key is out of reach now (left
+   alone). *ver is 1, 2 or 3, *store where a v3 file's key is. */
+static unsigned char *clCredsDecode(char *buf, size_t *plain_len, int *ver, int *store, int *why) {
+	*ver = 0; *store = CL_KEY_NONE; *why = 1; *plain_len = 0;
+	char *rest = buf, header[64];
+	char *hdr = hkNextLine(&rest);
+	if (!hdr) return NULL;
+	snprintf(header, sizeof(header), "%s", hdr);
+	size_t ml = strlen(CL_CREDS_MAGIC);
+	if (!strncmp(header, CL_CREDS_MAGIC, ml) && header[ml] == ' ') {
+		*ver = 3;
+		for (int s = CL_KEY_FILE; s <= CL_KEY_CHAIN; s++) if (!strcmp(header + ml + 1, CL_KEY_NAMES[s])) *store = s;
+		if (*store == CL_KEY_NONE) return NULL;
+	} else if (!strcmp(header, CL_CREDS_MAGIC_V2)) *ver = 2;
+	else if (!strcmp(header, CL_CREDS_MAGIC_V1)) *ver = 1;
+	else return NULL;
+	/* the rest of the file is base64, newlines are cosmetic */
+	size_t len = 0;
+	char *b64 = malloc(strlen(rest) + 1);
+	if (!b64) return NULL;
+	for (const char *q = rest; *q; q++)
+		if (*q != '\n' && *q != '\r') b64[len++] = *q;
+	b64[len] = '\0';
+	size_t n = 0;
+	unsigned char *raw = len ? clB64Decode(b64, &n) : calloc(1, 1);
+	free(b64);
+	if (!raw) return NULL;
+	unsigned char key[32];
+	if (*ver == 3) {
+		int g = clKeyGet(*store, key);
+		unsigned char *plain = g == 1 ? clCredsOpen(key, header, raw, n, plain_len) : NULL;
+		crypto_wipe(key, sizeof key);
+		crypto_wipe(raw, n);
+		free(raw);
+		if (g == -1) *why = 2;
+		return plain;                              /* a wrong key or a changed file opens as nothing */
+	}
+	char host[256] = "host";
+	if (*ver == 1) { gethostname(host, sizeof(host)-1); host[sizeof(host)-1] = '\0'; }
+	clCredsKeyFor(*ver == 1 ? host : NULL, key);
+	clXorBuf(raw, n, key);
+	if (n && raw[0] != '[') { free(raw); return NULL; }   /* a v1 file from another host name: noise, the logins may be in it */
+	*plain_len = n;
+	return raw;
+}
+
+/* credentials.unreadable is what an older hako (v0.4.0 or before, no v3) moved aside
+   when it saved: its logins come back into the table, to be saved, where this one has none. */
+static void clCredsTakeKept(const char *path) {
+	char keep[680];
+	snprintf(keep, sizeof(keep), "%s.unreadable", path);
+	char *buf = hk_fs_read(keep, 1024 * 1024, NULL);
+	if (!buf) return;
+	int ver, store, why;
+	size_t n = 0;
+	unsigned char *plain = clCredsDecode(buf, &n, &ver, &store, &why);
+	free(buf);
+	if (plain && ver != 3) { crypto_wipe(plain, n); free(plain); return; }   /* only what this build sealed */
+	if (!plain) return;
+	clCred *active = NULL;
+	for (char *cur = (char *)plain, *endp = (char *)plain + n; cur < endp; ) {
+		char *eol = memchr(cur, '\n', (size_t)(endp - cur));
+		if (!eol) eol = endp;
+		*eol = '\0';
+		char *line = cur, *eq;
+		cur = eol + 1;
+		if (*line == '[') {
+			char *rb = strchr(line, ']');
+			if (!rb) continue;
+			*rb = '\0';
+			active = clCredsUpsert(line + 1);
+			if (active && (active->dirty || active->api_key || active->oauth_refresh)) active = NULL;
+			else if (active) active->dirty = cl_creds_keep_merged = 1;
+		} else if (active && (eq = strchr(line, '='))) {
+			*eq = '\0';
+			if (!strcmp(line, "api_key"))            { free(active->api_key); active->api_key = strdup(eq + 1); }
+			else if (!strcmp(line, "oauth_refresh")) { free(active->oauth_refresh); active->oauth_refresh = strdup(eq + 1); }
+			else if (!strcmp(line, "oauth_expires_at")) active->oauth_expires_at = atol(eq + 1);
+		}
+	}
+	crypto_wipe(plain, n);
+	free(plain);
+}
+
 static void clCredsLoad(void) {
 	if (cl_creds_loaded) return;
 	cl_creds_loaded = 1;
@@ -5726,42 +6144,18 @@ static void clCredsLoad(void) {
 	if (!path[0]) return;
 	char *credbuf = hk_fs_read(path, 1024 * 1024, NULL);
 	if (!credbuf) return;
-	cl_creds_unreadable = 0;
-	char *credsave = credbuf;
-	char header[64];
-	char *hdr = hkNextLine(&credsave);
-	if (!hdr) { free(credbuf); return; }
-	snprintf(header, sizeof(header), "%s", hdr);
-	int v1 = !strncmp(header, CL_CREDS_MAGIC_V1, strlen(CL_CREDS_MAGIC_V1));
-	if (!v1 && strncmp(header, CL_CREDS_MAGIC, strlen(CL_CREDS_MAGIC)) != 0) {
-		cl_creds_unreadable = 1;
-		free(credbuf);
-		return;
-	}
-	/* the rest of the file is base64, newlines are cosmetic */
-	size_t len = 0;
-	char *b64 = malloc(strlen(credsave) + 1);
-	if (!b64) { free(credbuf); return; }
-	for (const char *q = credsave; *q; q++)
-		if (*q != '\n' && *q != '\r') b64[len++] = *q;
-	b64[len] = '\0';
-	free(credbuf);
+	cl_creds_unreadable = cl_creds_locked = 0;
+	int ver, store, why;
 	size_t plain_len = 0;
-	unsigned char *plain = len ? clB64Decode(b64, &plain_len) : calloc(1, 1);
-	free(b64);
-	if (!plain) { cl_creds_unreadable = 1; return; }
-	unsigned char key[32];
-	char host[256] = "host";
-	if (v1) { gethostname(host, sizeof(host)-1); host[sizeof(host)-1] = '\0'; }
-	clCredsKeyFor(v1 ? host : NULL, key);
-	clXorBuf(plain, plain_len, key);
-	if (plain_len && plain[0] != '[') {
-		/* a v1 file from another host name: noise, and the logins may still be in it */
-		cl_creds_unreadable = 1;
-		free(plain);
+	unsigned char *plain = clCredsDecode(credbuf, &plain_len, &ver, &store, &why);
+	free(credbuf);
+	if (!plain) {
+		if (why == 2) { cl_creds_locked = 1; cl_creds_store = store; clCredsSayLocked(); }
+		else cl_creds_unreadable = 1;
 		return;
 	}
-	cl_creds_old_format = v1;
+	cl_creds_store = store;
+	cl_creds_old_format = ver == 1 || (ver == 2 && clKeyStoreHere() != CL_KEY_NONE);
 	/* The hako's live credential follows its row if the two were the same: a login or
 	   a rotated token from another hako reaches this one. A key from anywhere else,
 	   the environment say, differs from the row and stays. */
@@ -5797,9 +6191,11 @@ static void clCredsLoad(void) {
 		else if (!strcmp(line, "oauth_refresh")) { free(active->oauth_refresh); active->oauth_refresh = strdup(val); }
 		else if (!strcmp(line, "oauth_expires_at")) active->oauth_expires_at = atol(val);
 	}
+	crypto_wipe(plain, plain_len);
 	free(plain);
 	for (int i = 0; i < cl_creds_n; i++)
 		if (!cl_creds[i].dirty && !cl_creds[i].seen) clCredClear(&cl_creds[i]);	/* logged out elsewhere */
+	if (ver < 3 && clKeyStoreHere() != CL_KEY_NONE) clCredsTakeKept(path);   /* an older hako moved a v3 file aside */
 	if (live_same && (!clSameStr(E.ai_api_key, live->api_key) || !clSameStr(E.ai_oauth_refresh, live->oauth_refresh))) {
 		free(E.ai_api_key); E.ai_api_key = live->api_key ? strdup(live->api_key) : NULL;
 		free(E.ai_oauth_refresh); E.ai_oauth_refresh = live->oauth_refresh ? strdup(live->oauth_refresh) : NULL;
@@ -5902,15 +6298,42 @@ static void hkUsePastedKey(const char *prov, const char *key) {
 	hkApplyProviderAlias(prov);
 }
 
+/* While another hako works in this folder, a model picked here is this hako's alone:
+   saved, it became the other's on its next start (a local-model pane came back as
+   claude). The folder keeps the provider and model it had. */
+#if !defined(_WIN32) && !defined(HAKO_WASM)   /* HK_ATTACH, defined further down */
+static int hkAgentsOthersHere(void);
+#else
+static int hkAgentsOthersHere(void) { return 0; }
+#endif
+
+/* key=value as path has it saved, into out: 1 when there is one. */
+static int hkSavedField(const char *path, const char *key, char *out, size_t cap) {
+	char *b = hk_fs_read(path, 256 * 1024, NULL), *rest = b, *line;
+	size_t kl = strlen(key);
+	int got = 0;
+	while (b && !got && (line = hkNextLine(&rest)) != NULL)
+		if (!strncmp(line, key, kl) && line[kl] == '=') got = hkFmtFits(out, cap, "%s", line + kl + 1);
+	free(b);
+	return got;
+}
+
 static void hkWriteSessionFile(const char *path, int include_secrets) {
 	/* Built in memory, then handed to the seam in one write: a browser has no
 	   FILE* to print into. */
 	char buf[16384];
 	size_t n = 0;
 	#define SESS_PUT(...) (n = hkCatf(buf, n, sizeof(buf), __VA_ARGS__))
-	SESS_PUT("ai_provider=%s\n", hkProviderName(E.ai_provider_type));
-	if (E.ai_model) SESS_PUT("ai_model=%s\n", E.ai_model);
-	if (include_secrets && E.ai_endpoint) SESS_PUT("ai_endpoint=%s\n", E.ai_endpoint);
+	char was_p[64], was_m[256], was_e[512];
+	if (hkAgentsOthersHere() && hkSavedField(path, "ai_provider", was_p, sizeof was_p)) {   /* the folder keeps what it had */
+		SESS_PUT("ai_provider=%s\n", was_p);
+		if (hkSavedField(path, "ai_model", was_m, sizeof was_m)) SESS_PUT("ai_model=%s\n", was_m);
+		if (include_secrets && hkSavedField(path, "ai_endpoint", was_e, sizeof was_e)) SESS_PUT("ai_endpoint=%s\n", was_e);
+	} else {
+		SESS_PUT("ai_provider=%s\n", hkProviderName(E.ai_provider_type));
+		if (E.ai_model) SESS_PUT("ai_model=%s\n", E.ai_model);
+		if (include_secrets && E.ai_endpoint) SESS_PUT("ai_endpoint=%s\n", E.ai_endpoint);
+	}
 	SESS_PUT("ai_tools_enabled=%d\n", E.ai_tools_enabled);
 	SESS_PUT("ai_tool_gate=%d\n", E.ai_tool_gate);
 	SESS_PUT("ai_toolmode=%d\n", E.ai_toolmode);
@@ -6102,8 +6525,120 @@ static void hkLoadSession(void) {
    the only kind of front end that has none (--pipe, --serve). Rows say who wrote
    them ("by") and, for a line sent to another hako, who it is for ("to"). */
 static char hk_agent_name[24];
+static char hk_agents_here[400];  /* the other live hakos, "sho2 (mithraeum hako-sho)", for the prompt */
+static int hk_refresh_refused;   /* the last sign-in refresh was refused by its server (not unreachable) */
+static char *hk_resume_notes;   /* on a shared chat, what the others said after this model's last turn there */
 
-static void hkLogMessageTo(const char *role, const char *content, const char *to) {
+/* The model's family is its name (claude, gpt, sho), or the provider's. */
+static void hkAgentBaseName(char *out, size_t cap) {
+	static const char *W[] = { "claude", "gpt", "deepseek", "gemini", "llama", "mistral", "grok", "qwen",
+	                           "kimi", "glm", "gemma", "phi", "sho", "koi", NULL };
+	char m[128];
+	const char *src = E.ai_model ? E.ai_model : "";
+	size_t i = 0;
+	for (; src[i] && i < sizeof m - 1; i++) m[i] = (char)tolower((unsigned char)src[i]);
+	m[i] = '\0';
+	for (int k = 0; W[k]; k++) if (strstr(m, W[k])) { snprintf(out, cap, "%s", W[k]); return; }
+	const char *lab = hkProviderLabel();
+	size_t o = 0;
+	for (const char *p = lab ? lab : ""; *p && o + 1 < cap && o < 16; p++)
+		if (isalnum((unsigned char)*p) || *p == '-') out[o++] = (char)tolower((unsigned char)*p);
+	out[o] = '\0';
+	if (!o || !isalpha((unsigned char)out[0]) || !strcmp(out, "none")) snprintf(out, cap, "hako");
+}
+
+/* A short field of a log row (a role, a name), through the JSON reader: "" when absent. */
+static void hkRowField(const char *row, const char *key, char *out, size_t cap) {
+	char *v = hkExtractJsonString(row, key);
+	snprintf(out, cap, "%s", v && !strchr(v, '\\') ? v : "");
+	free(v);
+}
+
+/* A model's turn with what the other hakos said first. */
+static char *hkWithNotes(const char *notes, const char *line) {
+	size_t n = strlen(notes) + strlen(line) + 200;
+	char *out = malloc(n);
+	if (out) snprintf(out, n, "[Meanwhile on this session, from the other hakos and their models:]\n\n%s[Now, to you (%s):]\n%s",
+	                  notes, hk_agent_name[0] ? hk_agent_name : "hako", line);
+	return out;
+}
+
+/* A line that starts with @name ("**@sho:** hi" too), the name lowercased into to:
+   how much of l the address takes, with what follows it; 0 = for no one. */
+static size_t hkLineTo(const char *l, char to[24]) {
+	size_t i = strspn(l, " \t*_"), o = 0;
+	if (l[i] != '@') return 0;
+	for (i++; (isalnum((unsigned char)l[i]) || l[i] == '-') && o + 1 < 24; i++) to[o++] = (char)tolower((unsigned char)l[i]);
+	if (l[i] && !strchr(" \t*_:,\n", l[i])) return 0;        /* "@sho's idea" is about it, not to it */
+	while (o && to[o - 1] == '-') o--;
+	to[o] = '\0';
+	if (!o || !isalpha((unsigned char)to[0])) return 0;
+	return i + strspn(l + i, " \t*_:,");
+}
+
+/* The next line of a reply, from p, that is for another hako: it starts with @name,
+   and runs on to a blank line or the next @ line. Its start, or NULL; body is what
+   follows the address, end where it stops. */
+static const char *hkNextAddressed(const char *p, char to[24], const char **body, const char **end) {
+	for (const char *l = p; *l; ) {
+		const char *nl = strchr(l, '\n');
+		size_t at = hkLineTo(l, to);
+		if (at) {
+			char t2[24];
+			const char *e = nl ? nl : l + strlen(l);
+			while (*e == '\n' && e[1] && e[1] != '\n' && !hkLineTo(e + 1, t2)) {
+				const char *n2 = strchr(e + 1, '\n');
+				e = n2 ? n2 : e + 1 + strlen(e + 1);
+			}
+			*body = l + at;
+			*end = e;
+			return l;
+		}
+		if (!nl) break;
+		l = nl + 1;
+	}
+	return NULL;
+}
+
+/* c without what it says to name: that reaches the hako as a line of its own. */
+static void hkDropLinesTo(char *c, const char *name) {
+	char to[24], *w = c;
+	const char *p = c, *s, *b, *e;
+	while ((s = hkNextAddressed(p, to, &b, &e))) {
+		size_t keep = (size_t)((strcmp(to, name) ? e : s) - p);
+		memmove(w, p, keep);
+		w += keep;
+		p = e;
+	}
+	memmove(w, p, strlen(p) + 1);
+	for (w += strlen(w); w > c && isspace((unsigned char)w[-1]); ) *--w = '\0';
+}
+
+/* Another hako's words as shown here, in a plain notice row: its markdown would
+   show as marks ("* `alpha.txt`"), so bullets become dots and backticks, bold and
+   heading marks go. A new string (a dot is a byte longer than "* "); what its model
+   hears keeps them. */
+static char *hkPlainShown(const char *s) {
+	char *out = malloc(strlen(s) * 2 + 1), *w = out;
+	if (!out) return NULL;
+	for (const char *r = s, *bol = s; *r; ) {
+		if (r == bol) {                            /* the start of a line */
+			const char *q = r;
+			while (*q == ' ') *w++ = *q++;
+			if ((*q == '*' || *q == '-') && q[1] == ' ') { memcpy(w, "\xC2\xB7 ", 3); w += 3; q += 2; }
+			else while (*q == '#') { q++; if (*q == ' ') { q++; break; } }
+			r = q;
+		}
+		if (*r == '`' || (*r == '*' && r[1] == '*')) { r += *r == '*' ? 2 : 1; continue; }
+		if (*r == '\n') bol = r + 1;
+		*w++ = *r++;
+	}
+	*w = '\0';
+	return out;
+}
+
+/* hop: how many models in a row led to a line one sent another (0 = a person typed it) */
+static void hkLogMessageTo(const char *role, const char *content, const char *to, int hop) {
 	char path[PATH_MAX];
 	hkSessionLogPath(path, sizeof(path));
 	if (!path[0]) return;
@@ -6118,6 +6653,7 @@ static void hkLogMessageTo(const char *role, const char *content, const char *to
 		char who[80] = "";
 		if (hk_agent_name[0]) hkCatf(who, 0, sizeof who, ",\"by\":\"%s\"", hk_agent_name);
 		if (to && *to) hkCatf(who, strlen(who), sizeof who, ",\"to\":\"%s\"", to);
+		if (hop > 0) hkCatf(who, strlen(who), sizeof who, ",\"hop\":%d", hop);
 		int n = snprintf(line, lcap, "{\"ts\":%ld,\"role\":\"%s\"%s,\"content\":\"%s\"}\n",
 		                 hk_time_unix(), role, who, esc);
 		hk_fs_write(path, line, (size_t)n, 1);      /* append */
@@ -6125,7 +6661,7 @@ static void hkLogMessageTo(const char *role, const char *content, const char *to
 	}
 	free(esc);
 }
-static void hkLogMessage(const char *role, const char *content) { hkLogMessageTo(role, content, NULL); }
+static void hkLogMessage(const char *role, const char *content) { hkLogMessageTo(role, content, NULL, 0); }
 
 /* The chat's name and color are properties of the chat: they go into its… */
 static void hkLogSessionMeta(void) {
@@ -6145,6 +6681,7 @@ static void hkLogSessionMeta(void) {
    three "new session" entry points cannot drift. */
 static void hkSessionFresh(aiData *data) {
 	if (data) aiClearHistory(data);
+	free(hk_resume_notes); hk_resume_notes = NULL;
 	E.session_started = hk_time_unix();
 	E.session_last_used = 0;
 	E.session_turn_count = 0;
@@ -6257,10 +6794,61 @@ static void hkLoadHistoryTail(aiData *data, int max_msgs, int ctx_msgs) {
 		if (dig) aiPushMessage(data, "user", dig);
 		free(dig);
 	}
+	/* A chat two hakos shared (a join row says so): what another one asked and answered
+	   is shown as theirs and reaches this model as notes, never as its own turns. */
+	int multi = 0;
+	for (int i = 0; i < lcount && !multi; i++) multi = strstr(lines[i], "\"role\":\"join\"") != NULL;
+	char me[24];
+	if (hk_agent_name[0]) snprintf(me, sizeof me, "%s", hk_agent_name); else hkAgentBaseName(me, sizeof me);
+	char *notes = NULL;
+	size_t notes_len = 0, notes_cap = 0;
+	free(hk_resume_notes); hk_resume_notes = NULL;
 	for (int k = lo; k < kept; k++) {
 		int i = keep_idx[k];
 		char *l = lines[i];
 		if (strstr(l, "\"role\":\"meta\"") || strstr(l, "\"role\":\"digest\"")) continue;
+		char by[24] = "", to[24] = "";
+		if (multi) { hkRowField(l, "by", by, sizeof by); hkRowField(l, "to", to, sizeof to); }
+		int other = by[0] && strcmp(by, me);
+		if (other && !strstr(l, "\"role\":\"user\"") && !strstr(l, "\"role\":\"assistant\"") && !strstr(l, "\"role\":\"chat\""))
+			continue;                                 /* its tools and notices are its own */
+		if (other && !(strstr(l, "\"role\":\"user\"") && !strcmp(to, me))) {
+			char *text = hkRowContent(l);
+			int chat = strstr(l, "\"role\":\"chat\"") != NULL, asked = strstr(l, "\"role\":\"user\"") != NULL;
+			if (text && !chat && !asked) {            /* its words, not its tool calls; what it said to this one came as a line */
+				char *w = hkStripToolBlocks(text);
+				free(text);
+				text = w;
+				if (text) hkDropLinesTo(text, me);
+			}
+			if (!text || !*text) { free(text); continue; }
+			char head[64];
+			if (chat) snprintf(head, sizeof head, "chat from %s", by);
+			else if (asked && to[0]) snprintf(head, sizeof head, "%s asked %s", by, to);
+			else if (asked) snprintf(head, sizeof head, "%s was asked", by);
+			else snprintf(head, sizeof head, "%s", by);
+			if (k >= start && data->history_count < AI_HISTORY_MAX) {
+				char *pt = hkPlainShown(text);            /* shown as words, not marks */
+				size_t n = strlen(head) + strlen(pt ? pt : text) + 4;
+				char *sh = malloc(n);
+				if (sh) {
+					snprintf(sh, n, "%s: %s", head, pt ? pt : text);
+					data->history[data->history_count] = sh;
+					data->history_role[data->history_count] = HK_ROLE_SYSTEM;
+					data->history_count++;
+				}
+				free(pt);
+			}
+			if (!chat && k >= ctx_start) {
+				hkSbAdd(&notes, &notes_len, &notes_cap, head, strlen(head));
+				hkSbAdd(&notes, &notes_len, &notes_cap, ": ", 2);
+				hkSbAdd(&notes, &notes_len, &notes_cap, text, strlen(text) > 4000 ? 4000 : strlen(text));
+				hkSbAdd(&notes, &notes_len, &notes_cap, "\n\n", 2);
+				if (notes_len > 16000) { memmove(notes, notes + notes_len - 16000, 16001); notes_len = 16000; }
+			}
+			free(text);
+			continue;
+		}
 		int show = k >= start;
 		char *role = strstr(l, "\"role\":\"");
 		char *content = strstr(l, "\"content\":\"");
@@ -6317,14 +6905,25 @@ static void hkLoadHistoryTail(aiData *data, int max_msgs, int ctx_msgs) {
 					data->history_role[data->history_count] = r;
 					data->history_count++;
 				}
+				if (other) {                       /* a line another hako sent this one: as it ran here */
+					size_t n = strlen(by) + strlen(text) + 16;
+					char *t2 = malloc(n);
+					if (t2) { snprintf(t2, n, "[from %s] %s", by, text); free(text); text = t2; }
+					if (show && data->history_count > 0) { free(data->history[data->history_count - 1]); data->history[data->history_count - 1] = strdup(text); }
+				}
 				if (k >= ctx_start) {
-					if (r == HK_ROLE_USER) aiPushMessage(data, "user", text);
+					if (r == HK_ROLE_USER && notes) {
+						char *w = hkWithNotes(notes, text);
+						aiPushMessage(data, "user", w ? w : text);
+						free(w); free(notes); notes = NULL; notes_len = notes_cap = 0;
+					} else if (r == HK_ROLE_USER) aiPushMessage(data, "user", text);
 					else if (r == HK_ROLE_AI) aiPushMessage(data, "assistant", text);
 				}
 				free(text);
 			}
 		}
 	}
+	hk_resume_notes = notes;                          /* what came after this model's last turn: its next one */
 	free(keep_idx);
 	for (int i = 0; i < lcount; i++) free(lines[i]);
 	free(lines);
@@ -6843,6 +7442,17 @@ static int hkBuildPrompt(aiData *data) {
 	}
 	size_t todo_len = todo_block ? strlen(todo_block) : 0;
 
+	char others[sizeof hk_agents_here + 520] = "";       /* last: a hako arriving leaves the rest as it was */
+	if (hk_agents_here[0] && hk_agent_name[0]) {          /* the example is what got a 3B model to do it */
+		int fl = (int)strcspn(hk_agents_here, " ,");
+		snprintf(others, sizeof others,
+			"\n# Other hakos here\n\nYou are %s. Also on this chat: %s, each another model.\n"
+			"To talk to one, start a line with @ and its name. That line is sent to it, and it answers.\n"
+			"Example: asked \"say hi to %.*s\", you reply:\n@%.*s hi!\n",
+			hk_agent_name, hk_agents_here, fl, hk_agents_here, fl, hk_agents_here);
+	}
+	size_t others_len = strlen(others);
+
 	char hako_hdr_buf[96];
 	snprintf(hako_hdr_buf, sizeof(hako_hdr_buf), "\n# %s (project context)\n\n", hako_src);
 	const char *hako_hdr = hako_hdr_buf;
@@ -6873,7 +7483,7 @@ static int hkBuildPrompt(aiData *data) {
 	size_t blen = strlen(BASE_PROMPT), r2len = strlen(rule2), tlen = strlen(BASE_TAIL);
 	size_t rlen = tool_prompt ? strlen(tool_prompt) : 0;
 	size_t elen = strlen(env_probe);
-	size_t need = rlen + mlen + blen + r2len + tlen + elen + total + hako_hlen + hako_len + todo_len + mem_len + plan_len + 1;
+	size_t need = rlen + mlen + blen + r2len + tlen + elen + total + hako_hlen + hako_len + todo_len + mem_len + plan_len + others_len + 1;
 	char *combined = malloc(need);
 	if (combined) {
 		size_t off = 0;
@@ -6891,6 +7501,7 @@ static int hkBuildPrompt(aiData *data) {
 		if (plan_block) { memcpy(combined + off, plan_block, plan_len); off += plan_len; }
 		if (mem_block)  { memcpy(combined + off, mem_block, mem_len);  off += mem_len; }
 		if (todo_block) { memcpy(combined + off, todo_block, todo_len); off += todo_len; }
+		memcpy(combined + off, others, others_len); off += others_len;
 		combined[off] = '\0';
 		free(buf); free(hako_body); free(todo_block); free(mem_block);
 		free(data->system_prompt);
@@ -7348,6 +7959,11 @@ static int clRailOn(void) {
 
 /* Streamed deltas arrive mid-word, but the renderer works on lines. */
 typedef struct { char buf[8192]; size_t len; int shown; int open; int parked; } clStreamLine;
+static int cl_stream_partial;   /* a streamed line is parked half done: the next delta climbs back onto it */
+#if HK_ATTACH
+static volatile sig_atomic_t hk_tail_news;       /* the log grew during this hako's own turn */
+static void hkAgentsMidTurn(aiData *data);
+#endif
 
 static void clPrintRoleLine(unsigned char role, const char *text);
 static void clOutBegin(void);
@@ -7373,6 +7989,7 @@ static void clStreamPark(clStreamLine *sl) {
 	fflush(stdout);
 	sl->parked = 1;
 	sl->open = 0;
+	cl_stream_partial = sl->shown > 0;
 	clOutEnd(&G_AI);
 }
 
@@ -7393,6 +8010,10 @@ static void clStreamEmit(clStreamLine *sl) {
 	clStreamUnecho(sl);
 	clPrintRoleLine(HK_ROLE_AI, sl->buf);   /* nested: depth > 0, no bar */
 	sl->len = 0;
+	cl_stream_partial = 0;
+#if HK_ATTACH
+	if (hk_tail_news) hkAgentsMidTurn(&G_AI);   /* a model streams on without a pause: between its lines is the moment */
+#endif
 }
 
 static void clStreamPush(clStreamLine *sl, const char *chunk) {
@@ -7431,6 +8052,7 @@ static void clStreamEnd(clStreamLine *sl) {
 	if (sl->len) { clStreamResume(sl); clStreamEmit(sl); }
 	else if (sl->shown) clStreamUnecho(sl);     /* withdrawn: nothing to render */
 	if (sl->open) { sl->open = 0; sl->parked = 0; clOutEnd(&G_AI); }
+	cl_stream_partial = 0;
 }
 
 /* Bracketed so the bar comes back underneath whatever this prints — that is
@@ -7523,11 +8145,17 @@ static void clPrintRoleLineRaw(unsigned char role, const char *text) {
 	fflush(stdout);
 	E.last_role_shown = role;
 }
+/* The worker and the keyboard thread both add rows during a turn (a queued
+   command's echo, another hako's line): one at a time, or a row is lost. */
+static pthread_mutex_t hk_history_lock = PTHREAD_MUTEX_INITIALIZER;
 static void aiPushHistoryStore(aiData *data, const char *text, unsigned char role) {
-	if (data->history_count >= AI_HISTORY_MAX) return;
-	data->history[data->history_count] = strdup(text ? text : "");
-	data->history_role[data->history_count] = role;
-	data->history_count++;
+	pthread_mutex_lock(&hk_history_lock);
+	if (data->history_count < AI_HISTORY_MAX) {
+		data->history[data->history_count] = strdup(text ? text : "");
+		data->history_role[data->history_count] = role;
+		data->history_count++;
+	}
+	pthread_mutex_unlock(&hk_history_lock);
 }
 
 /* A menu opened and closed leaves no trace: its command line is echoed only
@@ -9315,10 +9943,11 @@ static int hkInjectPushKind(const char *line, int kind);
 static void hkAgentsTick(aiData *data);
 static void hkAgentsBusy(int busy);
 static int hkAgentsRoute(aiData *data, char *line, size_t cap);
-static char *hkAgentsPrompt(const char *line);
+static char *hkAgentsNotes(void);
 static int hkAgentsNames(char out[][160], int max, const char *pfx, size_t plen);
 static int hkAgentsCmd(aiData *data, const char *cmd, int cmdlen, const char *arg);
-static void hkAgentsAtStart(aiData *data);
+static int hkAgentsAtStart(aiData *data);
+static void hkAgentsAtStartSay(void);
 static void hsAttachInfo(int *port, const char **token);
 static void hsAttachSetPort(int port);
 static int hrStart(void);
@@ -9437,7 +10066,9 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 #if HK_ATTACH
 		if (hs_attached && hkEmitToolRequest(name, subject, kind, input_json)) hs_answer_armed = 1;
 #endif
+		hkStatus("blocked", "permission");
 		int pick = clPopupSelect("allow?", choices, hs_remote ? 2 : 3, 0, NULL);
+		hkStatus("working", NULL);
 #if HK_ATTACH
 		if (hs_answer_armed) { hs_answer_armed = 0; pick = hsAttachSettle(pick); }
 #endif
@@ -9911,7 +10542,14 @@ static char *hkExecToolRun(const char *name, const char *input_json) {
 		return hkToolWebFetch(input_json);
 	}
 	if (strcmp(name, "ask_user") == 0) {
-		return hkToolAskUser(input_json);
+		/* the keyboard, as an approval takes it: unclaimed, the line reader read the
+		   same tty and an enter meant for the menu went to the field, the turn stuck */
+		hkClaimStdin();
+		hkStatus("blocked", "question");
+		char *ans = hkToolAskUser(input_json);
+		hkStatus("working", NULL);
+		hkReleaseStdin();
+		return ans;
 	}
 	if (strcmp(name, "delegate") == 0) return hkToolDelegate(input_json);
 	if (strcmp(name, "remember") == 0) {
@@ -10886,7 +11524,7 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 	}
 	case AI_PROVIDER_ANTHROPIC: {
 		if (!endpoint) endpoint = "https://api.anthropic.com";
-		if (!model) model = "claude-haiku-4-5";
+		if (!model) model = hkProviderDefaultModel(AI_PROVIDER_ANTHROPIC);
 		int anth_on = tools_on && hkProjectTrusted();
 		int oauth_anth = E.ai_oauth_provider && !strcmp(E.ai_oauth_provider, "anthropic");
 		int stream_on = oauth_anth || (E.ai_stream && !anth_on);
@@ -10979,28 +11617,31 @@ static int aiBuildRequest(aiData *data, enum aiProviderType type, hkReqParts *ou
 			snprintf(body, bodycap,
 				"{\"model\":\"%s\",\"instructions\":\"%s\",\"input\":%s,"
 				"\"stream\":true,\"store\":false}",
-				model ? model : "gpt-5.5", sys_esc ? sys_esc : "", msgs);
+				model ? model : "gpt-6-luna", sys_esc ? sys_esc : "", msgs);
 			break;
 		}
 		if (!endpoint) endpoint = "https://api.openai.com";
 		if (!model) model = hkProviderDefaultModel(E.ai_provider_type);
-		if (!model) model = "gpt-4o-mini";
+		if (!model) model = "gpt-6-luna";
 		const char *reason = "";
 		if (endpoint && strstr(endpoint, "generativelanguage") && strstr(model, "2.5"))
 			reason = ",\"reasoning_effort\":\"none\"";
 		const char *stream_field = E.ai_stream
 			? ",\"stream\":true,\"stream_options\":{\"include_usage\":true}" : "";
+		/* OpenAI's own API turns max_tokens away on its reasoning models (gpt-5
+		   on); other OpenAI-shaped hosts keep the old name */
+		const char *mtk = strstr(endpoint, "api.openai.com") ? "max_completion_tokens" : "max_tokens";
 		int tlen = tools_on ? strlen(fn_tools) + 16 : 0;
 		int need = bodycap + tlen + 160 + (int)strlen(reason);
 		if (need > bodycap) { body = realloc(body, need); bodycap = need; }
 		if (tools_on) {
 			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"max_tokens\":%d%s%s,\"messages\":%s,\"tools\":%s}",
-				model, max_tokens, reason, stream_field, msgs, fn_tools);
+				"{\"model\":\"%s\",\"%s\":%d%s%s,\"messages\":%s,\"tools\":%s}",
+				model, mtk, max_tokens, reason, stream_field, msgs, fn_tools);
 		} else {
 			snprintf(body, bodycap,
-				"{\"model\":\"%s\",\"max_tokens\":%d%s%s,\"messages\":%s}",
-				model, max_tokens, reason, stream_field, msgs);
+				"{\"model\":\"%s\",\"%s\":%d%s%s,\"messages\":%s}",
+				model, mtk, max_tokens, reason, stream_field, msgs);
 		}
 		break;
 	}
@@ -11472,8 +12113,7 @@ static long hkContextWindow(void) {
 		return v > 0 ? v : (sizeof(void *) == 4 ? 4096 : 8192);
 	}
 	case AI_PROVIDER_ANTHROPIC:
-		if (strstr(m, "haiku")) return 200000;
-		if (strstr(m, "claude-3") || strstr(m, "-4-5")) return 200000;
+		if (strstr(m, "claude-3") || strstr(m, "-4-5") || strstr(m, "haiku-4")) return 200000;
 		return 1000000;
 	case AI_PROVIDER_OLLAMA:    return 8192;
 	case AI_PROVIDER_OPENAI:
@@ -11481,9 +12121,11 @@ static long hkContextWindow(void) {
 		if (strstr(m, "gpt-4-"))   return 8192;
 		if (strstr(m, "gemini"))   return 1000000;
 		if (strstr(m, "claude")) {
-			if (strstr(m, "haiku") || strstr(m, "claude-3")) return 200000;
+			if (strstr(m, "haiku-4") || strstr(m, "claude-3")) return 200000;
 			return 1000000;
 		}
+		if (strstr(m, "gpt-6") || strstr(m, "grok-4") || strstr(m, "deepseek-flash")
+		    || strstr(m, "deepseek-v4")) return 1000000;
 		return 128000;
 	default: return 128000;
 	}
@@ -12548,21 +13190,21 @@ static char *hkMithraeumFirstAvailable(void) {
 }
 
 static const struct { const char *prov, *models; } HK_MODEL_SUGG[] = {
-	{ "anthropic",      "claude-opus-5, claude-sonnet-5, claude-opus-4-8, claude-opus-4-7, claude-sonnet-4-6, claude-haiku-4-5" },
-	{ "openai",         "gpt-4o, gpt-4o-mini, gpt-5, o1, o1-mini, gpt-4.1" },
-	{ "chatgpt",        "gpt-5.5, gpt-5.4, gpt-5.4-mini" },
-	{ "gemini",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro, gemini-1.5-flash" },
-	{ "google",         "gemini-2.5-pro, gemini-2.5-flash, gemini-1.5-pro" },
-	{ "groq",           "llama-3.3-70b-versatile, llama-3.1-8b-instant, mixtral-8x7b-32768" },
-	{ "cerebras",       "llama3.1-70b, llama3.1-8b, llama-3.3-70b" },
-	{ "deepseek",       "deepseek-chat, deepseek-reasoner" },
-	{ "mistral",        "mistral-large-latest, mistral-small-latest, codestral-latest" },
+	{ "anthropic",      "claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5, claude-fable-5-2, claude-opus-5, claude-sonnet-5" },
+	{ "openai",         "gpt-6.1-sol, gpt-6-luna, gpt-6.1-terra, gpt-6-astra" },
+	{ "chatgpt",        "gpt-6.1-sol, gpt-6-luna, gpt-6.1-terra, gpt-6-astra" },
+	{ "gemini",         "gemini-3.8-flash, gemini-3.5-flash-lite, gemini-4-argon, gemini-4-carbon" },
+	{ "google",         "gemini-3.8-flash, gemini-3.5-flash-lite, gemini-4-argon, gemini-4-carbon" },
+	{ "groq",           "openai/gpt-oss-120b, openai/gpt-oss-20b" },
+	{ "cerebras",       "gpt-oss-120b, qwen-3.8-27b" },
+	{ "deepseek",       "deepseek-flash, deepseek-v4-pro" },
+	{ "mistral",        "mistral-medium-latest, mistral-large-latest, mistral-small-latest, codestral-latest" },
 	{ "together",       "meta-llama/Llama-3.3-70B-Instruct-Turbo, Qwen/Qwen2.5-72B-Instruct-Turbo" },
 	{ "fireworks",      "accounts/fireworks/models/llama-v3p1-70b-instruct, accounts/fireworks/models/qwen2p5-72b-instruct" },
-	{ "openrouter",     "anthropic/claude-3.5-sonnet, openai/gpt-4o, meta-llama/llama-3.3-70b-instruct:free, deepseek/deepseek-chat:free" },
+	{ "openrouter",     "anthropic/claude-sonnet-5.5, openai/gpt-6.1-sol, google/gemini-4-argon, deepseek/deepseek-v4.1-flash-1017" },
 	{ "nous",           "anthropic/claude-haiku-5.5, anthropic/claude-sonnet-5.5, deepseek/deepseek-v4-flash, moonshotai/kimi-k3.1-pro" },
-	{ "xai",            "grok-2, grok-2-mini, grok-beta" },
-	{ "grok",           "grok-2, grok-2-mini, grok-beta" },
+	{ "xai",            "grok-4.7, grok-4.3, grok-build-0.1" },
+	{ "grok",           "grok-4.7, grok-4.3, grok-build-0.1" },
 };
 
 static const char *hkProviderLabel(void) {
@@ -12593,8 +13235,9 @@ static const char *hkProviderLabel(void) {
 
 static const char *hkCuratedModels(void) {
 	const char *match = hkProviderLabel();
-	if (!strcmp(match, "copilot"))       return "gpt-4o, gpt-4o-mini, o1-mini, claude-3.5-sonnet, claude-3.7-sonnet";
-	if (!strcmp(match, "github-models")) return "gpt-4o, gpt-4o-mini, meta-llama-3-70b-instruct, mistral-large, microsoft/phi-3.5-mini";
+	/* both catalogs depend on the plan: the live list is the real one */
+	if (!strcmp(match, "copilot"))       return "gpt-4.1, gpt-5-mini, claude-sonnet-4.5";
+	if (!strcmp(match, "github-models")) return "gpt-4.1-mini, gpt-4.1";
 	for (size_t i = 0; i < sizeof(HK_MODEL_SUGG) / sizeof(HK_MODEL_SUGG[0]); i++)
 		if (!strcmp(HK_MODEL_SUGG[i].prov, match)) return HK_MODEL_SUGG[i].models;
 	return NULL;
@@ -12725,6 +13368,23 @@ static int hkModelListReq(char *url, size_t ucap, char *hdr, size_t hcap) {
 	}
 }
 
+/* The next `"name": value` at or after p, spaces around the colon or not; points at the value. */
+static const char *hkJsonKey(const char *p, const char *name) {
+	char q[40];
+	int ql = snprintf(q, sizeof q, "\"%s\"", name);
+	while (p && (p = strstr(p, q)) != NULL) {
+		const char *v = p + ql;
+		while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+		if (*v == ':') {
+			v++;
+			while (*v == ' ' || *v == '\t' || *v == '\n' || *v == '\r') v++;
+			return v;
+		}
+		p += ql;
+	}
+	return NULL;
+}
+
 static int hkParseModelList(const char *json, char out[][96], int max) {
 	if (!json || !*json || max <= 0) return 0;
 	long long *when = calloc((size_t)max, sizeof(long long));
@@ -12733,11 +13393,11 @@ static int hkParseModelList(const char *json, char out[][96], int max) {
 
 	for (int pass = 0; pass < 3 && n == 0; pass++) {
 		/* codex lists "slug"; openai-shaped lists "id"; gemini/ollama "name" */
-		const char *key = pass == 0 ? "\"slug\":\"" : pass == 1 ? "\"id\":\"" : "\"name\":\"";
-		size_t klen = strlen(key);
+		const char *key = pass == 0 ? "slug" : pass == 1 ? "id" : "name";
 		const char *p = json;
-		while (n < max && (p = strstr(p, key)) != NULL) {
-			p += klen;
+		while (n < max && (p = hkJsonKey(p, key)) != NULL) {
+			if (*p != '"') { p++; continue; }
+			p++;
 			const char *e = p;
 			while (*e && *e != '"') e++;
 			if (!*e) break;
@@ -12746,17 +13406,29 @@ static int hkParseModelList(const char *json, char out[][96], int max) {
 				char id[96];
 				snprintf(id, sizeof(id), "%.*s", len, p);
 				const char *bare = strncmp(id, "models/", 7) == 0 ? id + 7 : id;
+				/* this entry's own fields run up to the next one's key */
+				const char *nxt = hkJsonKey(e, key);
+#define HK_IN_ENTRY(f) ((f) && (!nxt || (f) < nxt))
+				/* codex marks the ones its picker hides (review and reserve slugs):
+				   still offered, after the ones it lists, so they stay reachable but
+				   never come first (a default heals to the top of the list) */
+				const char *vis = hkJsonKey(e, "visibility");
+				int hidden = HK_IN_ENTRY(vis) && strncasecmp(vis, "\"list\"", 6) != 0;
 				if (hkModelIsChat(bare)) {
 					int dup = 0;
 					for (int i = 0; i < n; i++) if (!strcmp(out[i], bare)) { dup = 1; break; }
 					if (!dup) {
 						snprintf(out[n], 96, "%s", bare);
-						const char *nxt = strstr(e, key);
-						const char *cr = strstr(e, "\"created\":");
-						if (cr && (!nxt || cr < nxt)) when[n] = atoll(cr + 10);
+						const char *cr = hkJsonKey(e, "created");
+						const char *pr = hkJsonKey(e, "priority");
+						/* codex ranks by priority, lowest first; the rest newest first */
+						if (HK_IN_ENTRY(pr)) when[n] = -atoll(pr);
+						else if (HK_IN_ENTRY(cr)) when[n] = atoll(cr);
+						if (hidden) when[n] -= 1LL << 40;
 						n++;
 					}
 				}
+#undef HK_IN_ENTRY
 			}
 			p = e;
 		}
@@ -12878,6 +13550,27 @@ static int hkModelHere(const char *model, int *lv) {
 	return hkModelFitsProvider(E.ai_provider_type, model) && (*lv == 0 || known);
 }
 
+/* The provider's own model nearest the built-in default: the default itself,
+   else the newest of its tier (a retired claude-haiku-4-5 finds claude-haiku-5-5,
+   not the dearest model on the list), else the first that fits the provider. */
+static const char *hkLiveLike(const char *pref, char live[][96], int n) {
+	static const char *TIER[] = { "haiku", "sonnet", "opus", "fable", "flash-lite", "flash",
+		"luna", "terra", "sol", "astra", "nano", "mini", "medium", "small", "large", "pro", NULL };
+	if (n <= 0) return NULL;
+	for (int i = 0; pref && i < n; i++)
+		if (!strcmp(pref, live[i])) return live[i];
+	const char *tier = NULL;
+	for (int t = 0; pref && TIER[t] && !tier; t++)
+		if (strstr(pref, TIER[t])) tier = TIER[t];
+	for (int i = 0; tier && i < n; i++)
+		if (strstr(live[i], tier) && hkModelFitsProvider(E.ai_provider_type, live[i])
+		    && (strcmp(tier, "flash") || !strstr(live[i], "flash-lite")))
+			return live[i];
+	for (int i = 0; i < n; i++)
+		if (hkModelFitsProvider(E.ai_provider_type, live[i])) return live[i];
+	return live[0];
+}
+
 static void hkHealModelForProvider(aiData *data) {
 	char (*live1)[96] = hk_live1;
 	clOAuthEnsureFresh(data);
@@ -12885,10 +13578,7 @@ static void hkHealModelForProvider(aiData *data) {
 	if (hkModelHere(E.ai_model, &lv)) return;
 
 	const char *pref = hkProviderDefaultModel(E.ai_provider_type);
-	const char *dm = NULL;
-	for (int i = 0; i < lv && pref; i++)
-		if (!strcmp(pref, live1[i])) { dm = live1[i]; break; }
-	if (!dm && lv > 0) dm = live1[0];
+	const char *dm = hkLiveLike(pref, live1, lv);
 	if (!dm) dm = pref;
 	if (dm && (!E.ai_model || strcmp(dm, E.ai_model))) {
 		free(E.ai_model); E.ai_model = strdup(dm);
@@ -13803,6 +14493,15 @@ static void hkReportEmpty(aiData *data, const char *body, const char *what) {
 		} else {
 			snprintf(err, sizeof(err), "Error: %s — %.200s",
 			         label, msg ? msg : body);
+			/* a plan's usage limit (ChatGPT's codex backend) says when it lifts: so do we */
+			long secs = hkExtractJsonInt(body, "resets_in_seconds");
+			long at = secs > 0 ? 0 : hkExtractJsonInt(body, "resets_at");
+			if (secs <= 0 && at > hk_time_unix()) secs = at - hk_time_unix();
+			if (secs > 0) {
+				size_t o = strlen(err);
+				if (secs >= 3600) hkCatf(err, o, sizeof err, " (resets in %ldh %ldm)", secs / 3600, secs % 3600 / 60);
+				else hkCatf(err, o, sizeof err, " (resets in %ldm)", secs > 60 ? secs / 60 : 1);
+			}
 		}
 		free(reason);
 		free(msg);
@@ -13946,7 +14645,11 @@ static void *aiWorkerTurn(void *arg) {
 	data->turn_start_ms = clWallMs();
 
 	pthread_mutex_lock(&data->lock);
-	char *prompt = data->current_prompt ? strdup(data->current_prompt) : NULL;
+	/* the model hears the other hakos first; every check below reads only the line asked */
+	char *prompt = !data->current_prompt ? NULL : data->current_notes ? hkWithNotes(data->current_notes, data->current_prompt)
+	                                                                   : strdup(data->current_prompt);
+	free(data->current_notes);
+	data->current_notes = NULL;
 	if (prompt) hkSlimOldWrites(data);       /* earlier turns' file bodies are on disk now */
 	if (prompt) aiPushMessage(data, "user", prompt);
 	pthread_mutex_unlock(&data->lock);
@@ -14208,10 +14911,10 @@ static void *aiWorkerTurn(void *arg) {
 			char msg[384];
 			const char *pname = hkProviderLabel();
 			if (E.ai_provider_type == AI_PROVIDER_NONE) {
-				snprintf(msg, sizeof(msg), "Error: no provider set. Run /provider <name> or /login <name>.");
+				snprintf(msg, sizeof(msg), "Error: no provider set. Run :provider <name> or :login <name>.");
 			} else if (!E.ai_api_key && !HK_IS_OLLAMA_WIRE(E.ai_provider_type)) {
 				snprintf(msg, sizeof(msg),
-					"Error: missing api key for %s. Run /login %s, or set %s_API_KEY env var.",
+					"Error: not signed in to %s. Run :login %s, or set %s_API_KEY.",
 					pname, pname,
 					(E.ai_provider_type == AI_PROVIDER_ANTHROPIC) ? "ANTHROPIC" :
 					(E.ai_provider_type == AI_PROVIDER_OPENAI) ? "OPENAI / GOOGLE / GROQ / etc"
@@ -14405,9 +15108,8 @@ static void *aiWorkerTurn(void *arg) {
 				}
 				if (E.ai_oauth_refresh && !token_retried && hkAuthFailure(full_response)) {
 					token_retried = 1;
-					free(full_response);
-					clOAuthRefresh(data);
-					continue;
+					if (clOAuthRefresh(data) == 0) { free(full_response); continue; }
+					token_retried = hk_refresh_refused ? 2 : 3;   /* no new token: asking again would fail the same way */
 				}
 				if (!stream_retried && hkRetryableStreamError(full_response)) {
 					stream_retried = 1;
@@ -14418,6 +15120,8 @@ static void *aiWorkerTurn(void *arg) {
 				}
 				pthread_mutex_lock(&data->lock);
 				hkReportEmpty(data, full_response, "stream");
+				if (token_retried == 2 && E.ai_oauth_provider)
+					aiSayf(data, "the %s sign-in has ended: :login %s signs in again", hkProviderLabel(), E.ai_oauth_provider);
 				pthread_mutex_unlock(&data->lock);
 			}
 
@@ -14879,7 +15583,7 @@ static const hkCmd HK_CMDS[] = {
 	{ "agents",    ':', "session",  "",                "the hakos on this session",        HK_CF_TURN },
 	{ "as",        ':', "session",  "<name>",          "this hako's name on the session",  HK_CF_TURN },
 	{ "route",     ':', "session",  "[name|off]",      "who answers a line without @",     HK_CF_TURN },
-	{ "join",      ':', "session",  "[name|chat]",     "work on another hako's chat",      HK_CF_TURN },
+	{ "join",      ':', "session",  "[hako or chat]",  "work on another hako's chat",      HK_CF_TURN },
 	{ "say",       ':', "session",  "<text>",          "a line for the people here, no model answers", HK_CF_TURN },
 	{ "mcp",       ':', "app",      "[reload]",        "MCP servers",                      HK_CF_TURN },
 	{ "e",         ':', "app",      "[editor]",        "write the next message in $EDITOR", HK_CF_TURN | HK_CF_TTY },
@@ -15424,7 +16128,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			free(E.ai_model);
 			E.ai_model = strdup(arg);
 			hkSaveSession();
-			if (!hk_menu_pick) aiSayf(data, "model: %s (saved)", E.ai_model);
+			if (!hk_menu_pick) aiSayf(data, "model: %s (%s)", E.ai_model, hkAgentsOthersHere() ? "this hako only: another works in this folder" : "saved");
 
 			if (E.ai_provider_type == AI_PROVIDER_MITHRAEUM && isatty(STDIN_FILENO)) {
 				char *p = hkMithraeumModelPath(E.ai_model);
@@ -15639,12 +16343,15 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 				hkSaveSession();
 				if (!hk_menu_pick) {
 					char msg[256];
-					snprintf(msg, sizeof(msg), "provider: %s (saved)%s%s",
-						hkProviderLabel(),
+					snprintf(msg, sizeof(msg), "provider: %s (%s)%s%s",
+						hkProviderLabel(), hkAgentsOthersHere() ? "this hako only: another works in this folder" : "saved",
 						hkProviderDefaultEndpoint(arg) ? " endpoint=" : "",
 						hkProviderDefaultEndpoint(arg) ? hkProviderDefaultEndpoint(arg) : "");
 					aiAddHistory(data, msg);
 				}
+				/* said now, not by the next turn failing */
+				if (!E.ai_api_key && !E.ai_oauth_refresh && !HK_IS_OLLAMA_WIRE(E.ai_provider_type) && strcmp(hkProviderLabel(), "custom"))
+					aiSayf(data, "not signed in to %s yet: :login %s", hkProviderLabel(), hkProviderLabel());
 			}
 		} else {
 			aiSayf(data, "provider: %s", hkProviderLabel());
@@ -16324,9 +17031,9 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		E.session_started = hk_time_unix();
 		hkSaveSession();
 		aiClearHistory(data);
-		aiSayf(data, "resumed: %s", E.session_id);
 		hkLoadHistoryTail(data, AI_HISTORY_MAX, 40);
 		hkReplayTranscript(data);
+		aiSayf(data, "resumed: %s", E.session_id);   /* after: said first, it was logged into the chat and shown again from it */
 		return 1;
 	}
 	if (strncmp(cmd, "session", cmdlen) == 0 && cmdlen == 7) {
@@ -16452,6 +17159,14 @@ static void hkRcParse(const char *path, int layer) {
 		hk_rc[hk_rc_n].layer = (unsigned char)layer;
 		hk_rc[hk_rc_n].tool = tool;
 		hk_rc_n++;
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+		static int warned;
+		struct stat st;
+		if (!layer && !warned && !strcmp(key, "ai_api_key") && *val && stat(path, &st) == 0 && (st.st_mode & 077)) {
+			warned = 1;
+			fprintf(stderr, "! %s holds an API key and other users can read it: chmod 600 %s\n", path, path);
+		}
+#endif
 	}
 	free(buf);
 }
@@ -16855,6 +17570,7 @@ static void clCleanupAI(aiData *data) {
 	free(data->history);
 	free(data->history_role);
 	free(data->current_prompt);
+	free(data->current_notes);
 	free(data->current_response);
 	free(data->system_prompt);
 	aiFreeMessages(data);
@@ -17528,6 +18244,7 @@ static int clMenuTake(char *buf, int *len, int *cur, int cap, int run) {
 static int clReadLineRaw2(const char *prompt, char *out, size_t cap) {
 	if (clEnableRaw() != 0) {
 		printf("%s", prompt); fflush(stdout);
+		clFrameYield();
 		if (!fgets(out, cap, stdin)) return -1;
 		size_t n = strlen(out);
 		if (n && out[n-1] == '\n') out[--n] = '\0';
@@ -17579,8 +18296,12 @@ static int clReadLineRaw2(const char *prompt, char *out, size_t cap) {
 			clRedrawLine(prompt, buf, len, cur);
 		}
 #endif
+#if HK_ATTACH
+		if (hk_tail_news && cl_composing && !hk_need_stdin && !cl_turn_done)   /* another hako spoke mid-turn */
+			hkAgentsMidTurn(&G_AI);
+#endif
 		if (hk_need_stdin || cl_turn_done) { r = -1; errno = EINTR; }
-		else r = read(STDIN_FILENO, &c, 1);
+		else { clFrameYield(); r = read(STDIN_FILENO, &c, 1); clFrameResume(); }
 		if (r <= 0) {
 			if (r < 0 && errno == EINTR && hk_need_stdin) {
 				buf[len] = '\0';
@@ -17642,6 +18363,9 @@ static int clReadLineRaw2(const char *prompt, char *out, size_t cap) {
 				clRedrawLine(prompt, buf, len, cur);
 				continue;
 			}
+#if HK_ATTACH
+			if (r < 0 && errno == EINTR && cl_tail_sig) { cl_tail_sig = 0; continue; }   /* shown at the top of the loop */
+#endif
 			if (r < 0 && errno == EINTR) {
 				clDisableRaw();
 				clLineBreak();
@@ -18308,6 +19032,18 @@ static int clOAuthChatGPT(aiData *data) {
 	return 0;
 }
 
+/* The sign-in server answered and refused the refresh token: said once, with its reason,
+   and that token is not tried again (clOAuthRefresh) until a new sign-in replaces it. */
+static void clOAuthRefused(aiData *data, const char *label, const char *prov, const char *resp) {
+	hk_refresh_refused = 1;
+	char *why = hkExtractJsonString(resp, "error_description");
+	if (!why) why = hkExtractJsonString(resp, "message");
+	if (!why) why = hkExtractJsonString(resp, "error");
+	if (data) aiSayf(data, "%s: sign-in expired%s%.160s%s; run :login %s again", label,
+	                 why ? " (" : "", why ? why : "", why ? ")" : "", prov);
+	free(why);
+}
+
 static int clOAuthChatGPTRefresh(aiData *data) {
 	if (!E.ai_oauth_refresh) return -1;
 	size_t cap = strlen(E.ai_oauth_refresh) + 192;
@@ -18318,8 +19054,8 @@ static int clOAuthChatGPTRefresh(aiData *data) {
 	char *tr = clCurlPost(HAKO_CHATGPT_ISSUER "/oauth/token", body, NULL);
 	free(body);
 	int rc = tr ? hkChatGPTStore(tr) : -1;
-	if (rc != 0 && data) aiAddHistory(data, tr ? "ChatGPT: sign-in expired; run :login chatgpt again"
-	                                           : "ChatGPT: could not reach the sign-in server; still signed in");
+	if (rc != 0 && tr) clOAuthRefused(data, "ChatGPT", "chatgpt", tr);
+	else if (rc != 0 && data) aiAddHistory(data, "ChatGPT: could not reach the sign-in server; still signed in");
 	free(tr);
 	return rc;
 }
@@ -18428,8 +19164,8 @@ static int clOAuthNousRefresh(aiData *data) {
 	hkHttpReq rq = { .method = "POST", .url = HAKO_NOUS_PORTAL "/api/oauth/token", .headers = hdr, .body = form };
 	char *tr = hk_http_fetch(&rq);
 	int rc = tr ? hkNousStore(tr) : -1;
-	if (rc != 0 && data) aiAddHistory(data, tr ? "Nous: sign-in expired; run :login nous again"
-	                                           : "Nous: could not reach the sign-in server; still signed in");
+	if (rc != 0 && tr) clOAuthRefused(data, "Nous", "nous", tr);
+	else if (rc != 0 && data) aiAddHistory(data, "Nous: could not reach the sign-in server; still signed in");
 	free(tr);
 	return rc;
 }
@@ -18569,11 +19305,13 @@ static char *hkOAuthPendingTake(void) {
 	char path[600];
 	hkOAuthPendingPath(path, sizeof(path));
 	if (!path[0]) return NULL;
-	long len = 0;
+	long len = 0, mtime = 0;
+	if (!hk_fs_exists(path, NULL, &mtime, NULL)) return NULL;
 	char *v = hk_fs_read(path, 4096, &len);
 	if (v) {
 		while (len > 0 && (v[len - 1] == '\n' || v[len - 1] == '\r')) v[--len] = '\0';
 		hk_fs_remove(path);
+		if (mtime && hk_time_unix() - mtime > 15 * 60) { crypto_wipe(v, (size_t)len); free(v); v = NULL; }   /* a sign-in left open, not this one */
 	}
 	return v;
 }
@@ -18681,7 +19419,7 @@ static int clOAuthAnthropicExchange(aiData *data, char *paste, const char *verif
 	free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("anthropic");
 	E.ai_oauth_expires_at = expires > 0 ? hk_time_unix() + expires - 30 : 0;
 	if (!E.ai_model || !*E.ai_model) {
-		free(E.ai_model); E.ai_model = strdup("claude-haiku-4-5");
+		free(E.ai_model); E.ai_model = strdup(hkProviderDefaultModel(AI_PROVIDER_ANTHROPIC));
 	}
 	clCredsCaptureCurrent();
 	clCredsSave();
@@ -18787,13 +19525,14 @@ static int clOAuthRefreshNow(aiData *data) {
 	snprintf(body, sizeof(body),
 		"{\"grant_type\":\"refresh_token\",\"refresh_token\":\"%s\",\"client_id\":\"%s\"}",
 		E.ai_oauth_refresh, client_id);
-	hkHttpReq rfsh = { .method = "POST", .url = HAKO_ANTHROPIC_TOKEN_URL, .body = body };
+	const char *tu = getenv("HAKO_ANTHROPIC_TOKEN_URL");      /* tests point it at a local fake */
+	hkHttpReq rfsh = { .method = "POST", .url = tu && *tu ? tu : HAKO_ANTHROPIC_TOKEN_URL, .body = body };
 	char *tr = hk_http_fetch(&rfsh);
-	if (!tr) return -1;
+	if (!tr) { if (data) aiAddHistory(data, "Claude: could not reach the sign-in server; still signed in"); return -1; }
 
 	char *access = hkExtractJsonString(tr, "access_token");
 	if (!access) {
-		if (data) aiAddHistory(data, "OAuth: refresh failed; run :login anthropic again");
+		clOAuthRefused(data, "Claude", "anthropic", tr);
 		free(tr); return -1;
 	}
 	int expires = hkExtractJsonInt(tr, "expires_in");
@@ -18820,7 +19559,16 @@ static int clOAuthRefresh(aiData *data) {
 	if (!E.ai_oauth_provider) rc = -1;	/* logged out from another hako */
 	else if (!clSameStr(was, E.ai_api_key)
 	         && (!E.ai_oauth_expires_at || hk_time_unix() < E.ai_oauth_expires_at)) rc = 0;
-	else rc = clOAuthRefreshNow(data);
+	else {
+		static uint64_t dead;                     /* the refresh token the server refused */
+		uint64_t tok = E.ai_oauth_refresh ? hkDigest(E.ai_oauth_refresh, strlen(E.ai_oauth_refresh)) : 0;
+		if (tok && tok == dead) { rc = -1; hk_refresh_refused = 1; }
+		else {
+			hk_refresh_refused = 0;
+			rc = clOAuthRefreshNow(data);
+			if (rc != 0 && hk_refresh_refused) dead = tok;
+		}
+	}
 	free(was);
 	hkLockDrop(lock);
 	return rc;
@@ -19252,6 +20000,7 @@ static int clPopupSelectLive(const char *title, const char **items, int n,
 		if (n > shown) printf("  … %d more\n", n - shown);
 		char line[32];
 		printf("  pick [1-%d]: ", shown); fflush(stdout);
+		clFrameYield();
 		if (!fgets(line, sizeof line, stdin)) return -1;
 		int pick = atoi(line);
 		return (pick >= 1 && pick <= shown) ? pick - 1 : -1;
@@ -19312,6 +20061,7 @@ relayout:
 	}
 
 	int result = -1, refilter = 0;
+	clFrameBegin();                  /* the first paint; each key's repaint is its own frame below */
 	int last_fired = -1;             /* the row on_move last saw */
 	long sig = -1;                   /* what the list looked like when last drawn */
 	for (;;) {
@@ -19464,12 +20214,16 @@ relayout:
 
 	read_key:
 		if (want_bar) { putchar('\n'); fflush(stdout); clBarShow(&G_AI); }
+		clFrameEnd();
+		clFrameYield();                 /* an outer frame too: the box is on screen before the key */
 		char c;
 		ssize_t got;
 #if HK_ATTACH
 		if (hs_answer_armed && hs_wake[0] >= 0 && hkWaitKeyOrWake()) got = -3; else
 #endif
 		got = read(STDIN_FILENO, &c, 1);
+		clFrameResume();
+		clFrameBegin();
 		if (want_bar) { clBarHide(); fputs("\x1b[A", stdout); fflush(stdout); }   /* back onto the hint row; flushed, the teardown below uses write() */
 		if (got == -3) { result = -3; break; }      /* answered on the phone */
 		if (got < 0 && errno == EINTR && cl_winch) {  /* a resize (iSh: the keyboard) re-lays it out, never closes it */
@@ -19534,6 +20288,7 @@ relayout:
 		for (int i = 0; i < prev_rows + CHROME + 1; i++) { if (write(STDOUT_FILENO, "\x1b[2K\n", 5) < 0) {} }
 		{ char up[16]; int k = snprintf(up, sizeof up, "\x1b[%dA\r", prev_rows + CHROME + 1); if (write(STDOUT_FILENO, up, k) < 0) {} }
 	}
+	clFrameEnd();                    /* the key that closed it, and the box taken off */
 #if HK_ATTACH
 	if (phone_too) { hs_answer_armed = 0; result = hsAttachSettleChoice(result, items, n); }
 #endif
@@ -19715,6 +20470,11 @@ static int clEnumerateSessions(clSessionInfo *out, int max) {
 		if (snprintf(path, sizeof(path), "%s/%s", sdir, e->d_name) >= (int)sizeof(path)) continue;
 		struct stat st;
 		if (stat(path, &st) != 0) continue;
+		char *head = hk_fs_read_head(path, 64 * 1024);   /* only notices (a second hako's own chat it never used): not a chat to list */
+		int real = head && (strstr(head, "\"role\":\"user\"") || strstr(head, "\"role\":\"meta\"") || strstr(head, "\"role\":\"chat\""));
+		if (!real && head && strlen(head) >= 64 * 1024 - 1) real = 1;   /* a long one: look no further */
+		free(head);
+		if (!real) continue;
 		int idx = n;
 		if (n < max) n++;
 		else {
@@ -19800,6 +20560,7 @@ static int clPromptYN(const char *q, int default_yes) {
 	return (buf[0] == 'y' || buf[0] == 'Y');
 }
 
+static int hk_start_own;   /* at start, a live hako was on the folder's recent chat: this one began its own */
 static void clStartupMenu(aiData *data) {
 	if (!isatty(STDIN_FILENO)) return;
 
@@ -19847,7 +20608,7 @@ static void clStartupMenu(aiData *data) {
 	clSessionInfo sess[16];
 	int nsess = clEnumerateSessions(sess, 16);
 
-	if (nsess == 0) return;
+	if (nsess == 0 || hk_start_own) return;       /* another hako is on the recent chat: this one has its own, said above */
 
 	for (;;) {
 		char cont[48];
@@ -21376,8 +22137,11 @@ static long hk_tail_off = -1;                    /* how much of the log this hak
 static char hk_tail_sid[24];
 static char *hk_shared;                          /* what the others said since this model's last turn */
 static char hk_tail_path[PATH_MAX];              /* the log, for the watcher thread */
+static char hk_tail_adir[PATH_MAX + 64];         /* who is on the chat, for the watcher too */
 static pthread_mutex_t hk_tail_lock = PTHREAD_MUTEX_INITIALIZER;
 static int hk_tail_thread;
+#define HK_HOPS_MAX 3                            /* models answering models, before a person has to */
+static int hk_turn_hop;                          /* how many led to this turn: 0 = a person asked */
 
 /* <state>/agents, or <state>/agents/<sid>: beside sessions/, which holds logs only */
 static int hkAgentsDirFor(const char *sid, char *out, size_t cap) {
@@ -21454,17 +22218,23 @@ static int hkAgentsChats(hkAgentChat *out, int max) {
 	return n;
 }
 
-/* At start: the folder's recent chat already has a live hako on it, so this one
-   starts its own and says how to join. Two hakos share a chat only when asked. */
-static void hkAgentsAtStart(aiData *data) {
-	if (E.pipe_mode || E.serve_mode || !E.session_resumed || !E.session_id) return;
+/* At start, before the banner: the folder's recent chat already has a live hako on
+   it, so this one starts its own (the banner then says new, and no session menu asks
+   again). Two hakos share a chat only when asked. 1 = it did; hkAgentsAtStartSay says so. */
+static char hk_start_with[96];
+static int hkAgentsAtStart(aiData *data) {
+	if (E.pipe_mode || E.serve_mode || !E.session_resumed || !E.session_id) return 0;
 	hkAgent a[HK_AGENTS_MAX];
 	int n = hkAgentsList(a, HK_AGENTS_MAX);
-	char who[96];
-	if (!hkAgentsWho(a, n, who, sizeof who, "")) return;
+	if (!hkAgentsWho(a, n, hk_start_with, sizeof hk_start_with, "")) return 0;
 	hkSessionFresh(data);
-	printf("  %s%s %s on this folder's recent chat, so this hako starts its own. :join works with %s.%s\n",
-	       E.color_enabled ? ANSI_DIM : "", who, strchr(who, ',') ? "are" : "is", strchr(who, ',') ? "them" : "it",
+	return 1;
+}
+static void hkAgentsAtStartSay(void) {
+	const char *who = hk_start_with;
+	if (!*who) return;
+	printf("  %s%s %s on this folder's recent chat, so this hako starts its own. :join %s puts it there.%s\n",
+	       E.color_enabled ? ANSI_DIM : "", who, strchr(who, ',') ? "are" : "is", strchr(who, ',') ? "<name>" : who,
 	       E.color_enabled ? ANSI_RESET : "");
 }
 
@@ -21490,29 +22260,14 @@ static size_t hkAgentWord(const char *s, char out[24]) {
 	return i;
 }
 
-/* The model's family is its name (claude, gpt, sho), or the provider's. */
-static void hkAgentBaseName(char *out, size_t cap) {
-	static const char *W[] = { "claude", "gpt", "deepseek", "gemini", "llama", "mistral", "grok", "qwen",
-	                           "kimi", "glm", "gemma", "phi", "sho", "koi", NULL };
-	char m[128];
-	const char *src = E.ai_model ? E.ai_model : "";
-	size_t i = 0;
-	for (; src[i] && i < sizeof m - 1; i++) m[i] = (char)tolower((unsigned char)src[i]);
-	m[i] = '\0';
-	for (int k = 0; W[k]; k++) if (strstr(m, W[k])) { snprintf(out, cap, "%s", W[k]); return; }
-	const char *lab = hkProviderLabel();
-	size_t o = 0;
-	for (const char *p = lab ? lab : ""; *p && o + 1 < cap && o < 16; p++)
-		if (isalnum((unsigned char)*p) || *p == '-') out[o++] = (char)tolower((unsigned char)*p);
-	out[o] = '\0';
-	if (!o || !isalpha((unsigned char)out[0]) || !strcmp(out, "none")) snprintf(out, cap, "hako");
-}
 
-/* Another live hako holds c: the older one keeps a name both took at once. */
+/* Another live hako holds c: the older one keeps a name both took at once, and one
+   joining a chat yields to the hakos already on it. */
+static int hk_agent_yield;
 static int hkAgentTaken(const hkAgent *a, int n, const char *c) {
 	int me = (int)getpid();
 	for (int i = 0; i < n; i++)
-		if (a[i].pid != me && !strcmp(a[i].name, c) && (a[i].pid < me || strcmp(hk_agent_name, c))) return 1;
+		if (a[i].pid != me && !strcmp(a[i].name, c) && (a[i].pid < me || hk_agent_yield || strcmp(hk_agent_name, c))) return 1;
 	return 0;
 }
 
@@ -21558,16 +22313,11 @@ static void hkAgentsBeat(void) {
 
 static void hkAgentsBusy(int busy) {
 	if (E.pipe_mode || E.serve_mode || !hk_tail_thread) return;
+	cl_stream_partial = 0;                        /* a turn cut short left none behind */
 	hk_agent_busy = busy;
 	hkAgentsBeat();
 }
 
-/* A short field of a log row (a role, a name), through the JSON reader: "" when absent. */
-static void hkRowField(const char *row, const char *key, char *out, size_t cap) {
-	char *v = hkExtractJsonString(row, key);
-	snprintf(out, cap, "%s", v && !strchr(v, '\\') ? v : "");
-	free(v);
-}
 
 /* What this model is told with its next turn: the newest, when there is a lot. */
 static size_t hk_shared_len, hk_shared_cap;
@@ -21585,15 +22335,16 @@ static void hkAgentsShare(const char *head, const char *text) {
 }
 static void hkAgentsShareClear(void) { free(hk_shared); hk_shared = NULL; hk_shared_len = hk_shared_cap = 0; }
 
-/* The prompt this model gets for line: what the others said first, if anything. NULL = line as is. */
-static char *hkAgentsPrompt(const char *line) {
-	if (!hk_shared || !*hk_shared) return NULL;
-	size_t n = strlen(hk_shared) + strlen(line) + 200;
-	char *out = malloc(n);
-	if (out) snprintf(out, n, "[Meanwhile on this session, from the other hakos and their models:]\n\n%s[Now, to you (%s):]\n%s",
-	                  hk_shared, hk_agent_name, line);
+/* What the others said that this model has not heard yet, and taken: NULL = nothing. */
+static char *hkAgentsNotes(void) {
+	if ((!hk_shared || !*hk_shared) && !hk_resume_notes) return NULL;
+	char *both = NULL;
+	size_t bl = 0, bc = 0;
+	if (hk_resume_notes) hkSbAdd(&both, &bl, &bc, hk_resume_notes, strlen(hk_resume_notes));
+	if (hk_shared) hkSbAdd(&both, &bl, &bc, hk_shared, strlen(hk_shared));
+	free(hk_resume_notes); hk_resume_notes = NULL;
 	hkAgentsShareClear();
-	return out;
+	return both;
 }
 
 /* One row another hako wrote: a line for this one runs here; the rest is shown and shared. */
@@ -21606,21 +22357,32 @@ static void hkAgentsRow(aiData *data, const char *row, int *said) {
 	int user = !strcmp(role, "user"), ai = !strcmp(role, "assistant"), chat = !strcmp(role, "chat");
 	if (!user && !ai && !chat) return;
 	char *c = hkRowContent(row);
+	if (c && ai) {                                /* its words, not its tool calls: those are its own (a small model took them for a task) */
+		char *w = hkStripToolBlocks(c);
+		free(c);
+		c = w;
+		if (c) hkDropLinesTo(c, hk_agent_name);   /* what it said to this one comes as a line of its own */
+	}
 	if (!c || !*c) { free(c); return; }
 	if (chat) {                                   /* between the people here: shown, never a model's */
 		if (!*said) clOutBegin();
 		*said = 1;
-		aiSayf(data, "chat from %s: %.400s", by, c);
+		char line[480];                               /* shown and sent to a linked device, not logged again: the row is in the log */
+		snprintf(line, sizeof line, "chat from %s: %.400s", by, c);
+		aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
 		free(c);
 		return;
 	}
 	if (user && !strcmp(to, hk_agent_name)) {
 		size_t n = strlen(c) + 48;
 		char *l = malloc(n);
+		const char *hp = strstr(row, "\"hop\":");          /* raw: a quote inside content is escaped */
+		int hop = hp ? atoi(hp + 6) : 0;
+		if (hop < 0 || hop > HK_HOPS_MAX) hop = HK_HOPS_MAX;
 		if (l) {
 			snprintf(l, n, "[from %s] %s", by, c);
 			for (char *q = l; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';    /* one typed line */
-			if (!hkInjectPushKind(l, HK_IN_AGENT)) { if (!*said) clOutBegin(); *said = 1; aiSayf(data, "%s asked something, but 16 lines are already waiting here", by); }
+			if (!hkInjectPushKind(l, HK_IN_AGENT | hop << 4)) { if (!*said) clOutBegin(); *said = 1; aiSayf(data, "%s asked something, but 16 lines are already waiting here", by); }
 		}
 		free(l);
 		free(c);
@@ -21635,24 +22397,32 @@ static void hkAgentsRow(aiData *data, const char *row, int *said) {
 	char shown[420];
 	int lines = 0;
 	size_t o = 0;
-	for (const char *q = c; *q && o + 4 < sizeof shown - 8 && lines < 6; q++) {
+	char *plain = hkPlainShown(c);
+	const char *pv = plain ? plain : c;
+	for (const char *q = pv; *q && o + 4 < sizeof shown - 8 && lines < 6; q++) {
 		if (*q == '\n') lines++;
 		shown[o++] = *q;
 	}
+	int cut = pv[o] != '\0';
+	free(plain);
 	while (o && (shown[o - 1] == '\n' || shown[o - 1] == ' ')) o--;
 	shown[o] = '\0';
 	if (!*said) clOutBegin();
 	*said = 1;
-	aiSayf(data, "%s: %s%s", head, shown, strlen(c) > o ? " \xE2\x80\xA6" : "");
+	char line[520];
+	snprintf(line, sizeof line, "%s: %s%s", head, shown, cut ? " \xE2\x80\xA6" : "");
+	aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
 	free(c);
 }
 
 /* What the others appended since the last look. */
 static void hkAgentsPoll(aiData *data) {
-	char path[PATH_MAX];
+	char path[PATH_MAX], adir[PATH_MAX + 64];
 	hkSessionLogPath(path, sizeof path);
+	if (!hkAgentsDir(adir, sizeof adir)) adir[0] = '\0';
 	pthread_mutex_lock(&hk_tail_lock);
 	snprintf(hk_tail_path, sizeof hk_tail_path, "%s", path);
+	snprintf(hk_tail_adir, sizeof hk_tail_adir, "%s", adir);
 	pthread_mutex_unlock(&hk_tail_lock);
 	if (!path[0]) return;
 	if (strcmp(hk_tail_sid, E.session_id)) {                 /* another chat: its past is not news */
@@ -21693,21 +22463,57 @@ static void hkAgentsPoll(aiData *data) {
 	if (said) clOutEnd(data);
 }
 
-/* Wakes the prompt when the log grows, so a line from another hako shows (or runs) now. */
+/* During this hako's own turn: what the others said shows now, between its own
+   lines. A streamed line still half done waits for its end (the next delta climbs
+   back onto it), where the stream calls this itself; a line for this hako runs once
+   this turn ends. The keyboard thread and the worker both come here, under the tty lock. */
+static void hkAgentsMidTurn(aiData *data) {
+	clTtyLock();                                  /* the worker prints a whole line or nothing */
+	if (!cl_stream_partial) {
+		hk_tail_news = 0;
+		hkAgentsPoll(data);
+	}
+	clTtyUnlock();
+}
+
+/* Wakes the prompt when the log grows, so a line from another hako shows (or runs)
+   now: at the prompt by SIGUSR1, as a line typed; during a turn by SIGUSR2, which
+   the reader takes in place and keeps what is being typed. */
 static void *hkTailThread(void *arg) {
 	(void)arg;
 	hkBlockWinch();
 	long last = -1;
+	uint64_t was_here = 0;
 	for (;;) {
 		cl_sleep_ms(300);
-		char p[PATH_MAX];
+		char p[PATH_MAX], ad[PATH_MAX + 64];
 		pthread_mutex_lock(&hk_tail_lock);
 		snprintf(p, sizeof p, "%s", hk_tail_path);
+		snprintf(ad, sizeof ad, "%s", hk_tail_adir);
 		pthread_mutex_unlock(&hk_tail_lock);
+		/* a hako coming or going wakes the prompt too, so it is said: one that quit takes its
+		   file with it, one killed (its terminal closed) leaves it, so only live ones count */
+		uint64_t here = 0;
+		DIR *d = ad[0] ? opendir(ad) : NULL;
+		for (struct dirent *e; d && (e = readdir(d)); ) {
+			int pid = atoi(e->d_name);
+			if (pid > 0 && kill(pid, 0) != 0 && errno == ESRCH) continue;
+			here += hkDigest(e->d_name, strlen(e->d_name));
+		}
+		if (d) closedir(d);
+		int moved = was_here && here != was_here;
+		was_here = here;
+		if (moved && hk_line_wait && g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
 		struct stat st;
 		if (!p[0] || stat(p, &st) != 0) continue;
-		if (last >= 0 && (long)st.st_size != last && hk_line_wait && g_main_thread_set) pthread_kill(g_main_thread, SIGUSR1);
+		int grew = last >= 0 && (long)st.st_size != last;
 		last = (long)st.st_size;
+		if (!g_main_thread_set) continue;
+		if (grew && hk_line_wait) pthread_kill(g_main_thread, SIGUSR1);
+		else if ((grew || hk_tail_news) && hk_agent_busy && cl_composing) {   /* again while it waits on a half line */
+			hk_tail_news = 1;
+			pthread_kill(g_main_thread, SIGUSR2);
+		}
 	}
 	return NULL;
 }
@@ -21724,6 +22530,46 @@ static void hkAgentsMemWatch(void) {
 	seen = sig;
 }
 
+/* Who came onto this chat, left it, or took another name (a model switch renames a
+   hako), said here: `@sho2` stopped working with no word of why. Shown, not logged.
+   A chat this hako just came to starts the count, quietly. */
+static void hkAgentsComings(aiData *data, const hkAgent *a, int n) {
+	static hkAgent was[HK_AGENTS_MAX];
+	static int was_n = -1;
+	static char was_sid[24];
+	int me = (int)getpid();
+	char line[200];
+	if (was_n >= 0 && E.session_id && !strcmp(was_sid, E.session_id)) {
+		for (int i = 0; i < n; i++) {
+			if (a[i].pid == me) continue;
+			int j = 0;
+			while (j < was_n && was[j].pid != a[i].pid) j++;
+			if (j == was_n) snprintf(line, sizeof line, "%s is on this chat now (%s %s). @%s asks it", a[i].name, a[i].prov, a[i].model, a[i].name);
+			else if (strcmp(was[j].name, a[i].name)) snprintf(line, sizeof line, "%s is %s now (%s %s). @%s asks it", was[j].name, a[i].name, a[i].prov, a[i].model, a[i].name);
+			else continue;
+			aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
+		}
+		for (int j = 0; j < was_n; j++) {
+			int i = 0;
+			while (i < n && a[i].pid != was[j].pid) i++;
+			if (i == n && was[j].pid != me) { snprintf(line, sizeof line, "%s left this chat", was[j].name); aiAddHistoryRole(data, line, HK_ROLE_SYSTEM); }
+		}
+	}
+	memcpy(was, a, sizeof(hkAgent) * (size_t)n);
+	was_n = n;
+	snprintf(was_sid, sizeof was_sid, "%s", E.session_id ? E.session_id : "");
+}
+
+/* Other live hakos in this folder, on this chat or another. */
+static int hkAgentsOthersHere(void) {
+	if (E.pipe_mode || E.serve_mode || !hk_tail_thread) return 0;
+	hkAgent a[HK_AGENTS_MAX];
+	hkAgentChat c[HK_AGENTS_MAX];
+	char who[96];
+	int n = hkAgentsList(a, HK_AGENTS_MAX);
+	return hkAgentsWho(a, n, who, sizeof who, "") + hkAgentsChats(c, HK_AGENTS_MAX);
+}
+
 /* Each time the terminal waits for a line: say this hako is here, and catch up. */
 static void hkAgentsTick(aiData *data) {
 	if (E.pipe_mode || E.serve_mode) return;
@@ -21734,7 +22580,15 @@ static void hkAgentsTick(aiData *data) {
 		atexit(hkAgentsGone);
 	}
 	hk_agent_busy = 0;
+	hk_tail_news = 0;                             /* the poll below reads it all */
 	hkAgentsBeat();
+	hkAgent a[HK_AGENTS_MAX];                     /* who the prompt says is here */
+	int n = hkAgentsList(a, HK_AGENTS_MAX), k = 0;
+	char here[sizeof hk_agents_here] = "";
+	for (int i = 0; i < n; i++)
+		if (a[i].pid != (int)getpid()) hkCatf(here, strlen(here), sizeof here, "%s%s (%s %s)", k++ ? ", " : "", a[i].name, a[i].prov, a[i].model);
+	if (strcmp(here, hk_agents_here)) { snprintf(hk_agents_here, sizeof hk_agents_here, "%s", here); hkPromptInvalidate(); }
+	hkAgentsComings(data, a, n);
 	hkAgentsPoll(data);
 	hkAgentsMemWatch();
 }
@@ -21771,12 +22625,37 @@ static int hkAgentsRoute(aiData *data, char *line, size_t cap) {
 	clPrintRoleLine(HK_ROLE_USER, line);
 	aiPushHistoryStore(data, line, HK_ROLE_USER);
 	if (hs_attached) clPipeEmitMsg("user", line);
-	hkLogMessageTo("user", text, to);
+	hkLogMessageTo("user", text, to, 0);
 	char h[48];
 	snprintf(h, sizeof h, "you asked %s", to);
 	hkAgentsShare(h, text);
 	aiSayf(data, "\xE2\x86\x92 %s", to);
 	return 1;
+}
+
+/* A line of this model's reply that starts with @name, for another live hako, is
+   sent to it (with the lines under it) like a typed @name line, and it answers in
+   its own turn. After HK_HOPS_MAX models in a row it stays here, so two never talk
+   on without a person. */
+static void hkAgentsFromModel(aiData *data, const char *reply) {
+	if (!reply || !*reply || !hk_agents_here[0] || E.pipe_mode || E.serve_mode) return;
+	char *t = hkStripToolBlocks(reply);
+	if (!t) return;
+	hkAgent a[HK_AGENTS_MAX];
+	int n = hkAgentsList(a, HK_AGENTS_MAX), held = 0;
+	char to[24];
+	for (const char *p = t, *s, *b, *e; (s = hkNextAddressed(p, to, &b, &e)); p = e) {
+		b += strspn(b, " \t\r\n");
+		if (b >= e || !strcmp(to, hk_agent_name) || hkAgentLive(to, a, n) < 0) continue;
+		if (hk_turn_hop >= HK_HOPS_MAX) { held++; continue; }
+		char *cut = t + (e - t), keep = *cut;      /* t is this function's copy */
+		*cut = '\0';
+		hkLogMessageTo("user", b, to, hk_turn_hop + 1);
+		*cut = keep;
+		aiSayf(data, "\xE2\x86\x92 %s", to);
+	}
+	if (held) aiSayf(data, "not sent on: the models have answered each other %d times in a row. @name <text> sends it", HK_HOPS_MAX);
+	free(t);
 }
 
 /* @ completes the other live hakos on this session. */
@@ -21845,16 +22724,28 @@ static int hkAgentsCmd(aiData *data, const char *cmd, int cmdlen, const char *ar
 	}
 	if (cmdlen == 3 && !strncmp(cmd, "say", 3)) {
 		if (!arg || !*arg) { aiAddHistory(data, ":say <text>: a line for the people on this chat; no model answers it"); return 1; }
-		hkLogMessageTo("chat", arg, NULL);       /* resume and the models skip a chat row */
+		hkLogMessageTo("chat", arg, NULL, 0);    /* resume and the models skip a chat row */
 		return 1;
 	}
 	if (cmdlen == 4 && !strncmp(cmd, "join", 4)) {
 		hkAgentChat c[16];
 		int n = hkAgentsChats(c, 16), at = -1;
-		const char *want = arg && *arg ? (*arg == '@' ? arg + 1 : arg) : "";
+		clSessionInfo si[32];                         /* the chats' names, as :name set them */
+		int ns = clEnumerateSessions(si, 32);
+		char want[64];                                /* `@gpt`, `"chat A"`, `chat A` all mean it */
+		const char *w0 = arg ? arg : "";
+		while (*w0 == '@' || *w0 == '"' || *w0 == '\'' || *w0 == ' ') w0++;
+		snprintf(want, sizeof want, "%s", w0);
+		for (size_t l = strlen(want); l && (want[l - 1] == '"' || want[l - 1] == '\'' || want[l - 1] == ' '); ) want[--l] = '\0';
+		const char *cname[16];
+		for (int i = 0; i < n; i++) {
+			cname[i] = "";
+			for (int k = 0; k < ns; k++) if (!strcmp(si[k].id, c[i].sid)) cname[i] = si[k].name;
+		}
 		for (int i = 0; i < n && at < 0; i++) {
 			if (!*want) { if (n == 1) at = i; continue; }
-			if (!strcmp(c[i].sid, want)) at = i;
+			if (!strcmp(c[i].sid, want) || (strlen(want) >= 4 && !strncmp(c[i].sid, want, strlen(want)))
+			    || (*cname[i] && !strcasecmp(cname[i], want))) at = i;
 			for (const char *w = c[i].who; *w && at < 0; ) {
 				size_t l = strcspn(w, ",");
 				if (l == strlen(want) && !strncmp(w, want, l)) at = i;
@@ -21862,14 +22753,32 @@ static int hkAgentsCmd(aiData *data, const char *cmd, int cmdlen, const char *ar
 			}
 		}
 		if (at < 0) {
-			if (!n) { aiAddHistory(data, "no other hako is on a chat in this folder"); return 1; }
-			aiAddHistory(data, *want ? "no hako by that name or chat here. the chats with a hako on them:" : "more than one chat has a hako on it. :join <name> picks one:");
-			for (int i = 0; i < n; i++) aiSayf(data, "  %s \xC2\xB7 %s", c[i].sid, c[i].who);
+			if (!n) {
+				hkAgent a[HK_AGENTS_MAX];
+				char here[96];
+				int k = hkAgentsList(a, HK_AGENTS_MAX);
+				if (hkAgentsWho(a, k, here, sizeof here, "")) aiSayf(data, "%s %s on this chat with you already. @name asks one", here, strchr(here, ',') ? "are" : "is");
+				else aiAddHistory(data, "no other hako is on a chat in this folder. start hako in another pane here, then :join from one of them");
+				return 1;
+			}
+			aiAddHistory(data, *want ? "no hako or chat by that name here. :join <hako or chat> with one of these:" : "more than one chat has a hako on it. :join <hako or chat> picks one:");
+			for (int i = 0; i < n; i++) aiSayf(data, "  %s%s%s \xC2\xB7 %s", *cname[i] ? cname[i] : c[i].sid, *cname[i] ? " " : "", *cname[i] ? c[i].sid : "", c[i].who);
 			return 1;
 		}
-		char who[96], r[64];
+		char who[96], r[64], jp[PATH_MAX + 64];
 		snprintf(who, sizeof who, "%s", c[at].who);
+		hkAgent ta[HK_AGENTS_MAX];                    /* its name there first: the chat's rows are read by it */
+		int tn = hkAgentsListFor(c[at].sid, ta, HK_AGENTS_MAX);
+		hk_agent_yield = 1;
+		hkAgentPickName(ta, tn);
+		hk_agent_yield = 0;
 		snprintf(r, sizeof r, ":resume %s", c[at].sid);
+		if (hsSessionPath(c[at].sid, ".jsonl", jp, sizeof jp)) {   /* the chat is shared from here on: its loaders tell the hakos apart */
+			char row[160], w2[96];
+			hkJsonEscapeInto(who, w2, (int)sizeof w2);
+			int rl = snprintf(row, sizeof row, "{\"ts\":%ld,\"role\":\"join\",\"by\":\"%s\",\"with\":\"%s\"}\n", hk_time_unix(), hk_agent_name, w2);
+			if (rl > 0 && rl < (int)sizeof row) hk_fs_write(jp, row, (size_t)rl, 1);
+		}
 		hkHandleSlashCmd(data, r);
 		if (!E.pipe_mode && !E.serve_mode) { hkAgentsBeat(); hkAgentsPoll(data); }
 		aiSayf(data, "joined %s on this chat. this hako is %s here; @%s asks %s", who, hk_agent_name,
@@ -23410,6 +24319,9 @@ static void hkBootMark(const char *phase) {
 }
 
 static void hkRestoreTerm(void) {
+	hkStatus("clear", NULL);         /* a fatal path too: Rex would keep showing "working" */
+	cl_frame_depth = 0;              /* never exit holding the paint or a hidden cursor (no unlock: maybe not ours) */
+	clFrameSeq(0);
 	clBarTeardown();
 	clDisableRaw();
 	fflush(stdout);
@@ -23427,8 +24339,8 @@ static void clTurn(aiData *data, const char *line, int logged, const char *promp
 	free(data->current_prompt);
 	data->current_prompt = strdup(line);
 #if HK_ATTACH
-	char *withshared = hkAgentsPrompt(line);       /* the model hears what the other hakos said */
-	if (withshared) { free(data->current_prompt); data->current_prompt = withshared; }
+	free(data->current_notes);
+	data->current_notes = hkAgentsNotes();         /* the model hears what the other hakos said */
 #endif
 	if (E.ai_provider_type == AI_PROVIDER_NONE) {
 		aiAddHistory(data, "Set ai_provider in ~/.hakorc or /provider <name>");
@@ -23436,16 +24348,24 @@ static void clTurn(aiData *data, const char *line, int logged, const char *promp
 	}
 #if HK_ATTACH
 	hkAgentsBusy(1);
+	free(data->current_response);                /* what this turn says, read below */
+	data->current_response = NULL;
 #endif
 	hkVoiceStop();                               /* a new turn ends the last one's reading */
+	hkStatus("working", NULL);
 	aiWorkerSend(data);
 	clComposeWhileBusy(data, prompt);
 	clWaitWorker(data);
+	hkStatus(E.interrupt ? "idle" : "done", NULL);
 	hkVoiceAfterTurn(data);
 	if (E.interrupt) {
 		E.interrupt = 0;
 		aiAddHistory(data, "(interrupted)");
 	}
+#if HK_ATTACH
+	else hkAgentsFromModel(data, data->current_response);   /* its @name paragraphs go to those hakos */
+	hk_turn_hop = 0;
+#endif
 }
 
 static int clRepl(aiData *data) {
@@ -23460,10 +24380,13 @@ static int clRepl(aiData *data) {
 	hkPrewarmStart(data);    /* spawn the engine and prefill while the splash is up */
 	hkBootMark("prewarm started");
 	clSplash();
+#if HK_ATTACH
+	hk_start_own = hkAgentsAtStart(data);   /* a live hako on the recent chat: this one starts its own, before the banner says which */
+#endif
 	clBanner(data);
 	hkBootMark("banner");
 #if HK_ATTACH
-	hkAgentsAtStart(data);   /* a live hako on the recent chat: this one starts its own */
+	hkAgentsAtStartSay();
 #endif
 	if (!clDetectKoiDefault()) clFirstRunWizard(data);
 	hkBootMark("local-model probe + first-run wizard");
@@ -23501,6 +24424,8 @@ static int clRepl(aiData *data) {
 #if HK_ATTACH
 		hkAgentsTick(data);                  /* here for the other hakos, and what they said */
 		int kind = hkInjectTake(line, sizeof(line));
+		hk_turn_hop = kind >> 4;                 /* a line from another hako's model: how many in a row */
+		kind &= 15;
 		if (kind == HK_IN_REMOTE && !hs_attached) kind = 0;     /* left from a remote that ended */
 		if (kind) {
 			n = (int)strlen(line);
@@ -23837,6 +24762,9 @@ int main(int argc, char **argv) {
 		atexit(hkRestoreTerm);           /* :q, a fatal path, anything: leave the tty sane */
 		printf("\x1b]0;" HK_MARK " hako\x07");
 		fflush(stdout);
+		hk_status_on = isatty(STDOUT_FILENO) && !E.output_json
+		               && hkStatusWanted(getenv("HAKO_STATUS"), getenv("TERM_PROGRAM"), getenv("TERM"));
+		hkStatus("idle", NULL);
 		rc = clRepl(&G_AI);
 		printf("\x1b]0;\x07");
 		fflush(stdout);

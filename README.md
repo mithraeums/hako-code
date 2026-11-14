@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.0-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.0"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.1-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.1"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -110,7 +110,7 @@ being small enough to live anywhere is the whole point.
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`, `delegate` (a subagent with its own context: it reads only unless you are in auto mode, cannot start another, and stops after 10 minutes). Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
 - **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard (a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure), so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
-- **Several models on one chat.** Run hako in two panes, `:join` the second to the first's chat, and each keeps its own model: `@name <text>` asks another (`@` completes the live ones), a line without `@` goes to your own unless `:route <name>` sends it elsewhere, and each model hears what the others said. Memory notes say which one saved them, a hako never writes over a file another changed since it read it, and `:say` is for the people on the chat, not the models.
+- **Several models on one chat.** Run hako in two panes, `:join` the second to the first's chat, and each keeps its own model: `@name <text>` asks another (`@` completes the live ones), a line without `@` goes to your own unless `:route <name>` sends it elsewhere, and each model hears what the others said, as it is said. A model writes to another the same way, with a line that starts with `@name`, and three models in a row hand it back to you. Memory notes say which one saved them, a hako never writes over a file another changed since it read it, and `:say` is for the people on the chat, not the models.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
 - **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON: *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
 - **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
@@ -177,7 +177,7 @@ hako
 > :login anthropic       # OAuth, uses your Claude Pro / Max subscription
 > :login github-models   # free for any GitHub account
 > :login gemini          # paste a free-tier API key
-> :model gemini-2.5-flash
+> :model gemini-3.8-flash
 ```
 
 Or one-shot:
@@ -226,7 +226,7 @@ hako --update           # check + atomic-replace if newer
 :help [cmd]   :q   :update   :remote [on|off|pair]   :mcp [reload]   :memory   :e   :o
 :name <chat>   :color <name|off>   :sessions [clear [all]]   :resume <id>   :session [new]
 :history   :clear   :undo   :edit   :todo [clear]
-:agents   :join [name]   :as <name>   :route <name|off>   :say <text>   @name <text>
+:agents   :join [hako or chat]   :as <name>   :route <name|off>   :say <text>   @name <text>
 :theme [<name>]   :mode ask|auto|plan   :auto   :tools   :toolgate   :toolmode   :trust   :mouse   :editor   :voice [on|off]
 :model [<id>]   :models [refresh]   :provider [<name>]   :pull <model>
 :login [<prov>|api]   :logout [<prov>]   :accounts   :usage
@@ -244,7 +244,8 @@ Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; g
 
 ```
 ~/.hako/state                              provider, model, settings (mode 0600, no secrets)
-~/.hako/credentials                        per-provider api_key / oauth tokens (obfuscated, 0600)
+~/.hako/credentials                        per-provider api_key / oauth tokens, sealed (XChaCha20-Poly1305, 0600)
+~/.hako/credentials.key                    its key where there is no keychain (0600; on a Mac the key is in the login keychain)
 ~/.hako/skills/                            markdown behaviors (flat or dir-dispatcher)
 ~/.hako/input_history                      line editor history (last 500)
 ~/.hako/projects/<encoded-cwd>/state       per-project session id, turn count
@@ -366,14 +367,12 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest: v0.4.0
-- **Several models on one chat.** Start a second hako on a folder and `:join` the first one's chat: each keeps its own model and is named for it, `@name` asks one of them, and each hears what the others said. `:say` is a line for the people only. Memory notes say which hako saved them and reach the others.
-- **One writer at a time.** A hako never writes over a file that changed since it read it, and two never write at once.
-- **Subagents.** A model can hand a self-contained task to a fresh hako (`delegate`), read only unless you are in auto mode.
-- **Remote for many windows.** `:remote on` shares one live chat on its own relay stream, so two hakos on one computer no longer take turns, a phone cannot switch the terminal's chat, and every studio window keeps each session it opened.
-- **No more random sign-outs.** One hako no longer logs another out, for any provider: logins merge under a lock and a running hako picks up a new one at its next turn.
-- **Long chats that hold.** A resumed chat keeps its opening request and a digest of the rest, and folds keep working through long tool turns.
-- Ships with **hako studio v0.2.0** (sessions switch without a reload, the hakos on a session, home-screen fixes on iOS 26).
+### Latest: v0.4.1
+- **Shared chats that hold together.** Another hako's lines show as they are said, even mid-turn. Models talk to each other with `@name` lines, and three in a row hand it back to you. Arrivals and leaves are said, `:join` takes a chat's name, and each line is logged once.
+- **Sealed sign-ins.** `~/.hako/credentials` is encrypted (XChaCha20-Poly1305), its key in the login keychain on a Mac or a 0600 key file elsewhere.
+- **Current models.** ChatGPT sign-in works again (default `gpt-6-luna`), and every provider's default, list, prices and context sizes are up to date.
+- **A smoother screen.** Every redraw is one frame: menus, the spinner and streaming no longer flicker or hop. In Rex the pane shows hako working, waiting on you or done.
+- A question from the model no longer leaves a turn stuck.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 

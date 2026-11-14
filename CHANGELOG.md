@@ -3,7 +3,42 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
-## [Unreleased]
+## [v0.4.1] - 2026-11-13
+
+### added
+- in Rex the pane shows hako working, waiting on you (an approval or a question) or done, from the same terminal report Claude Code sends (OSC 7501). sent only where the terminal is known to read it (`TERM_PROGRAM=rex`, or `TERM=xterm-rex` over ssh), since some terminals print an unknown report as junk; `HAKO_STATUS=1` or `0` forces it
+
+### changed
+- `~/.hako/credentials` is sealed now (XChaCha20-Poly1305) with a random key kept apart from it: in the login keychain on a Mac, through `/usr/bin/security` with the key on its stdin, never in an argument; elsewhere in `~/.hako/credentials.key` (0600). it was obfuscated before, and anyone with the file could read every sign-in. an older file moves over at the next start with its logins. a key that is there but out of reach (a locked keychain) is never taken for no key: nothing is read as empty and nothing is saved over the file, and hako says so once. an older hako that moved the sealed file aside gets its logins merged back. the keychain is used only for the account's own home, so a test or sandbox `HOME` never touches it (`HAKO_KEYSTORE=file` keeps the key in the file anywhere)
+
+### fixed
+- every redraw reaches the screen as one frame (synchronized output, the cursor hidden while it moves): a menu key, a spinner tick and each streamed chunk painted in steps, a bar erased then drawn again and a cursor that hopped up and back, which a terminal with a cursor trail (Rex) drew every time. a terminal without it ignores it. no frame stays open while hako waits for a key
+- a question from the model (ask_user) could hang: its menu and the line field both read the keyboard, and the enter often went to the field. it takes the keyboard the way an approval does
+- signed in with ChatGPT, every turn failed: the default `gpt-5.5` left ChatGPT sign-in on 2026-10-14. the default is `gpt-6-luna`, which every plan has, and `:models` lists the newer ones (`gpt-6.1-sol`) where the plan has them. the ChatGPT list keeps Codex's order, and what Codex's own picker hides (a review model, `gpt-reserve`) is still offered, after the rest, and a model list with spaces around its colons is read (one was only ever shown from the built-in list)
+- the built-in defaults had gone stale with their providers: Claude Haiku 5.5 for Anthropic (Haiku 4.5 before), GPT-6 Luna for OpenAI (gpt-4o-mini, being retired), Gemini 3.8 Flash (2.5 Flash stops 2026-12-01), `openai/gpt-oss-120b` on Groq and `gpt-oss-120b` on Cerebras (their Llama models left the public tiers), `deepseek-flash` (`deepseek-chat` is retired), `grok-4.7` (`grok-2` is gone), `mistral-medium-latest`. the lists `:models` falls back on, the prices `:usage` counts with and the context sizes moved with them (Haiku 5.5, GPT-6, Grok 4 and DeepSeek V4 are 1M)
+- a default a provider retires later no longer falls to whatever its list names first (often its dearest model): hako takes the newest of the same kind from the provider's own list, so a gone `claude-haiku-4-5` becomes the newest Haiku
+- OpenAI's API turned away every request to its reasoning models (gpt-5 on, GPT-6) for `max_tokens`: hako sends `max_completion_tokens` there; other OpenAI-shaped hosts keep `max_tokens`
+- a second hako in a folder said it started its own chat, then asked which session to use, under a banner that said resumed: it starts its own before the banner (which says new), says `:join <name>` puts it on the other's, and asks nothing more
+- `:resume` and `:join` said "resumed" three times: it was logged into the chat it switched to before that chat was read, and shown again from it
+- a hako coming onto the chat, leaving it, or renamed by a model switch went unsaid, so `@sho2` stopped working with no word of why: each is said, as it happens, even at an idle prompt
+- another hako's answers showed their markdown as marks (``* `alpha.txt` ``): they read as words, with dots for bullets; its model still hears them as written
+- with two hakos in a folder, one switching provider or model changed the other's next start (a local-model pane came back as claude): while another hako works in the folder, a switch is this hako's alone and says so, and the folder keeps the provider and model it had
+- `:provider` to one you are not signed in to said nothing until the next turn failed: it says `:login <provider>` then. the turn's error said `/login`; hako's commands start with `:`
+- what another hako on the chat said showed only after this hako's own turn ended, so a long turn hid it for minutes: it shows as it is said, between this one's lines (a streamed line is never split), and what is being typed stays in the field
+- a model could not talk to another hako on the chat: asked to say hello to sho, claude answered "Hello, hako!" to its own person, and sho never ran. each model is told who else is on the chat, and a line of its reply that starts with `@name` is sent to that hako, which answers in its own turn; after three models in a row it stays put, for a person to go on. the one it was for gets it once, as a line, not again in what it is shown
+- a local model answered a question about what another hako said with a greeting, after hako ran `list_dir` on its own: the other hako's tool calls (a `<write_file>`) were passed along as its words, and the check for a task read them as part of the line asked. another hako's tool calls are its own now, and the checks read only the line asked
+- `:join` takes a chat's name (`:join chat a`, quotes or not, any case) as well as a hako's name or the chat's id; once joined, a bare `:join` says who is on the chat instead of "no other hako is on a chat in this folder"
+- every line on a shared chat was logged two or three times: each hako wrote its own copy of what it showed of the other's rows, and a resumed chat or a linked device showed them all. what a hako shows of another's rows is no longer logged again
+- a hako that joined a chat, or restarted on one, took the other model's turns as its own: resume did not look at who wrote a row. on a shared chat (a join row marks it) the other hakos' lines are shown as theirs and reach this model as notes; their tool calls and notices stay theirs. a chat one hako had alone, models switched or not, comes back as before
+- a hako joining a chat took its new name only after it read the chat, so with two of one family (both `claude`) it read the other's turns as its own: it takes its name on the chat first (`claude2`)
+- a refused sign-in refresh said "refresh failed" four times a turn and asked the server again each time: it is said once, with the server's reason (for Claude, ChatGPT and Nous: "sign-in expired (Refresh token expired); run :login anthropic again"), and that token is not tried again until a new sign-in
+- switching from Nous or OpenRouter to Anthropic (or another vendor's own API) kept the router's model id (`anthropic/claude-haiku-5.5`), which that API does not know: a vendor's own provider takes only its own ids, so the switch picks one
+- `~/.hako` is this user's alone (0700): chats and typed history were 0644 under a 0755 folder, so anyone on the machine could read them. hako tightens an existing folder at start
+- a sign-in's PKCE verifier left behind by a login that never finished (it sat in `~/.hako/oauth-pending`) is dropped after 15 minutes instead of being used
+- a `~/.hakorc` that holds `ai_api_key` and that other users can read is said at start, with the `chmod 600` that fixes it; the key is not printed
+- a turn whose sign-in has ended no longer asks the provider again with the dead token: it says `:login <provider>` signs in again, and a server that cannot be reached is not taken for an ended sign-in
+- ChatGPT's usage limit says when it resets: "The usage limit has been reached (resets in 3h 12m)"
+- a second hako's own chat, never used, left a chat of notices behind on every start; the chat list (the start picker, `:resume`, studio) leaves out a chat with nothing but notices
 
 ## [v0.4.0] - 2026-11-11
 

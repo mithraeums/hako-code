@@ -10,6 +10,7 @@ Replies are chosen from the last user message, like fakehakm.py:
                   that should not ride along in every later request)
   "CLAUDEGOESON" -> a tool call, then prose that invents its result (what Haiku
                   did); the request's stop_sequences cut it like the real API
+  "CLAUDEEXPIRED" -> 401 expired token; POST .../oauth/token refuses the refresh
   "CLAUDEFULL" -> 400 "prompt is too long" until the request carries a compaction
                   digest, then a normal answer
   anything else -> a multi-line answer, streamed in 3-character deltas, with a
@@ -51,6 +52,17 @@ class H(BaseHTTPRequestHandler):
         with open(LOG, "ab") as f: f.write(raw + b"\n")
         try: body = json.loads(raw)
         except Exception: body = {}
+        def refuse(code, msg):
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+        if self.path.endswith("/oauth/token"):            # the sign-in server: this refresh token is over
+            with open(LOG + ".refresh", "a") as f: f.write("refresh\n")
+            return refuse(400, b'{"error":"invalid_grant","error_description":"Refresh token expired"}')
+        if "CLAUDEEXPIRED" in json.dumps(body.get("messages", [])):
+            return refuse(401, b'{"type":"error","error":{"type":"authentication_error","message":"OAuth access token has expired."}}')
         if "CLAUDEFULL" in json.dumps(body.get("messages", [])) and "compacted" not in json.dumps(body.get("messages", [])):
             msg = b'{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 210000 tokens > 200000 maximum"}}'
             self.send_response(400)
