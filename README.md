@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.1-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.1"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.2-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.2"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -367,7 +367,9 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest: v0.4.1
+### Latest: v0.4.2
+v0.4.2 brings back the FreeBSD build that v0.4.1 lacked. Everything else is v0.4.1:
+
 - **Shared chats that hold together.** Another hako's lines show as they are said, even mid-turn. Models talk to each other with `@name` lines, and three in a row hand it back to you. Arrivals and leaves are said, `:join` takes a chat's name, and each line is logged once.
 - **Sealed sign-ins.** `~/.hako/credentials` is encrypted (XChaCha20-Poly1305), its key in the login keychain on a Mac or a 0600 key file elsewhere.
 - **Current models.** ChatGPT sign-in works again (default `gpt-6-luna`), and every provider's default, list, prices and context sizes are up to date.
