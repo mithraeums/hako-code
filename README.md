@@ -111,6 +111,7 @@ being small enough to live anywhere is the whole point.
 - **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard (a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure), so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
 - **Several models on one chat.** Run hako in two panes, `:join` the second to the first's chat, and each keeps its own model: `@name <text>` asks another (`@` completes the live ones), a line without `@` goes to your own unless `:route <name>` sends it elsewhere, and each model hears what the others said, as it is said. A model writes to another the same way, with a line that starts with `@name`, and three models in a row hand it back to you. Memory notes say which one saved them, a hako never writes over a file another changed since it read it, and `:say` is for the people on the chat, not the models.
+- **Shows in Rex.** The pane says whether hako is working, waiting on you (an approval or a question) or done, from the same terminal report Claude Code sends (OSC 7501). Sent only where the terminal reads it; `HAKO_STATUS=1` or `0` forces it.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
 - **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON: *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
 - **Asks when it should.** `ask_user` puts a real choice in front of you, rendered through the same arrow-key picker as `:model` and `:theme`. Tool approvals use it too.
@@ -256,6 +257,8 @@ Bare `:provider` / `:model` / `:theme` (no argument) open an arrow-key picker; g
 <cwd>/.hako/HAKO.md                        per-project context (auto-loaded into system prompt)
 ```
 
+`HAKO_KEYSTORE=file` keeps the credentials key in `credentials.key` even on a Mac (`keychain` insists on the keychain).
+
 ### `~/.hakorc`
 
 One file for the whole suite (hako, hake, the studio): the first that exists of `$HAKORC`,
@@ -314,10 +317,10 @@ First run in any directory asks for trust. Untrusted = no tool access at all.
 | Nous Portal API   | `nous-api`                       | paste         | $/tok    | OpenAI-compat     | paste a key from portal.nousresearch.com     |
 | OpenAI            | `openai` · `gpt`                 | paste         | $/tok    | function-calling  |                                              |
 | Gemini            | `gemini` · `google`              | paste         | free/$   | OpenAI-compat     | generous free tier on AI Studio              |
-| Groq              | `groq`                           | paste         | free     | OpenAI-compat     | fastest hosting for Llama family             |
+| Groq              | `groq`                           | paste         | free     | OpenAI-compat     | fast open-weight hosting (gpt-oss, Llama)    |
 | Cerebras          | `cerebras`                       | paste         | free     | OpenAI-compat     | ultra-fast inference                         |
-| DeepSeek          | `deepseek`                       | paste         | $/tok    |  OpenAI-compat    | DeepSeek-Chat / Reasoner                     |
-| Mistral           | `mistral`                        | paste         | $/tok    | OpenAI-compat     | Mistral Large / Small / Codestral            |
+| DeepSeek          | `deepseek`                       | paste         | $/tok    | OpenAI-compat     | DeepSeek's own API                           |
+| Mistral           | `mistral`                        | paste         | $/tok    | OpenAI-compat     | Mistral Medium / Large / Codestral           |
 | Together          | `together`                       | paste         | $/tok    | OpenAI-compat     | aggregator                                   |
 | Fireworks         | `fireworks`                      | paste         | $/tok    | OpenAI-compat     | aggregator                                   |
 | xAI               | `xai` · `grok`                   | paste         | $/tok    | OpenAI-compat     | Grok API at api.x.ai                         |
