@@ -3,6 +3,27 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [v0.4.3] - 2026-11-19
+
+### added
+- steering: a line a device sends while a turn runs (`POST /api/steer`, cap `steer`) goes into that turn after its current tool round, as yours, in the same user message as the tool results so no provider sees two user turns in a row. one the turn never reached becomes the next prompt; a line for another hako (`@name`) goes there
+- the terminal steers too: ctrl-t while a turn runs puts the line into that turn (enter still queues it for after), and what no tool round took runs next
+- `--pipe` (hake's Rei pane): `steer` lines, read at each tool round and while an approval waits; a `stop` is read mid-turn; a prompt sent while an approval waited is kept for after the turn (it was dropped)
+- `:say` reaches a linked page as a `chat` message, from this hako or another on the chat
+- a page on a chat of several hakos can tell them apart: a reply's `message` says which hako gave it (`by`), another hako's line reaches a linked page whole with `by` and `to`, and `/api/state` says how many pages are open (`watching`)
+
+### fixed
+- `:mode` from a device (studio, `:remote`) while a turn runs takes at once; it waited in the queue until the turn ended, so switching to auto meant approving every call it was meant to skip. auto also allows the call waiting
+- a chat could get stuck for good: a small model's tool call with a shell command for its name, or arguments that were not JSON, went back to the provider on every request after it, and the provider refused each one (`Invalid function arguments`). the kept turn is rebuilt from what parsed: a bad name goes back as `unknown_tool`, bad arguments as `{}`
+- a local model's tool call began on screen as text: its first token (`<to`) reached a studio page as reply text, and flickered in the terminal, until the call showed. the start of a tag is held back until it is known
+- a tool call with no id ran twice (the scan also matched `"type":"function"`)
+- a tool's output that is not UTF-8 (a program printing garbage memory) comes back with `?` for those bytes; they went raw into the chat log and the request
+- the tool loop cap notice says how many rounds ran, that `continue` picks it up, and that `HAKO_MAX_ITERS` raises it
+- a small model could overwrite a file with one line, `(wrote 1767 bytes to main.c)`: the stand-in hako keeps for an old write's text, copied back as the new text. write_file and the edit tools refuse that now, nothing is written, and the model is told to send the real text
+- `--pipe` (hake's Rei pane): `:login <provider>` took the pane's next JSON line as the key and printed its prompt raw onto the wire; it asks with an `input_request` now (hidden) and takes the `answer`, or a `prompt` from an older pane
+- studio (embedded in `--serve`): a message typed while a turn runs is queued and sent when it ends, or sent now into the running turn; a turn's tool calls fold into one row; who is on the chat; backgrounds and paper grain
+- studio (embedded in `--serve`): a long chat follows each reply to its end again, and a reconnect opens it at its end
+
 ## [v0.4.2] - 2026-11-13
 
 ### fixed
