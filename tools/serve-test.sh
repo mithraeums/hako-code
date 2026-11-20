@@ -83,7 +83,7 @@ rm -rf "$T/h" "$T/p"; mkdir -p "$T/h/.hako/models/hako-sho" "$T/p" "$T/out"
 echo fake >"$T/h/.hako/models/hako-sho/hako-sho.mlf2"
 printf 'ai_provider=mithraeum\nai_model=hako-sho\nshow_splash=0\nai_auto_approve=1\n' >"$T/h/.hakorc"
 K='Cookie: hako_token=t0ken42'
-HOME="$T/h" HAKO_HAKM="$FAKE" "$BIN" --serve --port $P --token t0ken42 --dir "$T/p" </dev/null >"$T/serve.out" 2>&1 &
+HOME="$T/h" HAKO_HAKM="$FAKE" FAKE_LOG="$T/fake.log" "$BIN" --serve --port $P --token t0ken42 --dir "$T/p" </dev/null >"$T/serve.out" 2>&1 &
 pid=$!; i=0; until curl -s -o /dev/null -H "$K" "$U/api/state" || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done
 curl -s -N -H "$K" "$U/api/events" >"$T/ev" 2>/dev/null &
 cp=$!; sleep 0.3
@@ -108,6 +108,26 @@ post slash ':mode auto' >/dev/null; sleep 0.4
 case $(curl -s -H "$K" "$U/api/state") in *'"yolo":1'*) ok ":mode auto from a device holds";; *) no ":mode auto from a device did nothing";; esac
 post slash ':mode ask' >/dev/null; sleep 0.4
 case $(curl -s -H "$K" "$U/api/state") in *'"yolo":0'*) ok ":mode ask ends it";; *) no ":mode ask left auto on";; esac
+# mid-turn: the queue drains between turns, so :mode auto once waited behind the very approval it was for
+d0=$(dones); post prompt 'TOOL mid' >/dev/null; evn '"type":"tool_request"' 3
+post slash ':mode auto' >/dev/null; evn '"type":"done"' $((d0 + 1))
+[ "$(dones)" -gt "$d0" ] && ok ":mode auto mid-turn allows the waiting call" || no ":mode auto waited for the turn to end"
+grep -q '"type":"tool_decision".*"answer":"y"' "$T/ev" && ok "and the device hears it allowed" || no "no tool_decision for the mode switch"
+post slash ':mode ask' >/dev/null; sleep 0.4
+# steering: said while the tools ran, read by the same turn at its next step, in the tool results' message
+case $(curl -s -H "$K" "$U/api/state") in *'"steer"'*) ok "state offers steer";; *) no "no steer cap";; esac
+d0=$(dones); post prompt 'TOOL steer' >/dev/null; evn '"type":"tool_request"' 4
+post steer 'also STEERED please' >/dev/null; post approve y >/dev/null; evn '"type":"done"' $((d0 + 1))
+grep -q '(sent while you were working) also STEERED please' "$T/fake.log" && ok "a steer reaches the model in the same turn" || no "the model never saw the steer"
+[ "$(dones)" = $((d0 + 1)) ] && ok "and needs no turn of its own" || no "the steer ran as a turn of its own"
+[ "$(grep -c '"role":"user","text":"also STEERED please"' "$T/ev")" = 1 ] && ok "devices see it said once, where it was read" || no "no user message for the steer"
+# :say, a line between the people on the chat: a page draws it as one (it was only in the log)
+post slash ':say hello people' >/dev/null; evn '"role":"chat"' 1
+grep -q '"type":"message","role":"chat","by":"[^"]*","text":"hello people"' "$T/ev" && ok ":say reaches the page as a chat line" || no ":say never reached the page"
+# one no tool round took (the turn stopped): the next prompt, not lost
+d0=$(dones); post prompt 'TOOL left' >/dev/null; evn '"type":"tool_request"' 5
+post steer 'LEFTOVER line' >/dev/null; post stop >/dev/null; evn '"type":"done"' $((d0 + 2))
+[ "$(dones)" -ge $((d0 + 2)) ] && grep -q '^\[user\] LEFTOVER line$' "$T/fake.log" && ok "a steer the turn never read runs next" || no "a steer was lost when the turn stopped"
 st=$(curl -s -H "$K" "$U/api/state")
 case $st in *'"places","'*|*'"find","'*) no "a remote device is offered places or find";;
 	*'"places":[]'*) ok "no places or find offered remotely";; *) no "places listed for a remote device";; esac
@@ -119,6 +139,8 @@ post prompt 'hello' >/dev/null; sleep 1.5
 grep -q '"type":"delta"' "$T/ev" && ok "a headless reply streams as deltas" || no "no deltas from a headless turn"
 d=$(grep -n '"type":"delta"' "$T/ev" | tail -1 | cut -d: -f1); m=$(grep -n '"role":"ai"' "$T/ev" | tail -1 | cut -d: -f1)
 [ -n "$d" ] && [ -n "$m" ] && [ "$d" -lt "$m" ] && ok "and the finished message follows them" || no "a delta arrived after the finished message"
+# 11-19: a local model's tool call starts with "<": the page drew it as reply text until the call showed
+grep '"type":"delta"' "$T/ev" | grep -q '<\|\\u003c' && no "the start of a tool tag reached the page as reply text" || ok "no part of a tool tag reaches the page as reply text"
 kill $cp $pid 2>/dev/null; wait $cp $pid 2>/dev/null
 
 # DESIGN 2026-10-29 §4: the optional state fields, and a rename that reaches the page

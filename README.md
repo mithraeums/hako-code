@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.2-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.2"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.3-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.3"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -104,13 +104,13 @@ being small enough to live anywhere is the whole point.
   shapes they get wrong. (ollama is also supported as a *separate* optional
   provider, `:login ollama`, for non-hako models.)
 - **14 cloud providers when you want them.** Anthropic native (SSE + OAuth via Claude Pro/Max), ChatGPT sign-in (any ChatGPT plan, free included), OpenAI function-calling, GitHub Copilot, GitHub Models (free), OpenRouter (PKCE), Nous Portal (device code), and OpenAI-compat aliases for Gemini, Groq, Cerebras, DeepSeek, Mistral, Together, Fireworks, xAI/Grok, custom. Bare `:login` is a menu: sign-ins first, API keys one level down in `:login api`; `:login <name>` goes straight there.
-- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal (no absolute cursor moves, no scroll region), so a resize or a phone keyboard reflows cleanly. Keep typing while the model works; lines queue and run in order. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager, `ctrl+v` to paste an image (or drop its file in) for any provider that can see one.
+- **An input bar that stays out of the way.** Drawn in the normal flow of the terminal (no absolute cursor moves, no scroll region), so a resize or a phone keyboard reflows cleanly. Keep typing while the model works: enter queues a line for when the turn ends, `ctrl+t` puts it into the turn that is running, read after the step it is on. History, `^R` search, kill-word, bracketed paste, `ctrl+g` to finish the line in `$EDITOR`, `ctrl+o` for the whole transcript in a pager, `ctrl+v` to paste an image (or drop its file in) for any provider that can see one.
 - **Your terminal's colors by default, the suite's themes when you want them.** `theme=terminal` uses the profile's own 16 colors; `:theme <name>` swaps to one of the shared presets or a custom `theme.<name>.<slot>` theme from the rc, and bare `:theme` opens a picker that recolors as you move (enter keeps it, esc puts the old one back, and it fits even a phone-sized window). The pick is written to the rc, so hake and the studio see it too. Truecolor where supported, 256-color fallback otherwise.
 - **HAKO.md project context.** Per-project `<cwd>/.hako/HAKO.md` is auto-loaded into the system prompt, the CLAUDE.md equivalent for hako-code. Binary-safe + size-capped (200KB).
 - **Trust-gated tools.** `read_file`, `list_dir`, `grep`, `glob`, `write_file`, `edit_file` (str_replace), `edit_lines` (line range), `run_shell` (120s, up to 600 per call), `web_fetch`, `read_skill`, `delegate` (a subagent with its own context: it reads only unless you are in auto mode, cannot start another, and stops after 10 minutes). Per-call `[y]/[n]/[a]` approval, and writes show a diff of what they are about to change before you answer. Untrusted dir = all tools refused; `:trust` once per project.
 - **Persistent sessions + [Agent Skills](https://agentskills.io).** Per-cwd session id, 7-day resume, append-only JSONL history. Skills follow the open standard (a folder, a `SKILL.md` with `name` and `description`, loaded by progressive disclosure), so a skill written for any compatible agent works here. Read from `./.hako/skills`, `./.claude/skills`, `./.agents/skills`, `~/.hako/skills`, `~/.claude/skills` and `~/.agents/skills`, nearest first; a skill in two places loads once. Install a whole repository of them with `:skill install owner/repo`.
 - **Drop-in in a repo you already set up.** `AGENTS.md` or `CLAUDE.md` in the working directory is read as project context (after `.hako/HAKO.md`), and skills already sitting in `.claude/skills` are picked up as-is. Nothing to duplicate, nothing to migrate.
-- **Several models on one chat.** Run hako in two panes, `:join` the second to the first's chat, and each keeps its own model: `@name <text>` asks another (`@` completes the live ones), a line without `@` goes to your own unless `:route <name>` sends it elsewhere, and each model hears what the others said, as it is said. A model writes to another the same way, with a line that starts with `@name`, and three models in a row hand it back to you. Memory notes say which one saved them, a hako never writes over a file another changed since it read it, and `:say` is for the people on the chat, not the models.
+- **Several models on one chat.** Run hako in two panes, `:join` the second to the first's chat, and each keeps its own model: `@name <text>` asks another (`@` completes the live ones), a line without `@` goes to your own unless `:route <name>` sends it elsewhere, and each model hears what the others said, as it is said. A model writes to another the same way, with a line that starts with `@name`, and three models in a row hand it back to you. Memory notes say which one saved them, a hako never writes over a file another changed since it read it, and `:say` is for the people on the chat, not the models (a linked studio page shows it as chat, and tells the hakos apart).
 - **Shows in Rex.** The pane says whether hako is working, waiting on you (an approval or a question) or done, from the same terminal report Claude Code sends (OSC 7501). Sent only where the terminal reads it; `HAKO_STATUS=1` or `0` forces it.
 - **Scriptable.** `hako -p "task" --output-format json` prints one JSON object and exits 0 or 1; `-p -` takes the prompt on stdin. Enough for another tool to drive hako as a subprocess.
 - **Measurable.** `hako --bench tools/bench/tools-v1.jsonl` scores tool-call reliability against any provider and prints JSON: *well-formed* (exactly one parseable call) and *correct* (right tool, right argument), including restraint tasks where calling nothing is the right answer. It runs the real parser on a real turn with execution stubbed, so the number is about hako rather than about the benchmark.
@@ -212,6 +212,7 @@ hako --update           # check + atomic-replace if newer
 | `^D` (empty) | EOF / exit |
 | `^G` | finish the line in `$EDITOR` (`editor=` in `~/.hakorc`) |
 | `^O` | the whole transcript, expanded, in a pager (`q` closes) |
+| `^T` | while a turn runs: put the line into it, read after its current step (enter waits for the turn to end) |
 | Shift+Tab | cycle ask → auto → plan |
 | Tab | complete commands, names and paths; with the menu open, take the selected entry |
 | Esc | close the command menu (the line stays); stop a reply being read aloud |
@@ -370,14 +371,14 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest: v0.4.2
-v0.4.2 brings back the FreeBSD build that v0.4.1 lacked. Everything else is v0.4.1:
+### Latest: v0.4.3
 
-- **Shared chats that hold together.** Another hako's lines show as they are said, even mid-turn. Models talk to each other with `@name` lines, and three in a row hand it back to you. Arrivals and leaves are said, `:join` takes a chat's name, and each line is logged once.
-- **Sealed sign-ins.** `~/.hako/credentials` is encrypted (XChaCha20-Poly1305), its key in the login keychain on a Mac or a 0600 key file elsewhere.
-- **Current models.** ChatGPT sign-in works again (default `gpt-6-luna`), and every provider's default, list, prices and context sizes are up to date.
-- **A smoother screen.** Every redraw is one frame: menus, the spinner and streaming no longer flicker or hop. In Rex the pane shows hako working, waiting on you or done.
-- A question from the model no longer leaves a turn stuck.
+- **Talk while it works.** `ctrl+t` puts a line into the running turn, read after the step it is on; enter still waits for the turn to end. Studio's **send now** does the same, and hake's Rei pane has it too.
+- **Mode switches take at once.** `:mode auto` from studio or a phone mid-turn takes right away and answers the tool that is waiting, instead of after every approval it was meant to skip.
+- **Chats that no longer get stuck.** A small model's broken tool call (a shell command for a name, arguments that are not JSON) is rebuilt before it goes back, so the provider stops refusing every later request. A call with no id runs once, and output that is not UTF-8 is mended.
+- **A file can't be flattened to one line.** The write and edit tools refuse a body that is only hako's receipt of an old write.
+- **Shared chats on the page.** Replies say which hako gave them, other hakos' lines reach a linked page, and `:say` shows there as chat.
+- `:login` works from hake's Rei pane, and the embedded studio follows long chats to their end again.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 

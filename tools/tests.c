@@ -270,6 +270,138 @@ static void pipe_tests(void) {
 	ckstr(res, "denied", "a denied write is refused");
 	free(res);
 
+	/* :login in the Rei pane: the pasted key comes over the wire. It asks with an
+	   input_request and takes the answer; a raw fgets took the pane's next JSON
+	   line as the key, and printed its prompt onto the wire */
+	char key[256];
+	const char *answers[][2] = {
+		{"{\"type\":\"answer\",\"answer\":\"sk-FAKE-pipe\"}\n", "the answer is the key, not its JSON line"},
+		{"{\"type\":\"prompt\",\"text\":\"sk-FAKE-older\"}\n", "a pane without input_request sends it as a prompt, and that works too"},
+	};
+	for (int a = 0; a < 2; a++) {
+		w = fopen(inp, "w");
+		fputs(answers[a][0], w);
+		fclose(w);
+		E.pipe_mode = 1;
+		io_redirect(inp, outp);
+		clReadHidden("API key", key, sizeof key);
+		io_restore();
+		E.pipe_mode = 0;
+		emitted = hkReadFileAll(outp, 100000);
+		ckstr(emitted, "{\"type\":\"input_request\",\"prompt\":\"paste API key", "a hidden read over the pipe asks with input_request");
+		ckstr(emitted, "\"hidden\":1", "the ask says the answer is hidden");
+		ck(emitted && emitted[0] == '{' && strchr(emitted, '\n') == emitted + strlen(emitted) - 1,
+		   "the ask is one JSON line, nothing raw on the wire");
+		ck(!strcmp(key, a ? "sk-FAKE-older" : "sk-FAKE-pipe"), answers[a][1]);
+		free(emitted);
+	}
+
+	/* a small model's broken tool calls must not go back to the provider as sent:
+	   solar-mini named a call with a whole shell command, and sent arguments that
+	   were not JSON; each went back on every request after it, nous refused every
+	   one ("Invalid function arguments") and the chat was stuck */
+	aiData fd;
+	memset(&fd, 0, sizeof fd);
+	clInitAI(&fd);
+	int was_auto = E.ai_auto_approve;
+	E.ai_auto_approve = 1;
+	int ran = hkFnToolExecAll(&fd,
+		"{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":["
+		"{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"sh test_tally.sh 2>&1 | tail -30\",\"arguments\":\"{}\"}},"
+		"{\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\": \\\"f.txt\\\", oops}\"}},"
+		"{\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"f.txt\\\"}\"}}"
+		"]}}]}");
+	E.ai_auto_approve = was_auto;
+	ck(ran == 3, "all three calls run, each once (one with no id ran twice)");
+	ck(fd.message_count == 4, "one assistant turn and three tool results are kept");
+	const char *turn = fd.message_count ? fd.messages[0].content : NULL;
+	ckstr(turn, "\"name\":\"unknown_tool\"", "a name that is not a name goes back as unknown_tool");
+	cknot(turn, "test_tally", "and the shell command is not sent back as one");
+	ckstr(turn, "\"id\":\"c2\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}",
+	      "arguments that are not JSON go back as {}");
+	ckstr(turn, "\"arguments\":\"{\\\"path\\\":\\\"f.txt\\\"}\"", "good arguments go back as they came");
+	ckstr(turn, "\"id\":\"call_2\"", "a call with no id gets one");
+	ck(fd.message_count == 4 && strstr(fd.messages[3].content, "\"tool_call_id\":\"call_2\""), "and its result answers that id");
+	ck(fd.message_count == 4 && strstr(fd.messages[2].content, "BETA"), "the call with broken arguments still ran (read what it could)");
+	E.ai_provider_type = AI_PROVIDER_OPENAI;
+	char *wire = aiBuildMessagesJson(&fd);
+	ck(wire && hkJsonSkip(wire, 0) && !*hkJsonSkip(wire, 0), "the request built from them is valid JSON");
+	free(wire);
+	E.ai_provider_type = AI_PROVIDER_NONE;
+	for (int i = 0; i < fd.message_count; i++) { free(fd.messages[i].role); free(fd.messages[i].content); }
+	free(fd.messages); free(fd.system_prompt);
+	pthread_mutex_destroy(&fd.lock);
+	E.ai_auto_approve = 1;
+	char *garb = hkExecTool("run_shell", "{\"cmd\":\"printf 'a\\\\246\\\\216b \\\\303\\\\251'\"}");
+	E.ai_auto_approve = was_auto;
+	ckstr(garb, "a??b \xc3\xa9", "a tool's bytes that are not UTF-8 come back as ?, real UTF-8 kept");
+	free(garb);
+	ck(hkJsonObjectOk("{\"a\":[1,-2.5e3,true,null,{\"b\":\"\\u00e9\\n\"}]}") && !hkJsonObjectOk("{\"a\":1,}")
+	   && !hkJsonObjectOk("{\"a\" 1}") && !hkJsonObjectOk("{} x") && !hkJsonObjectOk("[1]") && !hkJsonObjectOk("{\"a\":01}"),
+	   "the strict JSON check takes JSON and nothing else");
+
+	/* several hakos on one chat: a page tells their replies apart by "by" */
+	{
+		char was[sizeof hk_agent_name];
+		memcpy(was, hk_agent_name, sizeof was);
+		snprintf(hk_agent_name, sizeof hk_agent_name, "sho2");
+		E.pipe_mode = 1;
+		io_redirect("/dev/null", outp);
+		clPipeEmitMsg("ai", "hello");
+		clPipeEmitMsg("user", "hi");
+		io_restore();
+		E.pipe_mode = 0;
+		char *o = hkReadFileAll(outp, 10000);
+		ckstr(o, "{\"type\":\"message\",\"role\":\"ai\",\"by\":\"sho2\",\"text\":\"hello\"}", "a reply names the hako that gave it");
+		ckstr(o, "{\"type\":\"message\",\"role\":\"user\",\"text\":\"hi\"}", "a line typed here does not");
+		free(o);
+		memcpy(hk_agent_name, was, sizeof was);
+#if HK_ATTACH
+		long at = HS.ring_next;
+		hkPeerEmit("ai", "koi", "", "two \"lines\"\nhere");
+		hkPeerEmit("user", "koi", "sho2", "q");
+		ck(HS.ring_next == at + 2 && !strcmp(HS.ring[at % HS_RING], "{\"type\":\"message\",\"role\":\"ai\",\"by\":\"koi\",\"text\":\"two \\\"lines\\\"\\nhere\"}"),
+		   "another hako's reply goes to a linked page as theirs, whole");
+		ck(HS.ring_next == at + 2 && !strcmp(HS.ring[(at + 1) % HS_RING], "{\"type\":\"message\",\"role\":\"user\",\"by\":\"koi\",\"to\":\"sho2\",\"text\":\"q\"}"),
+		   "and a question there says who it was for");
+#endif
+	}
+
+	/* a steer joins the tool results' own user message, so no provider sees two user turns */
+	{
+		aiData sd;
+		memset(&sd, 0, sizeof sd);
+		clInitAI(&sd);
+		int pm = E.pipe_mode; E.pipe_mode = 0;
+		hkSteerOpen();
+		aiPushMessageRaw(&sd, "user", "[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"}]");
+		ck(hkSteerPush("use \"tabs\"") && hkSteerPush("and test it"), "an open turn takes steers");
+		hkSteerInto(&sd);
+		const char *c = sd.messages[0].content;
+		ck(sd.message_count == 1 && c[0] == '[' && hkJsonSkip(c, 0) && !*hkJsonSkip(c, 0),
+		   "anthropic: still one user message, still a JSON array");
+		ckstr(c, ",{\"type\":\"text\",\"text\":\"(sent while you were working) use \\\"tabs\\\"\\n\\nand test it\"}]",
+		      "with the steers as a text block after the results, joined");
+		aiPushMessage(&sd, "user", "<observation>done</observation>");
+		hkSteerPush("PROSE");
+		hkSteerInto(&sd);
+		ck(sd.message_count == 2 && !strcmp(sd.messages[1].content, "<observation>done</observation>\n\n(sent while you were working) PROSE"),
+		   "a prose round's results get it on the end");
+		aiPushMessageBody(&sd, "tool", "\"tool_call_id\":\"c1\",\"content\":\"ok\"");
+		hkSteerPush("OPENAI");
+		hkSteerInto(&sd);
+		ck(sd.message_count == 4 && !strcmp(sd.messages[3].role, "user") && !strcmp(sd.messages[3].content, "(sent while you were working) OPENAI"),
+		   "after a tool message it is a user message of its own");
+		hkSteerInto(&sd);
+		ck(sd.message_count == 4, "nothing waiting adds nothing");
+		free(hkSteerTake(1));
+		ck(!hkSteerPush("late"), "a closed turn refuses one, so it becomes the next prompt");
+		E.pipe_mode = pm;
+		for (int i = 0; i < sd.message_count; i++) { free(sd.messages[i].role); free(sd.messages[i].content); }
+		free(sd.messages); free(sd.system_prompt);
+		pthread_mutex_destroy(&sd.lock);
+	}
+
 	if (chdir("/tmp") == 0) { snprintf(cmd, sizeof(cmd), "rm -rf %s", root); if (system(cmd)) {} }
 }
 
@@ -352,6 +484,11 @@ static void long_msg_free(aiData *d) {
    hanging up at a tool call then waits on a curl that never gets SIGPIPE. `:remote on`
    in the middle of a turn hung that way, for good, behind an idle looking bar. */
 static void stream_pipe_tests(void) {
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+	/* 11-19: a local model's "<to" showed on the page as reply text before its tool call did */
+	ck(hkTagSafe("ok <to", 6) == 3 && hkTagSafe("<", 1) == 0 && hkTagSafe("a<b", 3) == 3 && hkTagSafe("x < 3", 5) == 5
+	   && hkTagSafe("plain", 5) == 5 && hkTagSafe("<observ", 7) == 0, "stream: the start of a tool tag is held back, any other < shows");
+#endif
 	char path[] = "/tmp/hako-stream-XXXXXX";
 	int fd = mkstemp(path);
 	ck(fd >= 0, "stream pipe: a scratch file");
@@ -1073,6 +1210,15 @@ static void guard_tests(void) {
 	r = hkExecTool("read_file", "{\"path\":\"notes.txt\"}"); free(r);
 	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"mine, on what it holds\\n\"}");
 	ckstr(r, "wrote", "read again, the write goes through"); free(r);
+	/* a small model copied the receipt of an earlier write back as the body (2026-11-17) */
+	r = hkExecTool("write_file", "{\"path\":\"notes.txt\",\"content\":\"(wrote 1767 bytes to notes.txt)\\n\"}");
+	ckstr(r, "nothing written", "a write whose body is an old write's receipt is refused"); free(r);
+	r = hkExecTool("edit_file", "{\"path\":\"notes.txt\",\"old\":\"mine, on what it holds\",\"new\":\"(wrote 40 bytes)\"}");
+	ckstr(r, "nothing written", "so is an edit to one"); free(r);
+	now = hkReadFileAll(f, 4096);
+	ck(now && !strcmp(now, "mine, on what it holds\n"), "and the file keeps its text"); free(now);
+	r = hkExecTool("write_file", "{\"path\":\"log.txt\",\"content\":\"(wrote 3 bytes to x) then more\\n\"}");
+	ckstr(r, "wrote", "a body that only starts like one is written"); free(r);
 	r = hkExecTool("write_file", "{\"path\":\"fresh.txt\",\"content\":\"new\\n\"}");
 	ckstr(r, "new file", "a file this hako never read is written as before"); free(r);
 

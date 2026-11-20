@@ -24,7 +24,7 @@
  *   REPL + main
  */
 
-#define HAKO_VERSION "0.4.2"
+#define HAKO_VERSION "0.4.3"
 
 #define HAKO_COPILOT_EDITOR_VER   "vscode/1.95.0"
 #define HAKO_COPILOT_PLUGIN_VER   "copilot-chat/0.22.0"
@@ -2975,6 +2975,8 @@ static int hkHealEndpoint(void);
 static void hkServePush(const char *json);
 static int hkServeAnswer(char *out, size_t cap);
 static int hkServeInput(const char *prompt, int hidden, char *out, size_t cap);
+static void clPipeEscape(const char *src, char *dst, int dsz);
+static void clPipeEmitRaw(const char *json);
 static void hkLogMessage(const char *role, const char *content);
 static void hkLoadHistoryTail(aiData *data, int max_msgs, int ctx_msgs);
 static char *hkResumeDigest(char **lines, int upto, int first);
@@ -3586,7 +3588,9 @@ static char *hkExecTool(const char *name, const char *input_json);
 static void hkSeenSet(const char *full);
 static int hkCloexec(int fd);
 static char *hkExtractContentArray(const char *response);
+#if !defined(_WIN32) && !defined(HAKO_WASM)
 static char *hkExtractRawJsonArray(const char *src, const char *key);
+#endif
 static void  hkMcpInit(void);
 static void  hkMcpShutdown(void);
 static char *hkMcpCallTool(const char *qualified_name, const char *args_json);
@@ -4140,6 +4144,60 @@ static int hkExtractJsonInt(const char *src, const char *key) {
 		return atoi(q);
 	}
 	return -1;
+}
+
+/* Strict JSON, for what goes back to a provider: one value, nothing after it. */
+static const char *hkJsonSkip(const char *p, int depth) {
+	p += strspn(p, " \t\r\n");
+	if (depth > 64) return NULL;
+	if (*p == '"') {
+		for (p++; *p != '"'; p++) {
+			if ((unsigned char)*p < 0x20) return NULL;
+			if (*p == '\\') {
+				p++;
+				if (*p == 'u') { for (int i = 1; i <= 4; i++) if (!isxdigit((unsigned char)p[i])) return NULL; p += 4; }
+				else if (!*p || !strchr("\"\\/bfnrt", *p)) return NULL;
+			}
+		}
+		return p + 1;
+	}
+	if (*p == '{' || *p == '[') {
+		char close = *p == '{' ? '}' : ']';
+		p += 1 + strspn(p + 1, " \t\r\n");
+		if (*p == close) return p + 1;
+		for (;;) {
+			if (close == '}') {
+				if (*p != '"' || !(p = hkJsonSkip(p, depth + 1))) return NULL;
+				p += strspn(p, " \t\r\n");
+				if (*p++ != ':') return NULL;
+			}
+			if (!(p = hkJsonSkip(p, depth + 1))) return NULL;
+			p += strspn(p, " \t\r\n");
+			if (*p == close) return p + 1;
+			if (*p++ != ',') return NULL;
+			p += strspn(p, " \t\r\n");
+		}
+	}
+	static const char *const words[] = {"true", "false", "null"};
+	for (int i = 0; i < 3; i++) if (!strncmp(p, words[i], strlen(words[i]))) return p + strlen(words[i]);
+	const char *q = p;
+	if (*q == '-') q++;
+	if (!isdigit((unsigned char)*q)) return NULL;
+	if (*q == '0') q++; else q += strspn(q, "0123456789");
+	if (*q == '.') { if (!isdigit((unsigned char)q[1])) return NULL; q += 1 + strspn(q + 1, "0123456789"); }
+	if (*q == 'e' || *q == 'E') {
+		q++;
+		if (*q == '+' || *q == '-') q++;
+		if (!isdigit((unsigned char)*q)) return NULL;
+		q += strspn(q, "0123456789");
+	}
+	return q;
+}
+static int hkJsonObjectOk(const char *s) {
+	if (!s) return 0;
+	s += strspn(s, " \t\r\n");
+	if (*s != '{' || !(s = hkJsonSkip(s, 0))) return 0;
+	return !s[strspn(s, " \t\r\n")];
 }
 
 static char *hkExtractJsonObject(const char *src, const char *key) {
@@ -4936,29 +4994,52 @@ static void clOpenUrl(const char *url) {
 #endif
 }
 
-static void clReadHidden(char *buf, size_t cap) {
+/* "paste <what> (input hidden)": on the terminal, or as an input_request on the wire */
+static void clReadHidden(const char *what, char *buf, size_t cap) {
+	char ask[128];
+	snprintf(ask, sizeof ask, "paste %s (input hidden%s): ", what,
+	         hkClipAvailable() ? ", enter alone uses the clipboard" : "");
 	buf[0] = '\0';
 #ifdef HAKO_WASM
-	hkServeInput("paste the value", 1, buf, cap);
+	hkServeInput(ask, 1, buf, cap);
 	return;
 #else
-	if (E.serve_mode) { hkServeInput("paste the code", 1, buf, cap); hkSqueezeSpace(buf); return; }
+	if (E.serve_mode) { hkServeInput(ask, 1, buf, cap); hkSqueezeSpace(buf); return; }
+	if (E.pipe_mode) {
+		/* stdin is the wire: a raw fgets took the pane's next JSON line as the key */
+		char esc[400], req[480], line[4096];
+		clPipeEscape(ask, esc, sizeof esc);
+		snprintf(req, sizeof req, "{\"type\":\"input_request\",\"prompt\":\"%s\",\"hidden\":1}", esc);
+		clPipeEmitRaw(req);
+		if (fgets(line, sizeof line, stdin)) {
+			char *ty = hkExtractJsonString(line, "type");
+			/* answer, or a prompt from a pane that does not know input_request; anything else cancels */
+			char *v = !ty ? NULL : !strcmp(ty, "answer") ? hkExtractJsonString(line, "answer")
+			        : !strcmp(ty, "prompt") ? hkExtractJsonString(line, "text") : NULL;
+			if (v) snprintf(buf, cap, "%s", v);
+			free(ty);
+			free(v);
+		}
+	} else {
+		printf("  %s", ask);
+		fflush(stdout);
 #ifndef _WIN32
-	struct termios old, neu;
-	int isterm = (tcgetattr(STDIN_FILENO, &old) == 0);
-	if (isterm) {
-		neu = old;
-		neu.c_lflag &= ~ECHO;
-		tcsetattr(STDIN_FILENO, TCSANOW, &neu);
-	}
-	clFrameYield();
-	if (!fgets(buf, cap, stdin)) buf[0] = '\0';
-	clFrameResume();
-	if (isterm) tcsetattr(STDIN_FILENO, TCSANOW, &old);
-	printf("\n");
+		struct termios old, neu;
+		int isterm = (tcgetattr(STDIN_FILENO, &old) == 0);
+		if (isterm) {
+			neu = old;
+			neu.c_lflag &= ~ECHO;
+			tcsetattr(STDIN_FILENO, TCSANOW, &neu);
+		}
+		clFrameYield();
+		if (!fgets(buf, cap, stdin)) buf[0] = '\0';
+		clFrameResume();
+		if (isterm) tcsetattr(STDIN_FILENO, TCSANOW, &old);
+		printf("\n");
 #else
-	if (!fgets(buf, cap, stdin)) buf[0] = '\0';
+		if (!fgets(buf, cap, stdin)) buf[0] = '\0';
 #endif
+	}
 	char *nl = strchr(buf, '\n'); if (nl) *nl = '\0';
 #endif
 	hkSqueezeSpace(buf);
@@ -7595,6 +7676,110 @@ static void hkDeltaPush(const char *t) {
 		hkDeltaFlush();
 }
 
+/* Steering: a line a device sends while a turn runs goes into that turn at its next
+   tool round, as the user's (as Claude Code does). A line no round took becomes the
+   next prompt. Pushed on the listener's thread, taken on the turn's; "open" says a
+   turn can still take one, so a line never lands after the turn gave its last. */
+#define HK_STEER_MAX 8
+static char *hk_steer[HK_STEER_MAX];
+static int hk_steer_n = 0, hk_steer_open = 0;
+static pthread_mutex_t hk_steer_lock = PTHREAD_MUTEX_INITIALIZER;
+static void hkSteerOpen(void) {
+	pthread_mutex_lock(&hk_steer_lock);
+	hk_steer_open = 1;
+	pthread_mutex_unlock(&hk_steer_lock);
+}
+static int hkSteerPush(const char *text) {
+	pthread_mutex_lock(&hk_steer_lock);
+	int ok = hk_steer_open && hk_steer_n < HK_STEER_MAX && (hk_steer[hk_steer_n] = strdup(text)) != NULL;
+	if (ok) hk_steer_n++;
+	pthread_mutex_unlock(&hk_steer_lock);
+	return ok;
+}
+/* Every line waiting, joined by blank lines, or NULL; close = the turn takes no more. */
+static char *hkSteerTake(int close) {
+	pthread_mutex_lock(&hk_steer_lock);
+	char *out = NULL;
+	size_t len = 0, cap = 0;
+	for (int i = 0; i < hk_steer_n; i++) {
+		if (len) hkSbAdd(&out, &len, &cap, "\n\n", 2);
+		hkSbAdd(&out, &len, &cap, hk_steer[i], strlen(hk_steer[i]));
+		free(hk_steer[i]);
+		hk_steer[i] = NULL;
+	}
+	hk_steer_n = 0;
+	if (close) hk_steer_open = 0;
+	pthread_mutex_unlock(&hk_steer_lock);
+	return out;
+}
+static void hkSteerClose(void) {
+	pthread_mutex_lock(&hk_steer_lock);
+	hk_steer_open = 0;
+	pthread_mutex_unlock(&hk_steer_lock);
+}
+
+/* --pipe (hake's Rei pane): stdin is the wire, and it is read during a turn too (at
+   an approval, and at each tool round), so a line said mid-turn is not lost. A line
+   that is not for the turn waits here for the next read; the approval loops dropped
+   them (a prompt typed while an approval waited was gone). */
+#define HK_PIPE_STASH 16
+static char *hk_pipe_stash[HK_PIPE_STASH];
+static int hk_pipe_stash_n = 0;
+static void hkPipeStash(const char *line) {
+	if (hk_pipe_stash_n < HK_PIPE_STASH) hk_pipe_stash[hk_pipe_stash_n] = strdup(line);
+	if (hk_pipe_stash_n < HK_PIPE_STASH && hk_pipe_stash[hk_pipe_stash_n]) hk_pipe_stash_n++;
+}
+static void hkPipeStashPrompt(const char *text) {
+	size_t cap = strlen(text) * 6 + 40;
+	char *esc = malloc(cap), *line = esc ? malloc(cap + 40) : NULL;
+	if (line) {
+		clPipeEscape(text, esc, (int)cap);
+		snprintf(line, cap + 40, "{\"type\":\"prompt\",\"text\":\"%s\"}", esc);
+		hkPipeStash(line);
+	}
+	free(esc);
+	free(line);
+}
+static char *hkPipeUnstash(void) {                 /* oldest first, or NULL */
+	if (!hk_pipe_stash_n) return NULL;
+	char *l = hk_pipe_stash[0];
+	memmove(hk_pipe_stash, hk_pipe_stash + 1, sizeof hk_pipe_stash[0] * (size_t)--hk_pipe_stash_n);
+	return l;
+}
+/* A line that came while something waits on the wire: 1 = dealt with (a steer into
+   the turn, a stop, a prompt or command kept for after it); 0 = the caller's. */
+static int hkPipeSide(const char *line) {
+	char *ty = hkExtractJsonString(line, "type");
+	if (!ty) return 0;
+	int took = 1;
+	if (!strcmp(ty, "steer")) {
+		char *t = hkExtractJsonString(line, "text");
+		/* no turn to take it, or a line for another hako: the next prompt */
+		if (t && *t && (t[0] == '@' || !hkSteerPush(t))) hkPipeStashPrompt(t);
+		free(t);
+	} else if (!strcmp(ty, "stop")) hkAbortTurn();
+	else if (!strcmp(ty, "prompt") || !strcmp(ty, "slash")) hkPipeStash(line);
+	else took = 0;
+	free(ty);
+	return took;
+}
+/* What came on the wire since the last read, without waiting (stdin is unbuffered in
+   --pipe, so select sees every line). */
+static void hkPipePoll(void) {
+#if !defined(_WIN32) && !defined(HAKO_WASM)
+	if (!E.pipe_mode || E.serve_mode) return;
+	char line[4096];
+	for (;;) {
+		fd_set r;
+		FD_ZERO(&r);
+		FD_SET(0, &r);
+		struct timeval tv = { 0, 0 };
+		if (select(1, &r, NULL, NULL, &tv) <= 0 || !fgets(line, sizeof line, stdin)) break;
+		if (!hkPipeSide(line)) hkPipeStash(line);       /* an answer to nothing: kept for the next read */
+	}
+#endif
+}
+
 static void clPipeEmitRaw(const char *json) {
 	if (E.serve_mode || hs_attached) {
 		if (hk_delta_n) hkDeltaFlush();          /* streamed text lands before what follows it */
@@ -7616,7 +7801,10 @@ static void clPipeEmitMsg(const char *role, const char *text) {
 	}
 	if (role && (!strcmp(role, "ai") || !strcmp(role, "system"))) hk_turn_spoke = 1;
 	clPipeEscape(text ? text : "", esc, sizeof(esc));
-	snprintf(line, sizeof(line), "{\"type\":\"message\",\"role\":\"%.16s\",\"text\":\"%.4095s\"}", role, esc);
+	/* a reply says which hako gave it, so a page on a chat of several can tell them apart */
+	char by[48] = "";
+	if (role && !strcmp(role, "ai") && hk_agent_name[0]) snprintf(by, sizeof by, ",\"by\":\"%.23s\"", hk_agent_name);
+	snprintf(line, sizeof(line), "{\"type\":\"message\",\"role\":\"%.16s\"%s,\"text\":\"%.4095s\"}", role, by, esc);
 	clPipeEmitRaw(line);
 }
 
@@ -7737,6 +7925,7 @@ static int hkPipeChoice(const char *title, const char **items, int n) {
 	} else {
 		char line[4096];
 		while (fgets(line, sizeof(line), stdin)) {
+			if (hkPipeSide(line)) continue;
 			char *ty = hkExtractJsonString(line, "type");
 			if (!ty) continue;
 			int ok = !strcmp(ty, "choice") || !strcmp(ty, "answer");
@@ -9516,6 +9705,7 @@ static char *hkToolAskUser(const char *input_json) {
 		} else {
 			char line[4096];
 			while (fgets(line, sizeof(line), stdin)) {
+				if (hkPipeSide(line)) continue;
 				char *ty = hkExtractJsonString(line, "type");
 				if (!ty) continue;
 				int is_choice = !strcmp(ty, "choice") || !strcmp(ty, "answer");
@@ -10013,6 +10203,7 @@ static int hkToolApprovalInner(const char *name, const char *input_json) {
 		} else {
 			char pbuf[4096];
 			while (fgets(pbuf, sizeof(pbuf), stdin)) {
+				if (hkPipeSide(pbuf)) continue;
 				char *ty = hkExtractJsonString(pbuf, "type");
 				if (!ty) continue;
 				int is_approve = (strcmp(ty, "approve") == 0);
@@ -10300,9 +10491,21 @@ static char *hkFitToolResult(char *r) {
 	return o;
 }
 
+/* A byte that is not UTF-8 becomes '?', in place: a program printing garbage
+   memory put raw bytes in the chat log and in the JSON sent to the provider. */
+static void hkUtf8Mend(char *s) {
+	for (unsigned char *p = (unsigned char *)s; p && *p; ) {
+		unsigned int cp;
+		int n = clUtf8Next(p, &cp);
+		if (n == 1 && *p >= 0x80) *p = '?';
+		p += n;
+	}
+}
+
 static char *hkExecTool(const char *name, const char *input_json) {
 	hk_cur_tool = name;
 	char *r = hkFitToolResult(hkExecToolInner(name, input_json));
+	hkUtf8Mend(r);
 	hk_cur_tool = NULL;
 	hk_cur_subject[0] = '\0';
 	return r;
@@ -10456,11 +10659,37 @@ static char *hkSeenStale(const char *full) {
 	return m ? m : strdup("error: the file changed since you last read it; read it again");
 }
 
+/* An old write's body reaches the model as "(wrote N bytes to path)" (hkSlimOne).
+   A small model copies that back as the new body and the file becomes the receipt:
+   five files of a real chat went to one line each (2026-11-17). The whole body
+   being a receipt is never a file anyone meant. */
+static int hkIsWriteReceipt(const char *raw) {
+	char *s = raw ? hkJsonUnescape(raw, (int)strlen(raw)) : NULL;
+	if (!s) return 0;
+	const char *p = s + strspn(s, " \t\r\n\"");
+	int yes = 0;
+	if (!strncmp(p, "(wrote ", 7) && isdigit((unsigned char)p[7])) {
+		p += 7 + strspn(p + 7, "0123456789");
+		const char *close = !strncmp(p, " bytes", 6) ? strchr(p, ')') : NULL;
+		yes = close && !close[1 + strspn(close + 1, " \t\r\n\"")];
+	}
+	free(s);
+	return yes;
+}
+
 static char *hkExecToolLocked(const char *name, const char *input_json) {
 	int lk = -1;
 	char dir[PATH_MAX], p[PATH_MAX + 16];
-	if ((!strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "edit_lines"))
-	    && hkProjectStateDir(dir, sizeof dir) && hkFmtFits(p, sizeof p, "%s/write.lock", dir) && hk_fs_mkdirp(dir) == 0)
+	int writes = !strcmp(name, "write_file") || !strcmp(name, "edit_file") || !strcmp(name, "edit_lines");
+	if (writes) {
+		char *body = hkJsonFirst(input_json, "content", "contents", "file_text", "new_str", "new", "new_string",
+		                         "replace", "text", "body", "code", "data", NULL);
+		int bad = hkIsWriteReceipt(body);
+		free(body);
+		if (bad) return strdup("error: nothing written. \"(wrote N bytes ...)\" is hako's note in place of an earlier "
+		                       "write, not file text. Send the file's whole text (read_file it first if you need it)");
+	}
+	if (writes && hkProjectStateDir(dir, sizeof dir) && hkFmtFits(p, sizeof p, "%s/write.lock", dir) && hk_fs_mkdirp(dir) == 0)
 		lk = hkLockTake(p);
 	char *r = hkExecToolRun(name, input_json);
 	hkLockDrop(lk);
@@ -11913,6 +12142,7 @@ static char *hkBuildToolResults(aiData *data, const char *content_array) {
 	return out;
 }
 
+#if !defined(_WIN32) && !defined(HAKO_WASM)   /* MCP only */
 static char *hkExtractRawJsonArray(const char *src, const char *key) {
 	char needle[64];
 	snprintf(needle, sizeof(needle), "\"%s\"", key);
@@ -11947,6 +12177,7 @@ static char *hkExtractRawJsonArray(const char *src, const char *key) {
 	out[n] = '\0';
 	return out;
 }
+#endif
 
 static int hkDupCall(char ***seen, int *n, int *cap, const char *name, const char *args) {
 	if (!name) return 0;
@@ -12970,81 +13201,112 @@ static int hkReactToolExecAll(aiData *data, const char *content,
 }
 
 static int hkFnToolExecAll(aiData *data, const char *response) {
-	char *tool_calls_raw = hkExtractRawJsonArray(response, "tool_calls");
-	if (!tool_calls_raw) return 0;
-
-	pthread_mutex_lock(&data->lock);
-	const char *txt = data->current_response;
-	int has_txt = txt && *txt;
-	size_t tlen = strlen(tool_calls_raw);
-	size_t txtlen = has_txt ? strlen(txt) : 0;
-	size_t bcap = tlen + txtlen * 6 + 128;
-	char *body = malloc(bcap);
-	if (has_txt) {
-		char *esc = malloc(txtlen * 6 + 8);
-		hkJsonEscapeInto(txt, esc, txtlen * 6 + 8);
-		snprintf(body, bcap, "\"content\":\"%s\",\"tool_calls\":%s", esc, tool_calls_raw);
-		free(esc);
-	} else {
-		snprintf(body, bcap, "\"content\":null,\"tool_calls\":%s", tool_calls_raw);
-	}
-	aiPushMessageBody(data, "assistant", body);
-	pthread_mutex_unlock(&data->lock);
-	free(body);
-	free(tool_calls_raw);
-
-	int count = 0;
 	const char *p = strstr(response, "\"tool_calls\":[");
 	if (!p) return 0;
-	char *seen_ids[32] = {0};
-	int n_seen = 0;
-	while ((p = strstr(p, "\"function\""))) {
+
+	/* Parse every call first. The assistant turn kept for the next request is
+	   rebuilt from what parsed, not copied raw: a small model's call with a
+	   shell command for a name, or arguments that are not JSON, went back on
+	   every request after it, the provider refused each one, and the chat was
+	   stuck. A call skipped here is left out too, so no call goes unanswered. */
+	enum { HK_FN_MAX = 32 };
+	char *ids[HK_FN_MAX] = {0}, *names[HK_FN_MAX] = {0}, *args[HK_FN_MAX] = {0};
+	int n = 0;
+	while (n < HK_FN_MAX && (p = strstr(p, "\"function\""))) {
+		/* the key, not the value of "type":"function": a call with no id ran twice */
+		const char *k = p + 10;
+		k += strspn(k, " \t\r\n");
+		if (*k != ':' || k[1 + strspn(k + 1, " \t\r\n")] != '{') { p++; continue; }
 		const char *obj_start = p;
 		while (obj_start > response && *obj_start != '{') obj_start--;
 		char *tc_id = hkExtractJsonString(obj_start, "id");
-		if (tc_id) {
-			int dup = 0;
-			for (int i = 0; i < n_seen; i++) if (!strcmp(seen_ids[i], tc_id)) { dup = 1; break; }
-			if (dup) { free(tc_id); p++; continue; }
-			if (n_seen < 32) seen_ids[n_seen++] = strdup(tc_id);
-		}
-		char *fname = hkExtractJsonString(p, "name");
-		char *args_obj = hkExtractJsonObject(p, "arguments");
-		if (!args_obj) {
+		int dup = 0;
+		for (int i = 0; tc_id && i < n; i++) if (!strcmp(ids[i], tc_id)) dup = 1;
+		char *fname = dup ? NULL : hkExtractJsonString(p, "name");
+		char *args_obj = fname ? hkExtractJsonObject(p, "arguments") : NULL;
+		if (fname && !args_obj) {
 			char *args_str = hkExtractJsonString(p, "arguments");
 			if (args_str) {
 				args_obj = hkJsonUnescape(args_str, (int)strlen(args_str));
 				free(args_str);
 			}
 		}
-		if (!fname || !args_obj) { free(tc_id); free(fname); free(args_obj); p++; continue; }
-		hkAnnounceTool(data, fname, args_obj);
-		char *result = hkExecTool(fname, args_obj);
+		p++;
+		if (!fname || !args_obj) { free(tc_id); free(fname); free(args_obj); continue; }
+		if (!tc_id) { char gen[24]; snprintf(gen, sizeof gen, "call_%d", n); tc_id = strdup(gen); }
+		ids[n] = tc_id; names[n] = fname; args[n] = args_obj;
+		n++;
+	}
+	if (!n) return 0;
+
+	char *calls = NULL;
+	size_t clen = 0, ccap = 0;
+	hkSbAdd(&calls, &clen, &ccap, "[", 1);
+	for (int i = 0; i < n; i++) {
+		size_t nl = strlen(names[i]);
+		int name_ok = nl > 0 && nl <= 64 && strspn(names[i], "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == nl;
+		const char *nm = name_ok ? names[i] : "unknown_tool";
+		const char *ar = hkJsonObjectOk(args[i]) ? args[i] : "{}";
+		size_t ecap = strlen(ar) * 6 + strlen(ids[i]) * 6 + 16;
+		char *eargs = malloc(ecap), *eid = malloc(ecap);
+		if (!eargs || !eid) { free(eargs); free(eid); continue; }
+		hkJsonEscapeInto(ar, eargs, (int)ecap);
+		hkJsonEscapeInto(ids[i], eid, (int)ecap);
+		if (i) hkSbAdd(&calls, &clen, &ccap, ",", 1);
+		hkSbAdd(&calls, &clen, &ccap, "{\"id\":\"", 7);
+		hkSbAdd(&calls, &clen, &ccap, eid, strlen(eid));
+		{ static const char M[] = "\",\"type\":\"function\",\"function\":{\"name\":\""; hkSbAdd(&calls, &clen, &ccap, M, sizeof(M) - 1); }
+		hkSbAdd(&calls, &clen, &ccap, nm, strlen(nm));
+		{ static const char M[] = "\",\"arguments\":\""; hkSbAdd(&calls, &clen, &ccap, M, sizeof(M) - 1); }
+		hkSbAdd(&calls, &clen, &ccap, eargs, strlen(eargs));
+		hkSbAdd(&calls, &clen, &ccap, "\"}}", 3);
+		free(eargs); free(eid);
+	}
+	hkSbAdd(&calls, &clen, &ccap, "]", 1);
+
+	pthread_mutex_lock(&data->lock);
+	const char *txt = data->current_response;
+	int has_txt = txt && *txt;
+	size_t txtlen = has_txt ? strlen(txt) : 0;
+	size_t bcap = clen + txtlen * 6 + 128;
+	char *body = malloc(bcap);
+	if (body && has_txt) {
+		char *esc = malloc(txtlen * 6 + 8);
+		if (esc) hkJsonEscapeInto(txt, esc, (int)(txtlen * 6 + 8));
+		snprintf(body, bcap, "\"content\":\"%s\",\"tool_calls\":%s", esc ? esc : "", calls);
+		free(esc);
+	} else if (body) {
+		snprintf(body, bcap, "\"content\":null,\"tool_calls\":%s", calls);
+	}
+	if (body) aiPushMessageBody(data, "assistant", body);
+	pthread_mutex_unlock(&data->lock);
+	free(body);
+	free(calls);
+
+	for (int i = 0; i < n; i++) {
+		hkAnnounceTool(data, names[i], args[i]);
+		char *result = hkExecTool(names[i], args[i]);
 		hkAnnounceToolResult(data, result);
 
 		const char *r = result ? result : "";
 		size_t rlen = strlen(r);
 		char *resc = malloc(rlen * 6 + 8);
-		hkJsonEscapeInto(r, resc, rlen * 6 + 8);
-		size_t idlen = tc_id ? strlen(tc_id) : 0;
-		size_t reslen = strlen(resc);
-		size_t tcap = idlen + reslen + 96;
-		char *tbody = malloc(tcap);
-		if (tc_id) {
-			snprintf(tbody, tcap, "\"tool_call_id\":\"%s\",\"content\":\"%s\"", tc_id, resc);
-		} else {
-			snprintf(tbody, tcap, "\"content\":\"%s\"", resc);
+		size_t idlen = strlen(ids[i]);
+		char *tbody = resc ? malloc(idlen * 6 + rlen * 6 + 96) : NULL;
+		if (tbody) {
+			char *eid = malloc(idlen * 6 + 8);
+			hkJsonEscapeInto(r, resc, (int)(rlen * 6 + 8));
+			if (eid) hkJsonEscapeInto(ids[i], eid, (int)(idlen * 6 + 8));
+			snprintf(tbody, idlen * 6 + rlen * 6 + 96, "\"tool_call_id\":\"%s\",\"content\":\"%s\"", eid ? eid : "", resc);
+			free(eid);
+			pthread_mutex_lock(&data->lock);
+			aiPushMessageBody(data, "tool", tbody);
+			pthread_mutex_unlock(&data->lock);
 		}
-		pthread_mutex_lock(&data->lock);
-		aiPushMessageBody(data, "tool", tbody);
-		pthread_mutex_unlock(&data->lock);
-		free(tbody); free(resc);
-		free(tc_id); free(fname); free(args_obj); free(result);
-		count++;
-		p++;
+		free(tbody); free(resc); free(result);
 	}
-	for (int i = 0; i < n_seen; i++) free(seen_ids[i]);
-	return count;
+	for (int i = 0; i < n; i++) { free(ids[i]); free(names[i]); free(args[i]); }
+	return n;
 }
 
 static void *clAnimThread(void *arg) {
@@ -13827,6 +14089,19 @@ static int hkHakmEnsure(const char *hakm, const char *weights) {
 	return 0;
 }
 
+/* How much of s may show now: all of it but a tail from its last '<' that could
+   still grow into a tag the stream hides, so no page or screen draws "<to" as text. */
+static size_t hkTagSafe(const char *s, size_t n) {
+	static const char *tags[] = { "<tool", "<write_file", "<invoke", "<observation" };
+	size_t i = n;
+	while (i > 0 && s[i - 1] != '<') i--;
+	if (!i) return n;
+	size_t lt = i - 1, tl = n - lt;
+	for (size_t k = 0; k < sizeof tags / sizeof *tags; k++)
+		if (tl < strlen(tags[k]) && !strncmp(s + lt, tags[k], tl)) return lt;
+	return n;
+}
+
 static char *hkHakmRoundtrip(const char *frame, size_t flen, char **eng) {
 	if (fwrite(frame, 1, flen, g_hakm_w) != flen) return NULL;
 	if (fflush(g_hakm_w) != 0) return NULL;
@@ -13836,6 +14111,9 @@ static char *hkHakmRoundtrip(const char *frame, size_t flen, char **eng) {
 	clStreamLine sline = { {0}, 0, 0, 0, 0 };
 	int streamed = 0, quiet = 0;
 	char seen[256]; size_t seen_n = 0; seen[0] = 0;
+	char hold[1024]; size_t hold_n = 0;   /* text kept back while it may be a tag's start */
+#define HK_HOLD_OUT(txt) do { if (E.pipe_mode) hkDeltaPush(txt); \
+		else { if (!streamed) { streamed = 1; clStopAnim(&G_AI); } clStreamPush(&sline, txt); } } while (0)
 	/* "T" frames are tokens as they are sampled; "R"/"E" ends the reply. */
 	for (;;) {
 		if (E.interrupt) { if (streamed) clStreamEnd(&sline); return NULL; }
@@ -13854,15 +14132,22 @@ static char *hkHakmRoundtrip(const char *frame, size_t flen, char **eng) {
 			else { seen_n = 0; seen[0] = 0; }
 			if (strstr(seen, "<tool") || strstr(seen, "<write_file") || strstr(seen, "<invoke")
 			    || strstr(seen, "<observation")) {   /* a small model repeating a result back */
-				quiet = 1;
+				quiet = 1; hold_n = 0;
 				if (streamed) { clStreamUnecho(&sline); sline.len = 0; clStreamPark(&sline); }
 			}
 		}
 		if (quiet) continue;
-		if (E.pipe_mode) { hkDeltaPush(tok); continue; }
-		if (!streamed) { streamed = 1; clStopAnim(&G_AI); }
-		clStreamPush(&sline, tok);
+		size_t tl = strlen(tok);
+		if (hold_n + tl >= sizeof hold) { hold[hold_n] = 0; if (hold_n) HK_HOLD_OUT(hold); hold_n = 0; }
+		memcpy(hold + hold_n, tok, tl); hold_n += tl; hold[hold_n] = 0;
+		size_t safe = hkTagSafe(hold, hold_n);
+		if (!safe) continue;
+		char keep = hold[safe]; hold[safe] = 0;
+		HK_HOLD_OUT(hold);
+		hold[safe] = keep; memmove(hold, hold + safe, hold_n - safe + 1); hold_n -= safe;
 	}
+	if (!quiet && hold_n) { hold[hold_n] = 0; HK_HOLD_OUT(hold); }   /* a "<" that never became a tag */
+#undef HK_HOLD_OUT
 	if (streamed && quiet) { clStreamUnecho(&sline); sline.len = 0; }
 	if (streamed) clStreamEnd(&sline);
 	if (E.debug) {                     /* the engine's own notes, printed safely */
@@ -14626,8 +14911,49 @@ static void hkSlimOldWrites(aiData *data) {
 }
 
 static int hk_turn_closed;   /* the turn reached its normal ending */
+/* What was said mid-turn, into the turn after its tool results: in the same user
+   message where one ends the list (Anthropic's tool_result array, a prose round's
+   results), so no provider sees two user turns in a row. */
+static void hkSteerInto(aiData *data) {
+	hkPipePoll();
+	char *t = hkSteerTake(0);
+	if (!t) return;
+	size_t sz = strlen(t) + 64;
+	char *said = malloc(sz);
+	if (!said) { free(t); return; }
+	snprintf(said, sz, "(sent while you were working) %s", t);
+	pthread_mutex_lock(&data->lock);
+	aiMessage *last = data->message_count ? &data->messages[data->message_count - 1] : NULL;
+	char *end = last && !strcmp(last->role, "user") && last->raw == 1 ? strrchr(last->content, ']') : NULL;
+	if (end) {
+		size_t ecap = strlen(said) * 6 + 8, head = (size_t)(end - last->content);
+		char *esc = malloc(ecap), *nc = esc ? malloc(head + ecap + 40) : NULL;
+		if (nc) {
+			hkJsonEscapeInto(said, esc, (int)ecap);
+			memcpy(nc, last->content, head);
+			snprintf(nc + head, ecap + 40, ",{\"type\":\"text\",\"text\":\"%s\"}]", esc);
+			free(last->content);
+			last->content = nc;
+		} else aiPushMessage(data, "user", said);
+		free(esc);
+	} else if (last && !strcmp(last->role, "user") && last->raw == 0) {
+		size_t n = strlen(last->content) + strlen(said) + 3;
+		char *nc = malloc(n);
+		if (nc) { snprintf(nc, n, "%s\n\n%s", last->content, said); free(last->content); last->content = nc; }
+	} else aiPushMessage(data, "user", said);
+	pthread_mutex_unlock(&data->lock);
+	clPrintRoleLine(HK_ROLE_USER, t);            /* as clTurn shows a line: the terminal's row, the pipe's message */
+	aiPushHistoryStore(data, t, HK_ROLE_USER);
+	if (hs_attached && !E.pipe_mode) clPipeEmitMsg("user", t);
+	hkLogMessage("user", t);
+	free(said);
+	free(t);
+}
+static void hkSteerRequeue(void);
+
 static void *aiWorkerTurn(void *arg) {
 	hkBlockWinch();
+	hkSteerOpen();
 	hk_turn_spoke = 0;
 	aiData *data = (aiData *)arg;
 
@@ -14716,6 +15042,10 @@ static void *aiWorkerTurn(void *arg) {
 
 	while (iter++ < max_iters) {
 		if (E.interrupt) break;          /* :q or ^C landed mid-turn */
+		if (used_tool) {                     /* said while the tools ran: read before the next step */
+			hkSteerInto(data);
+			if (E.interrupt) break;          /* a stop came with it */
+		}
 		/* Nothing further will change if the model is asking for the same
 		   thing again; spend the remaining iterations on nothing. */
 		if (hk_repeat_count > HK_REPEAT_LIMIT) break;
@@ -15295,10 +15625,13 @@ static void *aiWorkerTurn(void *arg) {
 	pthread_mutex_lock(&data->lock);
 	if (hk_repeat_count > HK_REPEAT_LIMIT)
 		aiAddHistory(data, "(stopped: the same tool call was repeating with no progress)");
-	else if (iter >= max_iters && used_tool) aiAddHistory(data, "(tool loop cap reached)");
+	else if (iter >= max_iters && used_tool) aiSayf(data, "(tool loop cap: %d tool rounds this turn. continue picks it up; HAKO_MAX_ITERS raises it, up to 40)", max_iters);
 	data->last_turn_ms = clWallMs() - data->turn_start_ms;
 	data->streaming = 0;
 	pthread_mutex_unlock(&data->lock);
+	/* a headless --serve has no thread of its own to take what no round read; the
+	   terminal (clTurn) and the pipe (clPipeMode) take it after joining this one */
+	if (E.serve_mode) hkSteerRequeue(); else hkSteerClose();
 	clSayWorkedFor(data, data->last_turn_ms);
 #if !defined(_WIN32) && !defined(HAKO_WASM)
 	/* Wake whoever is composing the next prompt: their read() is blocking and
@@ -16055,10 +16388,8 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 		} else {
 			aiAddHistory(data, "custom provider — set ai_endpoint via /provider or .hakorc");
 		}
-		printf("  paste API key (input hidden%s): ", hkClipAvailable() ? ", enter alone uses the clipboard" : "");
-		fflush(stdout);
 		char key[1024];
-		clReadHidden(key, sizeof(key));
+		clReadHidden("API key", key, sizeof(key));
 		if (!key[0]) { aiAddHistory(data, "(empty key, not saved)"); return 1; }
 		hkUsePastedKey(prov, key);
 		clCredsCaptureCurrent();
@@ -18517,6 +18848,13 @@ static int clReadLineRaw2(const char *prompt, char *out, size_t cap) {
 			clRedrawLine(prompt, buf, len, cur);
 			continue;
 		}
+		if (c == 20 && cl_composing) {           /* ctrl-t mid-turn: this line into the running turn */
+			buf[len] = '\0';
+			snprintf(out, cap, "%s", buf);
+			clLineBreak();
+			clDisableRaw();
+			return -8;
+		}
 		if (c == 7) {                            /* ctrl-g: keep writing in your editor */
 			buf[len] = '\0';
 			free(cl_preset_input);
@@ -19366,10 +19704,8 @@ static int clOAuthAnthropic(aiData *data) {
 	if (hkClipCopy(url)) aiAddHistory(data, "the link is on your clipboard: paste it into a browser");
 	clOpenUrl(url);
 
-	printf("  paste code (input hidden%s): ", hkClipAvailable() ? ", enter alone uses the clipboard" : "");
-	fflush(stdout);
 	char paste[512];
-	clReadHidden(paste, sizeof(paste));
+	clReadHidden("code", paste, sizeof(paste));
 	if (!paste[0]) {
 		/* A front end that cannot prompt mid-command: keep the verifier so the
 		   code can arrive as a command of its own. */
@@ -20727,6 +21063,18 @@ static void clComposeWhileBusy(aiData *data, const char *prompt) {
 			clRedrawReset();
 			continue;
 		}
+		if (qn == -8) {                             /* ctrl-t: into this turn, read after its current step */
+			cl_field_rows = 1;
+			clBarHide();
+			if (!qline[0]) continue;
+			if (qline[0] != '@' && hkSteerPush(qline)) {
+				clOutBegin();
+				aiSayf(data, "it reads that after its current step: %.60s", qline);
+				clOutEnd(data);
+				continue;
+			}
+			qn = (int)strlen(qline);                /* no turn to take it, or for another hako: queued */
+		}
 		if (qn <= 0) continue;
 		cl_field_rows = 1;
 		clBarHide();
@@ -20759,6 +21107,8 @@ static void clComposeWhileBusy(aiData *data, const char *prompt) {
 			char qm[48];
 			snprintf(qm, sizeof(qm), "queued (%d waiting)", hk_queue_n);
 			hkLogMessage("system", qm);
+			static int hinted;
+			if (!hinted++) { clOutBegin(); aiSayf(data, "that runs when this turn ends. ctrl-t instead puts a line into this turn"); clOutEnd(data); }
 			clOutBegin(); clOutEnd(data);         /* redraw the bar: it carries the count */
 		} else {
 			aiSayf(data, "queue is full (%d) \xE2\x80\x94 wait for this turn", HK_QUEUE_MAX);
@@ -21143,14 +21493,24 @@ static int clPipeHandleLine(aiData *data, const char *line) {
 }
 
 static int clPipeMode(aiData *data) {
+	setvbuf(stdin, NULL, _IONBF, 0);       /* so the mid-turn poll (select) sees every line */
 	clPipeBegin(data);
 
 	char line[4096];
-	while (fgets(line, sizeof(line), stdin)) {
+	for (;;) {
+		char *st = hkPipeUnstash();            /* said during the last turn, first */
+		if (st) { snprintf(line, sizeof line, "%s", st); free(st); }
+		else if (!fgets(line, sizeof(line), stdin)) break;
 		int len = (int)strlen(line);
 		while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
 		if (len == 0) continue;
+		char *ty = hkExtractJsonString(line, "type");
+		int steer = ty && !strcmp(ty, "steer");
+		free(ty);
+		if (steer) { hkPipeSide(line); continue; }   /* no turn running: it comes back as a prompt */
 		if (clPipeHandleLine(data, line)) break;
+		char *left = hkSteerTake(1);           /* said after the turn's last tool round: the next prompt */
+		if (left) { hkPipeStashPrompt(left); free(left); }
 	}
 	return 0;
 }
@@ -21158,6 +21518,7 @@ static int clPipeMode(aiData *data) {
 
 #ifdef HAKO_WASM
 static void hkServePush(const char *json) { (void)json; }
+static void hkSteerRequeue(void) { free(hkSteerTake(1)); }
 static int hkServeAnswer(char *out, size_t cap) { (void)out; (void)cap; return -1; }
 static int hkServeInput(const char *prompt, int hidden, char *out, size_t cap) {
 	(void)prompt; (void)hidden; (void)out; (void)cap; return -1;
@@ -21959,14 +22320,14 @@ static void hsServeState(int fd, const char *req) {
 	hsPutEsc(&b, E.ai_model ? E.ai_model : "");
 	hsPut(&b, "\",\"session\":\"");
 	hsPutEsc(&b, E.session_id ? E.session_id : "");
-	hsPutFmt(&b, "\",\"turns\":%d,\"busy\":%d,\"remote\":%d,\"yolo\":%d,\"awaiting_input\":%d,\"awaiting_answer\":%d,\"input_hidden\":%d,\"input_prompt\":\"",
-	         E.session_turn_count, HS.busy || (hs_attached && G_AI.streaming), hs_remote, hkAutoNow(), HS.input_waiting, HS.answer_waiting, HS.input_hidden);
+	hsPutFmt(&b, "\",\"watching\":%d,\"turns\":%d,\"busy\":%d,\"remote\":%d,\"yolo\":%d,\"awaiting_input\":%d,\"awaiting_answer\":%d,\"input_hidden\":%d,\"input_prompt\":\"",
+	         hs_streams, E.session_turn_count, HS.busy || (hs_attached && G_AI.streaming), hs_remote, hkAutoNow(), HS.input_waiting, HS.answer_waiting, HS.input_hidden);
 	hsPutEsc(&b, HS.input_prompt);
 	hsPut(&b, "\",\"caps\":[");
 	static const char *caps[] = {
 		"prompt", "slash", "approve", "input", "stop", "events", "sessions", "history",
 		"dirs", "files", "upload", "models", "providers", "places", "find", "link", "open", "rename", "delete", "mark",
-		"mkdir", "shell", "image", "cmd", NULL
+		"mkdir", "shell", "image", "cmd", "steer", NULL
 	};
 	for (int i = 0, n = 0; caps[i]; i++) {
 		if (hs_remote && (!strcmp(caps[i], "places") || !strcmp(caps[i], "find"))) continue;
@@ -22347,6 +22708,24 @@ static char *hkAgentsNotes(void) {
 	return both;
 }
 
+/* Another hako's line, to a linked page: a message with who said it ("by") and, for a
+   question, who it was for ("to"), so the page draws it as theirs and not this one's. */
+static void hkPeerEmit(const char *role, const char *by, const char *to, const char *text) {
+	size_t cap = strlen(text) * 6 + 160;
+	char *esc = malloc(cap), *line = esc ? malloc(cap + 160) : NULL;
+	if (line) {
+		char be[64], te[64];
+		clPipeEscape(text, esc, (int)cap);
+		clPipeEscape(by, be, sizeof be);
+		clPipeEscape(to, te, sizeof te);
+		snprintf(line, cap + 160, "{\"type\":\"message\",\"role\":\"%s\",\"by\":\"%s\"%s%s%s,\"text\":\"%s\"}",
+		         role, be, to[0] ? ",\"to\":\"" : "", te, to[0] ? "\"" : "", esc);
+		hkServePush(line);
+	}
+	free(esc);
+	free(line);
+}
+
 /* One row another hako wrote: a line for this one runs here; the rest is shown and shared. */
 static void hkAgentsRow(aiData *data, const char *row, int *said) {
 	char role[16], by[24], to[24];
@@ -22370,6 +22749,7 @@ static void hkAgentsRow(aiData *data, const char *row, int *said) {
 		char line[480];                               /* shown and sent to a linked device, not logged again: the row is in the log */
 		snprintf(line, sizeof line, "chat from %s: %.400s", by, c);
 		aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
+		if (hs_attached) hkPeerEmit("chat", by, "", c);  /* a linked page draws it as a line between people */
 		free(c);
 		return;
 	}
@@ -22412,6 +22792,7 @@ static void hkAgentsRow(aiData *data, const char *row, int *said) {
 	char line[520];
 	snprintf(line, sizeof line, "%s: %s%s", head, shown, cut ? " \xE2\x80\xA6" : "");
 	aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
+	if (hs_attached) hkPeerEmit(user ? "user" : "ai", by, to, c);   /* a linked page shows it whole, as theirs */
 	free(c);
 }
 
@@ -22725,6 +23106,7 @@ static int hkAgentsCmd(aiData *data, const char *cmd, int cmdlen, const char *ar
 	if (cmdlen == 3 && !strncmp(cmd, "say", 3)) {
 		if (!arg || !*arg) { aiAddHistory(data, ":say <text>: a line for the people on this chat; no model answers it"); return 1; }
 		hkLogMessageTo("chat", arg, NULL, 0);    /* resume and the models skip a chat row */
+		if (hs_attached || E.serve_mode) hkPeerEmit("chat", hk_agent_name[0] ? hk_agent_name : "you", "", arg);
 		return 1;
 	}
 	if (cmdlen == 4 && !strncmp(cmd, "join", 4)) {
@@ -22873,7 +23255,56 @@ static int hsRouteToTerminal(const char *type, const char *value) {
 }
 #endif
 
+/* A device's answer to the request waiting now: the popup in the terminal or the turn parked here. */
+static int hsApprove(const char *ans) {
+	int took = hsAnswerSet(ans);
+#if HK_ATTACH
+	if (took && hs_attached && hs_answer_armed && write(hs_wake[1], "x", 1) < 0) {}
+#endif
+	if (took && HS.pending_tool_id) {
+		char line[128];
+		snprintf(line, sizeof(line), "{\"type\":\"tool_decision\",\"id\":%ld,\"answer\":\"%c\"}",
+		         HS.pending_tool_id, ans[0]);
+		hkServePush(line);
+		HS.pending_tool_id = 0;
+	} else if (took && HS.pending_choice_id) {
+		char line[96];
+		snprintf(line, sizeof(line), "{\"type\":\"choice_decision\",\"id\":%ld}", HS.pending_choice_id);
+		hkServePush(line);
+		HS.pending_choice_id = 0;
+	}
+	return took;
+}
+
+/* :mode from a device while a turn runs: the queue only drains between turns, so
+   switching to auto waited behind every approval it was meant to skip (11-18).
+   Set it now; auto also allows the call waiting. Returns 1 when it took the line. */
+static int hsModeNow(const char *value) {
+	if (!value || !(HS.busy || G_AI.streaming)) return 0;
+	while (*value == ':' || *value == '/') value++;
+	if (strncmp(value, "mode ", 5)) return 0;
+	const char *a = value + 5;
+	while (*a == ' ') a++;
+	int plan = !strcmp(a, "plan"), autom = !strcmp(a, "auto");
+	if (!plan && !autom && strcmp(a, "ask")) return 0;
+	hkSetMode(plan, autom);
+	clPipeEmitMsg("system", plan ? "mode: plan (no changes)" : !autom ? "mode: ask (prompts first)"
+	              : hs_remote ? "mode: auto (runs tools) until remote turns off" : "mode: auto (runs tools)");
+	clPipeEmitState();
+	if (autom && HS.pending_tool_id) hsApprove("y");
+	return 1;
+}
+
+static void hsEnqueueCmd(const char *type, const char *field, const char *value);
+/* A line no tool round took: the next prompt, as if it came after the turn. */
+static void hkSteerRequeue(void) {
+	char *t = hkSteerTake(1);
+	if (t) hsEnqueueCmd("prompt", "text", t);
+	free(t);
+}
+
 static void hsEnqueueCmd(const char *type, const char *field, const char *value) {
+	if ((!strcmp(type, "slash") || !strcmp(type, "quiet")) && hsModeNow(value)) return;
 #if HK_ATTACH
 	if (hsRouteToTerminal(type, value)) return;
 #endif
@@ -23096,6 +23527,13 @@ static void *hsConnThread(void *arg) {
 		if (body && *body) hsEnqueueCmd(slash ? "slash" : "prompt", slash ? "cmd" : "text", body);
 		free(body);
 		hsSendOk(fd, 1);
+	} else if (!strncmp(req, "POST /api/steer", 15)) {   /* said mid-turn: the turn reads it at its next tool round */
+		char *body = hsReadBody(fd, req, used);
+		int ok = body && *body;
+		/* no turn to take it, or a line for another hako: the next prompt */
+		if (ok && (body[0] == '@' || !hkSteerPush(body))) hsEnqueueCmd("prompt", "text", body);
+		free(body);
+		hsSendOk(fd, ok);
 	} else if (!strncmp(req, "POST /api/cmd", 13)) {   /* a menu's command: runs, emits state, says nothing */
 		char *body = hsReadBody(fd, req, used);
 		if (body && *body) hsEnqueueCmd(hs_attached ? "slash" : "quiet", "cmd", body);
@@ -23108,22 +23546,7 @@ static void *hsConnThread(void *arg) {
 		hsSendOk(fd, 1);
 	} else if (!strncmp(req, "POST /api/approve", 17)) {
 		char *body = hsReadBody(fd, req, used);
-		int took = hsAnswerSet(body && *body ? body : "n");
-#if HK_ATTACH
-		if (took && hs_attached && hs_answer_armed && write(hs_wake[1], "x", 1) < 0) {}
-#endif
-		if (took && HS.pending_tool_id) {
-			char line[128];
-			snprintf(line, sizeof(line), "{\"type\":\"tool_decision\",\"id\":%ld,\"answer\":\"%c\"}",
-			         HS.pending_tool_id, body && *body ? body[0] : 'n');
-			hkServePush(line);
-			HS.pending_tool_id = 0;
-		} else if (took && HS.pending_choice_id) {
-			char line[96];
-			snprintf(line, sizeof(line), "{\"type\":\"choice_decision\",\"id\":%ld}", HS.pending_choice_id);
-			hkServePush(line);
-			HS.pending_choice_id = 0;
-		}
+		int took = hsApprove(body && *body ? body : "n");
 		free(body);
 		hsSendOk(fd, took);
 	} else if (!strncmp(req, "POST /api/image", 15)) {   /* a pasted or picked image: its "[image #N]" back */
@@ -24356,6 +24779,11 @@ static void clTurn(aiData *data, const char *line, int logged, const char *promp
 	aiWorkerSend(data);
 	clComposeWhileBusy(data, prompt);
 	clWaitWorker(data);
+	{                                            /* said into the turn after its last tool round: runs next */
+		char *left = hkSteerTake(1);
+		if (left && hk_queue_n < HK_QUEUE_MAX) hk_queue[hk_queue_n++] = left;
+		else free(left);
+	}
 	hkStatus(E.interrupt ? "idle" : "done", NULL);
 	hkVoiceAfterTurn(data);
 	if (E.interrupt) {

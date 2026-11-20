@@ -135,6 +135,8 @@ r.wait_for("What next?", 30); r.pump(0.5)
 inflow(r, "prose")
 mid = [s for s in idle if any("hello" in l for l in s)]
 check(mid and all(any(l.startswith("> ") for l in s) for s in mid), f"bar up in every idle frame mid-stream ({len(mid)} frames)")
+for s in [s for s in mid if not any(l.startswith("> ") for l in s)][:1]:   # rare under load: show the frame
+    [print("       | " + l.rstrip()[:100]) for l in s if l.strip()]
 check(any("· alpha.txt" in l for l in r.lines()), "bullets rendered")
 check(any("abc" in l for l in r.field_rows()), "type-ahead restored in the field")
 # ---- 2. tool turn: call line, result, no leak
@@ -490,6 +492,22 @@ saw = any(any("1 queued" in l for l in s) for s in r.snaps[-20:])
 check(saw, "and is still there while the first answer streams")
 r.pump(5)
 check(not any("queued" in l for l in r.lines()), "and goes once it has run", r)
+r.close()
+del os.environ["HAKO_FAKE_DELAY"]
+
+# ---- 3m4. ctrl+t during a turn: the line goes into that turn, read after its tool
+# round (enter still queues it for after the turn)
+os.environ["HAKO_FAKE_DELAY"] = "2"
+r = start()
+r.send("TOOL list it\r"); r.pump(0.6)
+r.send("STEERED tty\x14"); r.pump(0.4)
+check(any("reads that after its current step" in l for l in r.all_lines()), "ctrl+t mid-turn says the turn will read it", r)
+end = time.time() + 15
+while time.time() < end and "(sent while you were working) STEERED tty" not in (open(FAKE_LOG).read() if os.path.exists(FAKE_LOG) else ""):
+    r.pump(0.3)
+check("(sent while you were working) STEERED tty" in open(FAKE_LOG).read(), "and the model gets it in the same turn, after the tool")
+r.wait_for("Done.", 15); settle(r)
+check(not any("queued" in l for l in r.lines()), "nothing is left queued for after it", r)
 r.close()
 del os.environ["HAKO_FAKE_DELAY"]
 
@@ -1066,6 +1084,7 @@ quiet()
 rows = "".join(open(p).read() for p in logs)
 hops = [l for l in rows.splitlines() if "PINGPONG from" in l and '"role":"user"' in l]
 check(len(hops) == 3 and '"hop":3' in hops[-1] and not any('"hop":4' in l for l in hops), "three lines, hop 1 to 3 (%d)" % len(hops))
+if len(hops) != 3: [print("       " + h[:160]) for h in hops]
 r1.send("TOOL now\r"); both_wait(r2, "sho: Done. The directory", 20); quiet()
 check(not any("<tool_call" in l for l in r2.all_lines()), "another hako's tool calls are not shown or shared as its words", r2)
 r2.send(":provider anthropic\r"); r2.pump(1.0)
