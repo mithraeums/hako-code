@@ -66,6 +66,10 @@ class Run:
         self.pid, self.fd = pid, fd
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
     def pump(self, secs, idle_cb=None, idle=0.02):
+        """idle_cb gets the screen when output pauses, as a person would see it: hako paints
+        each redraw inside a synchronized-output frame (CSI ?2026h ... ?2026l) that a terminal
+        shows only whole, and pyte does not. A pause inside one (a frame split across reads
+        under load) is a half-painted state no terminal shows, so it is not an idle frame."""
         end = time.time() + secs; last = time.time(); busy = False
         while time.time() < end:
             r, _, _ = select.select([self.fd], [], [], 0.01)
@@ -74,9 +78,12 @@ class Run:
                 except OSError: return False
                 if not data: return False
                 self.raw += data; self.stream.feed(data); self.snaps.append(list(self.screen.display))
+                self.in_frame = self.raw.rfind(b"\x1b[?2026h") > self.raw.rfind(b"\x1b[?2026l")   # a marker split across reads counts once it is whole
                 last = time.time(); busy = True
             elif busy and idle_cb and time.time() - last >= idle:
-                idle_cb(list(self.screen.display)); busy = False
+                if getattr(self, "in_frame", False): self.mid_frame = getattr(self, "mid_frame", 0) + 1
+                else: idle_cb(list(self.screen.display))
+                busy = False
         return True
     def wait_for(self, text, secs=20):
         end = time.time() + secs
@@ -134,7 +141,7 @@ r.pump(8, idle_cb=idle.append)
 r.wait_for("What next?", 30); r.pump(0.5)
 inflow(r, "prose")
 mid = [s for s in idle if any("hello" in l for l in s)]
-check(mid and all(any(l.startswith("> ") for l in s) for s in mid), f"bar up in every idle frame mid-stream ({len(mid)} frames)")
+check(mid and all(any(l.startswith("> ") for l in s) for s in mid), f"bar up in every idle frame mid-stream ({len(mid)} frames, {getattr(r, 'mid_frame', 0)} pauses inside a frame not counted)")
 for s in [s for s in mid if not any(l.startswith("> ") for l in s)][:1]:   # rare under load: show the frame
     [print("       | " + l.rstrip()[:100]) for l in s if l.strip()]
 check(any("· alpha.txt" in l for l in r.lines()), "bullets rendered")
@@ -201,15 +208,16 @@ for _ in range(30):
     if not r.pump(0.1): alive = False; break
 check(not alive, "esc at the startup menu quits")
 # ---- 5. :q while the engine hangs
-open(os.path.join(HERE, "_hang.py"), "w").write("#!/usr/bin/env python3\nimport sys,time\ni=sys.stdin.buffer\nh=i.readline()\n"
+open(os.path.join(WORK, "_hang.py"), "w").write("#!/usr/bin/env python3\nimport sys,time\ni=sys.stdin.buffer\nh=i.readline()\n"
     "for _ in range(int(h.split()[0])):\n i.readline(); n=int(i.readline()); i.read(n)\ntime.sleep(600)\n")
-os.chmod(os.path.join(HERE, "_hang.py"), 0o755)
-r = start(engine="_hang.py"); r.send("hello\r"); time.sleep(1.5); t0 = time.time(); r.send(":q\r")
+os.chmod(os.path.join(WORK, "_hang.py"), 0o755)
+# in this run's own dir: parallel runs shared one in the repo and removed it under each other
+r = start(engine=os.path.join(WORK, "_hang.py")); r.send("hello\r"); time.sleep(1.5); t0 = time.time(); r.send(":q\r")
 alive = True
 for _ in range(50):
     if not r.pump(0.1): alive = False; break
 check(not alive, f":q during a stuck turn exits ({time.time()-t0:.1f}s)")
-os.remove(os.path.join(HERE, "_hang.py"))
+os.remove(os.path.join(WORK, "_hang.py"))
 # ---- 3c. keys during a tool turn must reach hako, not the terminal.
 # Approval used to seize stdin on EVERY tool call, even in auto mode, dropping
 # the reader to cooked mode while it waited for the handshake — keystrokes were
@@ -818,6 +826,30 @@ r.send(":theme\r"); r.wait_for("Theme", 10); r.pump(0.5)
 check(sum('"type":"choice_request"' in e for e in ev) > n0, "a menu opened at the desk shows on the device too")
 r.send("\x1b"); r.pump(0.8)
 check(any('"type":"choice_decision"' in e for e in ev), "closing it at the desk settles the device's box")
+# 11-19 on the phone: a key login sent from the device asked for the key on THIS keyboard,
+# so the device never got a box and the login sat there
+n0 = sum('"type":"input_request"' in e for e in ev)
+http("/api/slash", ":login custom")
+for _ in range(50):
+    if sum('"type":"input_request"' in e for e in ev) > n0: break
+    r.pump(0.1)
+_ir = [e for e in ev if '"type":"input_request"' in e][n0:]
+check(_ir and '"hidden":1' in _ir[0] and "clipboard" not in _ir[0], "a key login from the device asks the device, hidden, and never offers this computer's clipboard")
+check(not any("paste API key" in l for l in r.lines()), "and the terminal is not the one asked", r)
+http("/api/input", "sk-FAKE-from-the-phone"); r.pump(1.5)
+check(any("key saved" in l for l in r.all_lines()), "the device's answer is the key that is saved", r)
+check(not any("sk-FAKE-from-the-phone" in l for l in r.all_lines()) and not any("sk-FAKE-from-the-phone" in e for e in ev),
+      "and the key shows nowhere, on the screen or the wire", r)
+# 11-21: openrouter's browser sign-in returns to 127.0.0.1 on this computer, which a phone cannot reach:
+# from the device it goes straight to a pasted key, and nothing opens or waits here
+n0 = sum('"type":"input_request"' in e for e in ev)
+http("/api/slash", ":login openrouter")
+for _ in range(40):
+    if sum('"type":"input_request"' in e for e in ev) > n0: break
+    r.pump(0.1)
+check(sum('"type":"input_request"' in e for e in ev) > n0 and any("finishes on this computer" in e for e in ev),
+      "openrouter from the device asks for a key at once, and says why", r)
+http("/api/input", ""); r.pump(0.8)
 r.send(":remote off\r"); r.wait_for("remote: off", 10); r.pump(0.5)
 check(http("/api/state").startswith("ERR"), ":remote off closes the port")
 check(not any("remote" in l and "▶▶" in l for l in r.lines()), "and the bar drops it", r)
