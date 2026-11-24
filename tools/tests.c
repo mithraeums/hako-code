@@ -480,6 +480,65 @@ static void long_msg_free(aiData *d) {
 	pthread_mutex_destroy(&d->lock);
 }
 
+/* 11-23: the plan's usage, read from what each reply's headers say (Claude's ring). */
+static void limits_tests(void) {
+	char *pw = E.ai_oauth_provider; E.ai_oauth_provider = "anthropic";
+	hk_lim_who[0] = '\0';
+	long now = hk_time_unix();
+	char h[1024];
+	snprintf(h, sizeof h, "HTTP/2 200\r\nanthropic-ratelimit-unified-status: allowed\r\n"
+	         "anthropic-ratelimit-unified-5h-utilization: 0.31\r\nanthropic-ratelimit-unified-5h-reset: %ld\r\n"
+	         "Anthropic-RateLimit-Unified-7d-Utilization: 0.05\r\nanthropic-ratelimit-unified-7d-reset: %ld\r\n"
+	         "content-type: text/event-stream\r\n\r\n", now + 7200, now + 400000);
+	hkLimitsFromHeaders(h);
+	int m = hkLimMain();
+	ck(hk_lim_n == 2 && m >= 0 && !strcmp(hk_lim[m].name, "5h") && hk_lim[m].pct == 31 && hk_lim[m].reset == now + 7200,
+	   "limits: a Claude plan's week at 5% leads with the 5 hours");
+	snprintf(h, sizeof h, "anthropic-ratelimit-unified-5h-utilization: 0.12\r\nanthropic-ratelimit-unified-7d-utilization: 0.93\r\n");
+	hkLimitsFromHeaders(h);
+	m = hkLimMain();
+	ck(hk_lim_n == 2 && m >= 0 && !strcmp(hk_lim[m].name, "week") && hkLimPct(m) == 93, "limits: a week nearly gone leads instead");
+	hk_lim_dirty = 0;
+	hkLimitsFromHeaders("anthropic-ratelimit-unified-5h-utilization: 0.12\r\n");
+	ck(!hk_lim_dirty, "limits: the same numbers again tell the front ends nothing new");
+	char *j = NULL; size_t jl = 0, jc = 0;
+	hkLimitsJson(&j, &jl, &jc);
+	ck(j && strstr(j, "\"limits\":{\"main\":1,") && strstr(j, "{\"name\":\"week\",\"pct\":93,"), "limits: the state carries the headline and every window");
+	free(j);
+	E.ai_oauth_provider = "chatgpt";
+	hkLimitsFromHeaders("x-codex-primary-used-percent: 40\r\nx-codex-primary-window-minutes: 300\r\n"
+	                    "x-codex-primary-reset-after-seconds: 600\r\nx-codex-secondary-used-percent: 12.6\r\n"
+	                    "x-codex-secondary-window-minutes: 10080\r\n");
+	m = hkLimMain();
+	ck(hk_lim_n == 2 && !strcmp(hk_lim[0].name, "5h") && !strcmp(hk_lim[1].name, "week") && hk_lim[1].pct == 13
+	   && m == 0 && hk_lim[0].reset >= now + 600, "limits: ChatGPT's two windows, named by their length, another sign-in's numbers gone");
+	E.ai_oauth_provider = NULL;
+	hkLimitsFromHeaders("x-ratelimit-limit-requests: 500\r\nx-ratelimit-remaining-requests: 499\r\nx-ratelimit-reset-requests: 120ms\r\n"
+	                    "x-ratelimit-limit-tokens: 30000\r\nx-ratelimit-remaining-tokens: 15000\r\nx-ratelimit-reset-tokens: 6m0s\r\n"
+	                    "anthropic-ratelimit-input-tokens-limit: 1000\r\nanthropic-ratelimit-input-tokens-remaining: 750\r\n"
+	                    "anthropic-ratelimit-input-tokens-reset: 2030-01-01T00:00:00Z\r\n");
+	m = hkLimMain();
+	int in = -1;
+	for (int i = 0; i < hk_lim_n; i++) if (!strcmp(hk_lim[i].name, "in tok")) in = i;
+	ck(m >= 0 && !strcmp(hk_lim[m].name, "tok") && hk_lim[m].pct == 50 && hk_lim[m].reset >= now + 359,
+	   "limits: an API key's rate ceilings, the fullest leads");
+	ck(in >= 0 && hk_lim[in].pct == 25 && hk_lim[in].reset == 1893456000L, "limits: an ISO reset time is read as UTC");
+	ck(hkLimReset("1893456000") == 1893456000L && hkLimReset("2030-01-01T02:00:00+02:00") == 1893456000L
+	   && hkLimReset("1h") >= now + 3600, "limits: resets as unix time, an offset, a duration");
+	hkLimitsFromHeaders("x-ratelimit-limit-requests: 60\r\nx-ratelimit-remaining-requests: 12\r\nx-ratelimit-reset-requests: 20s\r\n");
+	m = hkLimMain();
+	ck(m >= 0 && !strcmp(hk_lim[m].name, "tok"), "limits: a per-minute ceiling at 80% does not lead");
+	hk_lim[m].reset = now - 1;
+	ck(hkLimPct(m) == 0, "limits: a window past its reset reads empty");
+	hk_lim_bar = 1;
+	char bar[64]; hkLimBar(bar, sizeof bar);
+	ck(strstr(bar, "%") != NULL, "limits: usage_bar=1 puts the headline in the bar");
+	hk_lim_bar = 0; hkLimBar(bar, sizeof bar);
+	ck(!*bar, "limits: off by default in the terminal");
+	hk_lim_who[0] = '\0'; hk_lim_n = 0; hk_lim_note[0] = '\0';
+	E.ai_oauth_provider = pw;
+}
+
 /* A process started while a model stream is open must not keep that stream's pipe:
    hanging up at a tool call then waits on a curl that never gets SIGPIPE. `:remote on`
    in the middle of a turn hung that way, for good, behind an idle looking bar. */
@@ -488,6 +547,32 @@ static void stream_pipe_tests(void) {
 	/* 11-19: a local model's "<to" showed on the page as reply text before its tool call did */
 	ck(hkTagSafe("ok <to", 6) == 3 && hkTagSafe("<", 1) == 0 && hkTagSafe("a<b", 3) == 3 && hkTagSafe("x < 3", 5) == 5
 	   && hkTagSafe("plain", 5) == 5 && hkTagSafe("<observ", 7) == 0, "stream: the start of a tool tag is held back, any other < shows");
+	/* 11-20: :remote on went off after two hours with no request, and the user checks in later than that */
+	{
+		char *was = getenv("HAKO_REMOTE_IDLE") ? strdup(getenv("HAKO_REMOTE_IDLE")) : NULL;
+		long rc = hk_remote_idle;
+		unsetenv("HAKO_REMOTE_IDLE"); hk_remote_idle = -1;
+		ck(hsIdleMinutes(1) == 0 && hsIdleMinutes(0) == 120, "remote: :remote on never idles off by itself, --serve --token after two hours");
+		hk_remote_idle = 600;
+		ck(hsIdleMinutes(1) == 600 && hsIdleMinutes(0) == 600, "remote: remote_idle in the rc sets both");
+		setenv("HAKO_REMOTE_IDLE", "0", 1);
+		ck(hsIdleMinutes(0) == 0, "remote: HAKO_REMOTE_IDLE=0 wins, never");
+		ck(hkRcProjectDenied("remote_idle"), "remote: a cloned repo's .hakorc cannot keep this computer reachable");
+		/* 11-21: a sign-in started from the phone opened this desk's browser and put its code on this desk's clipboard */
+		hs_attached = 1; hk_cmd_from_device = 1;
+		ck(!HK_DESK_ACTIONS_OK() && hkClipCopy("FAKE-device-code") == 0, "remote: a phone's command never opens this desk's browser or writes its clipboard");
+		hk_cmd_from_device = 0;
+		ck(HK_DESK_ACTIONS_OK(), "remote: a command typed here still may");
+		/* 11-23: an answer to an ask that already gave up stayed in memory until the next ask */
+		HS.input_waiting = 0; HS.input_ready = 0; HS.input[0] = '\0';
+		ck(hsInputSet("sk-FAKE-too-late") == 0 && HS.input[0] == '\0', "remote: an answer with nothing asking is dropped, not kept");
+		HS.input_waiting = 1;
+		ck(hsInputSet("sk-FAKE-on-time") == 1 && HS.input_ready, "remote: an answer to a live ask is taken");
+		HS.input_waiting = 0; HS.input_ready = 0; memset(HS.input, 0, sizeof HS.input);
+		hs_attached = 0;
+		hk_remote_idle = rc;
+		if (was) { setenv("HAKO_REMOTE_IDLE", was, 1); free(was); } else unsetenv("HAKO_REMOTE_IDLE");
+	}
 #endif
 	char path[] = "/tmp/hako-stream-XXXXXX";
 	int fd = mkstemp(path);
@@ -2169,7 +2254,7 @@ static void catalog_tests(void) {
 		if (hp[0]) unlink(hp);
 		hkHttpReq hr = { .method = "GET", .url = "https://x.test/v1/models", .headers = "-H 'x-api-key: sekrit'" };
 		char bt[64], ht[64];
-		char *cmd = hk_http_curl_cmd(&hr, bt, sizeof bt, ht);
+		char *cmd = hk_http_curl_cmd(&hr, bt, sizeof bt, ht, NULL);
 		ck(cmd && !strstr(cmd, "sekrit"), "a provider request carries no key on argv");
 		free(cmd);
 		if (ht[0]) unlink(ht);
@@ -3220,6 +3305,29 @@ static void creds_tests(void) {
 	clCredsSave();
 	ck(!creds_disk_is("groq", "gk", NULL), "creds: a logout elsewhere is not undone by a save here");
 
+	/* 11-24: a sign-in to another account of the same provider showed the last one's usage until its first reply */
+	{
+		if (!G_AI.history) clInitAI(&G_AI);
+		creds_wipe();
+		hkApplyProviderAlias("anthropic");
+		free(E.ai_oauth_provider); E.ai_oauth_provider = strdup("anthropic");
+		free(E.ai_api_key); E.ai_api_key = strdup("FAKE-usage");
+		hk_lim_who[0] = '\0';
+		hkLimitsFromHeaders("anthropic-ratelimit-unified-5h-utilization: 0.4\r\n");
+		int had = hk_lim_n;
+		hkHandleSlash(&G_AI, ":login anthropic FAKE-code");   /* no curl on PATH here: it goes nowhere */
+		char *j = NULL; size_t jl = 0, jc = 0;
+		hkLimitsJson(&j, &jl, &jc);
+		ck(had == 1 && j && strstr(j, "\"limits\":null"), "limits: signing in again shows no usage from the account before");
+		free(j); j = NULL; jl = jc = 0;
+		hkLimitsFromHeaders("anthropic-ratelimit-unified-5h-utilization: 0.4\r\n");
+		hkHandleSlash(&G_AI, ":logout");
+		hkLimitsJson(&j, &jl, &jc);
+		ck(j && strstr(j, "\"limits\":null"), "limits: nor does a logout");
+		free(j);
+		hk_lim_who[0] = '\0'; hk_lim_n = 0;
+	}
+
 	/* a new login reaches a hako already running, and only if it held the old one */
 	creds_wipe();
 	hkApplyProviderAlias("anthropic");
@@ -3604,6 +3712,10 @@ int main(int argc, char **argv) {
 	r = hkToolGrep("{\"pattern\":\"x\",\"path\":\"nope\"}");
 	ckstr(r, "not a directory", "grep names a missing directory");
 	free(r);
+	r = hkToolGrep("{\"pattern\":\"alpha\",\"path\":\"src/a.c\"}");
+	ckstr(r, "src/a.c:1:", "grep on a file path searches that file");
+	ck(r && strstr(r, "src/b.c") == NULL, "grep on a file path searches only that file");
+	free(r);
 	char *g2 = hkToolGlob("{\"pattern\":\"*\",\"path\":\"nope\"}");
 	ckstr(g2, "not a directory", "glob names a missing directory");
 	free(g2);
@@ -3636,6 +3748,7 @@ int main(int argc, char **argv) {
 	compact_tests();
 	long_session_tests();
 	stream_pipe_tests();
+	limits_tests();
 	resume_tests();
 	secrets_at_rest_tests();
 	creds_tests();

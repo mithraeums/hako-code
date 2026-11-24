@@ -3,6 +3,25 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
+## [Unreleased]
+
+### added
+- plan usage, as each provider reports it: a Claude or ChatGPT plan's 5 hour and weekly windows, Copilot's premium requests, an API key's rate ceilings, an OpenRouter or DeepSeek balance. read from the headers every reply carries, and from the provider's usage endpoint where one exists (`:usage`, then now and then for a provider whose replies say nothing). `:usage` lists every window with when it resets; the headline is the fullest, so the week leads when it is nearly gone and the 5 hours otherwise
+- `:usage bar` (or `usage_bar=1` in the rc) puts that headline in the bar, `5h 31%`, and in hake's Rei header; off by default in the terminal
+- `--pipe` and `--serve`: `init`, `state` and `/api/state` carry `limits`, and a `limits` event follows each call that moved them; `:usage ask` asks now and answers in one line
+- studio (embedded in `--serve`): a tab bar along the bottom on a phone (new, recents, files, you), and a solid menu drawer; settings in three tabs, themes as a grid of previews
+
+### changed
+- `:remote on` stays on until `:remote off` or the terminal closes; it went off after two hours with no request from a device, an open page not counting, and a phone often checks in later than that. `hako --serve --token` (this network, nobody at the desk) still stops after two hours. `remote_idle=<minutes>` in the rc sets either (0 = never; a project's own `.hakorc` cannot), and `HAKO_REMOTE_IDLE` still wins
+
+### fixed
+- `:remote on`: a key login sent from the phone (`:login nous-api`, any pasted key or sign-in code) asked for the key on this computer's keyboard, so the phone never got a box and the login waited for good. the device that sent it is asked now, hidden, and gets the key's address instead of a browser opening on the desk; this computer's clipboard is never offered to it, and the ask gives up after five minutes
+- `:remote on`: a sign-in started from the phone (`:login nous`, `copilot`, `chatgpt` and the other browser or device-code sign-ins) opened the browser on this computer and copied its code to this computer's clipboard; the phone gets the link and the code instead, and nothing happens at the desk. openrouter's browser sign-in, which returns to this computer, goes straight to a pasted key from the phone
+- `:remote on`: a key typed into the phone's box after the ask had given up was kept in memory until the next ask; an answer with nothing asking is dropped now
+- the input row stood empty for a moment after a line was sent (the bar was drawn before the field's prompt); the bar draws the prompt itself
+- `grep` given one file as its path (`adventure/room.c`) searches that file; it said "not a directory", and a small model asked the same way again
+- three `-Wformat-truncation` warnings in a gcc build at `-O0` (iSh, Alpine): a chat id copied after its length was checked, and a notice of who came onto a chat sized for the longest names
+
 ## [v0.4.3] - 2026-11-19
 
 ### added

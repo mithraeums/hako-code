@@ -118,6 +118,7 @@ being small enough to live anywhere is the whole point.
 - **Self-update.** `hako --update` pulls the latest GitHub release, verifies sha256, atomically replaces the binary. No reinstall, no rebuild.
 - **Streaming everywhere.** Anthropic SSE, every OpenAI-compatible provider and the local engine stream live tokens, including through tool calls. The spinner names the tool in flight (`reading main.c`); `anim_style=` picks one of eight.
 - **Context that does not run out.** Token accounting per provider, and at 70% of the window the middle of the conversation folds into a digest while the opening request and recent turns stay verbatim. `:compact` to force it, `:usage` to see it.
+- **Knows what is left.** A Claude or ChatGPT plan's 5 hour and weekly windows, Copilot's premium requests, an API key's rate ceilings, a prepaid balance: read from each reply and the provider's usage endpoint. `:usage` lists them; `:usage bar` keeps the fullest in the bar, the way studio's ring does.
 - **Skills as modes.** Skills load as one-line descriptions and fetch their body on demand, so installing ten costs almost nothing. `:use <skill>` promotes one to a mode: its full instructions go into every reply until `:use none`, and it survives a restart.
 
 <p align="center"><sub><b>—— III ——</b></sub></p>
@@ -282,6 +283,8 @@ show_splash=0
 anim_style=pump              # braille dots bar pulse bounce ghost arrows blocks pump
 editor=vim                   # for ctrl+g; else $EDITOR
 shell_timeout=120            # run_shell deadline in seconds (max 600)
+remote_idle=0                # minutes with no device before remote turns off; 0 = never (the default for :remote on, 120 for --serve --token)
+usage_bar=1                  # the plan's fullest limit in the bar (5h 31%), and in hake's Rei header; :usage bar toggles it
 ai_max_tokens=4096
 ai_stream=1
 prompt_cache=1               # Anthropic prompt caching

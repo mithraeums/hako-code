@@ -413,6 +413,7 @@ typedef struct {
 	int         stream;
 	int         timeout_s;   /* 0 = no limit, as every provider call wants */
 	int         follow;      /* follow redirects; only web_fetch asks for it */
+	int         limits;      /* read the reply's headers for plan and rate limits (hkLimitsFromHeaders) */
 } hkHttpReq;
 
 static char *hk_http_fetch(const hkHttpReq *req);
@@ -422,6 +423,9 @@ static void  hk_http_close(void *h);
 
 static long hk_time_ms(void);
 static long hk_time_unix(void);
+static void hkLimitsFromHeaders(const char *hdrs);
+static void hkLimBar(char *out, size_t cap);
+static void hkLimitsJson(char **b, size_t *len, size_t *cap);
 
 static char *hk_fs_read(const char *path, long max_bytes, long *out_len);
 static int   hk_fs_write(const char *path, const char *data, size_t len, int append);
@@ -3211,6 +3215,12 @@ static void hkCycleMode(void) {    /* ask -> auto -> plan -> ask */
 	else                     hkSetMode(0, 1);
 }
 static volatile int hs_attached = 0;       /* :remote on, inside this terminal session */
+static int hk_cmd_from_device = 0;         /* the command running now came from a linked device, not this keyboard */
+static int hs_input_wait_s = 0;            /* >0: an input_request gives up after this many seconds */
+static long hk_remote_idle = -1;           /* remote_idle= in the rc, minutes; -1 = not set */
+/* A command a phone sent through :remote acts on the phone: no browser opens on this desk and
+   nothing lands on its clipboard; the link and the code are in what the phone is shown */
+#define HK_DESK_ACTIONS_OK() (!(hs_attached && hk_cmd_from_device))
 static volatile int hs_streams = 0;        /* devices watching (open event streams) */
 static char hk_update_latest[32];          /* "0.2.11" when a newer release exists */
 static volatile int hk_update_ready = 0;   /* set once hk_update_latest is written */
@@ -3351,7 +3361,13 @@ static void clBarShowRaw(aiData *data) {
 	{ int rp = cols - 3 - rule_w; printf("%s%*s\n", ANSI_RESET, rp > 0 ? rp : 0, ""); } h++;
 
 	cl_bar_field = h;                          /* the field: the reader draws it */
-	for (int i = 0; i < cl_field_rows; i++) { printf("\x1b[2K%*s\n", cols - 1, ""); h++; }
+	/* its prompt too, so the field never shows empty: between a sent line and the reader
+	   taking the next keys (a turn starting) the bar stood with a blank field row */
+	for (int i = 0; i < cl_field_rows; i++) {
+		if (i == 0) printf("\x1b[2K%s%*s\n", E.color_enabled ? "\x1b[1m> \x1b[0m" : "> ", cols - 3, "");
+		else printf("\x1b[2K%*s\n", cols - 1, "");
+		h++;
+	}
 
 	printf("\x1b[2K  %s", rule_c);            /* bottom rule */
 	for (int i = 0; i < rule_w; i++) printf("\xE2\x94\x80");
@@ -3362,7 +3378,7 @@ static void clBarShowRaw(aiData *data) {
 	if (!cl_menu_drawn) cl_menu_n = 0;
 	if (cl_menu_n > 0) {
 		for (int k = cl_menu_top; k < cl_menu_top + cl_menu_n; k++) { clMenuRow(k, cols, k == cl_menu_top + cl_menu_n - 1); h++; }
-		printf("\r\x1b[%dA", h - 1 - cl_bar_field);   /* back up onto the field */
+		printf("\r\x1b[%dA\x1b[2C", h - 1 - cl_bar_field);   /* back up onto the field, after its prompt */
 		fflush(stdout);
 		cl_bar_h = h;
 		cl_bar_cols = cols;
@@ -3390,6 +3406,15 @@ static void clBarShowRaw(aiData *data) {
 		else if (cost > 0.00005) snprintf(c, sizeof(c), "\xC2\xB7$%.4f", cost);
 		snprintf(right, sizeof(right), "\xE2\x86\x91%ld\xE2\x86\x93%ld%s",
 		         data->total_in_tokens, data->total_out_tokens, c);
+	}
+	{	/* the plan's fullest window, when usage_bar=1 */
+		char lb[64];
+		hkLimBar(lb, sizeof lb);
+		if (*lb) {
+			char was[256];
+			snprintf(was, sizeof was, "%s", right);
+			hkCatf(right, 0, sizeof right, "%s%s%s%s", TH_META, lb, was[0] ? "  " : "", was);
+		}
 	}
 	/* Three widths, because a phone in portrait is 30-something columns and a
 	   bar row that wraps costs a row we did not count. */
@@ -3445,7 +3470,7 @@ static void clBarShowRaw(aiData *data) {
 	if (gap < 1) gap = 1;
 	printf("\x1b[2K%s%*s%s%s", left, gap, "", right, ANSI_RESET); h++;
 
-	printf("\r\x1b[%dA", h - 1 - cl_bar_field);   /* back up onto the field */
+	printf("\r\x1b[%dA\x1b[2C", h - 1 - cl_bar_field);   /* back up onto the field, after its prompt */
 	fflush(stdout);
 	cl_bar_h = h;
 	cl_bar_cols = cols;
@@ -3667,9 +3692,10 @@ static char *hkHeadersToFile(const char *hdrs, char *path, size_t cap) {
 	return rest;
 }
 
-static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_cap, char *hdr_tmp) {
+static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_cap, char *hdr_tmp, char *dump_tmp) {
 	body_tmp[0] = '\0';
 	hdr_tmp[0] = '\0';
+	if (dump_tmp) dump_tmp[0] = '\0';
 	if (req->body) {
 		snprintf(body_tmp, tmp_cap, "/tmp/hako_req_XXXXXX");
 		int fd = mkstemp(body_tmp);
@@ -3682,9 +3708,19 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 		hdrs = hkHeadersToFile(req->headers, hdr_tmp, tmp_cap);
 		if (!hdrs) { if (body_tmp[0]) unlink(body_tmp); return NULL; }
 	}
-	size_t cap = strlen(req->url) + (hdrs ? strlen(hdrs) : 0) + 576;
+	/* the reply's headers, for the limits they carry: curl writes them here */
+	if (req->limits && dump_tmp) {
+		snprintf(dump_tmp, tmp_cap, "/tmp/hako_hdr_XXXXXX");
+		int fd = mkstemp(dump_tmp);
+		if (fd < 0) dump_tmp[0] = '\0'; else close(fd);
+	}
+	size_t cap = strlen(req->url) + (hdrs ? strlen(hdrs) : 0) + 608;
 	char *cmd = malloc(cap);
-	if (!cmd) { free(hdrs); if (body_tmp[0]) unlink(body_tmp); if (hdr_tmp[0]) unlink(hdr_tmp); return NULL; }
+	if (!cmd) {
+		free(hdrs); if (body_tmp[0]) unlink(body_tmp); if (hdr_tmp[0]) unlink(hdr_tmp);
+		if (dump_tmp && dump_tmp[0]) unlink(dump_tmp);
+		return NULL;
+	}
 	int has_accept = req->headers && (strstr(req->headers, "accept:") || strstr(req->headers, "Accept:"));
 	int has_ctype = req->headers && strstr(req->headers, "Content-Type:");
 	char limits[64];
@@ -3695,8 +3731,9 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 		         req->timeout_s > 0 ? "--max-time " : "",
 		         req->timeout_s > 0 ? req->timeout_s : 0);
 	snprintf(cmd, cap,
-		"curl -s%s %s-X %s '%s' -A 'hako-code/%s' %s%s%s%s%s 2>/dev/null",
+		"curl -s%s %s%s%s%s-X %s '%s' -A 'hako-code/%s' %s%s%s%s%s 2>/dev/null",
 		req->stream ? "N" : "", limits,
+		dump_tmp && dump_tmp[0] ? "-D '" : "", dump_tmp && dump_tmp[0] ? dump_tmp : "", dump_tmp && dump_tmp[0] ? "' " : "",
 		req->method ? req->method : "GET", req->url, HAKO_VERSION,
 		has_accept ? "" : "-H 'Accept: application/json' ",
 		hdrs ? hdrs : "",
@@ -3713,6 +3750,7 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 		free(cmd); free(hdrs);
 		if (body_tmp[0]) unlink(body_tmp);
 		if (hdr_tmp[0]) unlink(hdr_tmp);
+		if (dump_tmp && dump_tmp[0]) unlink(dump_tmp);
 		return NULL;
 	}
 	free(hdrs);
@@ -3722,7 +3760,7 @@ static char *hk_http_curl_cmd(const hkHttpReq *req, char *body_tmp, size_t tmp_c
 static char *hk_http_fetch(const hkHttpReq *req) {
 	if (!req || !req->url) return NULL;
 	char tmp[64], htmp[64];
-	char *cmd = hk_http_curl_cmd(req, tmp, sizeof(tmp), htmp);
+	char *cmd = hk_http_curl_cmd(req, tmp, sizeof(tmp), htmp, NULL);
 	if (!cmd) return NULL;
 	FILE *fp = popen(cmd, "r");
 	free(cmd);
@@ -3733,7 +3771,7 @@ static char *hk_http_fetch(const hkHttpReq *req) {
 	return out;
 }
 
-typedef struct { FILE *fp; char tmp[64], htmp[64]; } hkHttpNative;
+typedef struct { FILE *fp; char tmp[64], htmp[64], dtmp[64]; } hkHttpNative;
 
 static void *hk_http_open(const hkHttpReq *req) {
 	if (!req || !req->url) return NULL;
@@ -3742,7 +3780,7 @@ static void *hk_http_open(const hkHttpReq *req) {
 	                     req->body ? strlen(req->body) : (size_t)0);
 	hkHttpNative *h = calloc(1, sizeof(*h));
 	if (!h) return NULL;
-	char *cmd = hk_http_curl_cmd(req, h->tmp, sizeof(h->tmp), h->htmp);
+	char *cmd = hk_http_curl_cmd(req, h->tmp, sizeof(h->tmp), h->htmp, h->dtmp);
 	if (!cmd) { free(h); return NULL; }
 	h->fp = popen(cmd, "r");
 	free(cmd);
@@ -3751,7 +3789,13 @@ static void *hk_http_open(const hkHttpReq *req) {
 #if defined(F_SETFD) && defined(FD_CLOEXEC)
 	if (h->fp) fcntl(fileno(h->fp), F_SETFD, FD_CLOEXEC);
 #endif
-	if (!h->fp) { if (h->tmp[0]) unlink(h->tmp); if (h->htmp[0]) unlink(h->htmp); free(h); return NULL; }
+	if (!h->fp) {
+		if (h->tmp[0]) unlink(h->tmp);
+		if (h->htmp[0]) unlink(h->htmp);
+		if (h->dtmp[0]) unlink(h->dtmp);
+		free(h);
+		return NULL;
+	}
 	return h;
 }
 
@@ -3767,6 +3811,12 @@ static void hk_http_close(void *handle) {
 	if (h->fp) pclose(h->fp);
 	if (h->tmp[0]) unlink(h->tmp);
 	if (h->htmp[0]) unlink(h->htmp);
+	if (h->dtmp[0]) {
+		char *hd = hk_fs_read(h->dtmp, 65536, NULL);
+		hkLimitsFromHeaders(hd);
+		free(hd);
+		unlink(h->dtmp);
+	}
 	free(h);
 }
 
@@ -3877,6 +3927,7 @@ static long hk_time_unix(void) { return (long)time(NULL); }
 
 extern char *hkjs_http_fetch(const char *method, const char *url,
                              const char *headers, const char *body, int stream);
+extern char *hkjs_http_headers(void);   /* the last reply's headers, as far as CORS shows them */
 extern int   hkjs_fs_read(const char *path, char **out, long *len);
 extern int   hkjs_fs_write(const char *path, const char *data, int len, int append);
 extern int   hkjs_fs_stat(const char *path, long *size, long *mtime, int *is_dir);
@@ -3890,7 +3941,7 @@ static char *hk_http_fetch(const hkHttpReq *req) {
 	                       req->headers ? req->headers : "", req->body ? req->body : "", 0);
 }
 
-typedef struct { char *buf; size_t pos; } hkHttpWasm;
+typedef struct { char *buf; size_t pos; int limits; } hkHttpWasm;
 
 static void *hk_http_open(const hkHttpReq *req) {
 	if (!req || !req->url) return NULL;
@@ -3901,6 +3952,7 @@ static void *hk_http_open(const hkHttpReq *req) {
 	hkHttpWasm *h = calloc(1, sizeof(*h));
 	if (!h) { free(body); return NULL; }
 	h->buf = body;
+	h->limits = req->limits;
 	return h;
 }
 
@@ -3919,6 +3971,7 @@ static char *hk_http_gets(void *handle, char *buf, int cap) {
 static void hk_http_close(void *handle) {
 	hkHttpWasm *h = (hkHttpWasm *)handle;
 	if (!h) return;
+	if (h->limits) { char *hd = hkjs_http_headers(); hkLimitsFromHeaders(hd); free(hd); }
 	free(h->buf);
 	free(h);
 }
@@ -4330,6 +4383,442 @@ static void hkUpdateUsage(aiData *data, const char *resp) {
 	int cr = hkExtractJsonInt(resp, "cache_read_input_tokens");
 	if (cw > 0) data->total_cache_write += cw;
 	if (cr > 0) data->total_cache_read  += cr;
+}
+
+/* ---------- plan and rate limits: how much is left, in the provider's words ----------
+   A subscription says how full its 5 hour and weekly windows are, an API key its
+   rate ceilings, a prepaid key its balance. The headers ride every reply, so the
+   numbers follow each call; the providers with a usage endpoint are asked too
+   (:usage, a sign-in, a front end that wants them). The headline is the fullest
+   window: the week when it is nearly gone, the 5 hours otherwise. */
+#define HK_LIM_MAX 8
+typedef struct { char name[20]; int pct; long reset; } hkLim;
+static hkLim hk_lim[HK_LIM_MAX];
+static int hk_lim_n = 0;
+static long hk_lim_at = 0;            /* when a provider last said */
+static char hk_lim_note[48] = "";     /* a balance, when that is all there is */
+static char hk_lim_who[64] = "";      /* whose numbers they are */
+static long hk_lim_asked = 0;         /* the last endpoint ask */
+static int hk_lim_dirty = 0;          /* changed since the front ends were told */
+static int hk_lim_hdr = 0;            /* the replies carry them: no need to ask */
+
+/* Numbers are one credential's: another provider or sign-in starts clean. */
+static void hkLimWho(void) {
+	char who[64];
+	snprintf(who, sizeof who, "%s/%s", hkProviderLabel(), E.ai_oauth_provider ? E.ai_oauth_provider : "key");
+	if (!strcmp(who, hk_lim_who)) return;
+	snprintf(hk_lim_who, sizeof hk_lim_who, "%s", who);
+	hk_lim_n = 0; hk_lim_note[0] = '\0'; hk_lim_at = 0; hk_lim_asked = 0; hk_lim_hdr = 0; hk_lim_dirty = 1;
+}
+
+static void hkLimSet(const char *name, double pct, long reset) {
+	if (!name || !*name || pct < 0) return;
+	if (pct > 100) pct = 100;
+	int i = 0;
+	while (i < hk_lim_n && strcmp(hk_lim[i].name, name)) i++;
+	if (i == HK_LIM_MAX) return;
+	int p = (int)(pct + 0.5);
+	if (i == hk_lim_n) {                 /* the row before the count: a reader never sees a blank one */
+		snprintf(hk_lim[i].name, sizeof hk_lim[i].name, "%s", name);
+		hk_lim[i].pct = p; hk_lim[i].reset = reset;
+		hk_lim_n++;
+		hk_lim_dirty = 1;
+	} else {
+		if (hk_lim[i].pct != p) hk_lim_dirty = 1;
+		hk_lim[i].pct = p; hk_lim[i].reset = reset;
+	}
+	hk_lim_at = hk_time_unix();
+}
+
+/* A window past its reset is empty again, whatever it said. */
+static int hkLimPct(int i) {
+	return (hk_lim[i].reset > 0 && hk_lim[i].reset <= hk_time_unix()) ? 0 : hk_lim[i].pct;
+}
+
+/* The headline: the fullest window. A per-minute ceiling refills before anyone
+   could act on it, so it leads only when it is nearly hit. */
+static int hkLimMain(void) {
+	long now = hk_time_unix();
+	int best = -1, any = -1;
+	for (int i = 0; i < hk_lim_n; i++) {
+		int p = hkLimPct(i);
+		if (any < 0 || p > hkLimPct(any)) any = i;
+		if (hk_lim[i].reset > 0 && hk_lim[i].reset - now < 300 && p < 90) continue;
+		if (best < 0 || p > hkLimPct(best) || (p == hkLimPct(best) && hk_lim[i].reset > hk_lim[best].reset)) best = i;
+	}
+	return best >= 0 ? best : any;
+}
+
+static long hkDaysFromCivil(long y, int m, int d) {
+	y -= m <= 2;
+	long era = (y >= 0 ? y : y - 399) / 400;
+	long yoe = y - era * 400;
+	long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+	return era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+}
+
+/* A reset as providers write it: unix seconds, seconds from now, "6m0s", or an ISO time. */
+static long hkLimReset(const char *v) {
+	if (!v) return 0;
+	while (*v == ' ' || *v == '"') v++;
+	if (!*v) return 0;
+	size_t n = strlen(v);
+	if (n >= 10 && v[4] == '-' && v[7] == '-') {
+		int y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
+		if (sscanf(v, "%4d-%2d-%2d", &y, &mo, &d) != 3 || mo < 1 || mo > 12) return 0;
+		if (n >= 19) sscanf(v + 11, "%2d:%2d:%2d", &h, &mi, &s);
+		long t = hkDaysFromCivil(y, mo, d) * 86400L + h * 3600L + mi * 60L + s;
+		if (n > 19) {
+			const char *z = v + 19;
+			while (*z == '.' || isdigit((unsigned char)*z)) z++;
+			if (*z == '+' || *z == '-') {
+				int oh = 0, om = 0;
+				sscanf(z + 1, "%2d:%2d", &oh, &om);
+				long off = oh * 3600L + om * 60L;
+				t += *z == '+' ? -off : off;
+			}
+		}
+		return t;
+	}
+	double secs = 0;
+	int units = 0;
+	const char *p = v;
+	while (*p) {
+		char *e;
+		double x = strtod(p, &e);
+		if (e == p) break;
+		p = e;
+		if (*p == 'h') { secs += x * 3600; p++; units = 1; }
+		else if (*p == 'm' && p[1] == 's') { secs += x / 1000; p += 2; units = 1; }
+		else if (*p == 'm') { secs += x * 60; p++; units = 1; }
+		else if (*p == 's') { secs += x; p++; units = 1; }
+		else { if (!units && x > 1e9) return (long)x; secs += x; break; }
+	}
+	return hk_time_unix() + (long)(secs + 0.999);
+}
+
+static void hkLimWindowName(long minutes, char *out, size_t cap) {
+	if (minutes == 10080) snprintf(out, cap, "week");
+	else if (minutes >= 1440 && minutes % 1440 == 0) snprintf(out, cap, "%ldd", minutes / 1440);
+	else if (minutes >= 60 && minutes % 60 == 0) snprintf(out, cap, "%ldh", minutes / 60);
+	else snprintf(out, cap, "%ldm", minutes > 0 ? minutes : 0);
+}
+
+/* "7d_opus" -> "week opus", "requests" -> "req", "tokens-minute" -> "tok/min" */
+static void hkLimName(const char *k, char *out, size_t cap) {
+	static const char *const SUB[][2] = {
+		{ "7d", "week" }, { "input-tokens", "in tok" }, { "output-tokens", "out tok" },
+		{ "requests", "req" }, { "tokens", "tok" }, { "-minute", "/min" }, { "-day", "/day" },
+		{ "-month", "/month" }, { "_", " " }, { "-", " " } };
+	size_t o = 0;
+	while (*k && o + 1 < cap) {
+		size_t j = 0;
+		for (; j < sizeof SUB / sizeof *SUB; j++) {
+			size_t L = strlen(SUB[j][0]);
+			if (!strncmp(k, SUB[j][0], L)) {
+				for (const char *r = SUB[j][1]; *r && o + 1 < cap; r++) out[o++] = *r;
+				k += L;
+				break;
+			}
+		}
+		if (j == sizeof SUB / sizeof *SUB) out[o++] = *k++;
+	}
+	out[o] = '\0';
+}
+
+static int hkLimEnds(const char *s, const char *suf, size_t *stem) {
+	size_t n = strlen(s), L = strlen(suf);
+	if (n <= L || strcmp(s + n - L, suf)) return 0;
+	*stem = n - L;
+	return 1;
+}
+
+/* The headers of a reply (curl -D, or the browser's), one "name: value" a line. */
+static void hkLimitsFromHeaders(const char *hdrs) {
+	if (!hdrs || !*hdrs) return;
+	hkLimWho();
+	struct { char k[24]; double pct; long reset; } un[6];             /* a subscription's windows */
+	struct { char k[32]; double lim, rem; long reset; } rl[8];        /* an API key's ceilings */
+	struct { double pct; long mins, reset; } cx[2] = { { -1, 0, 0 }, { -1, 0, 0 } };   /* ChatGPT's two */
+	int nun = 0, nrl = 0;
+	for (const char *line = hdrs; *line; ) {
+		const char *nl = strchr(line, '\n');
+		size_t L = nl ? (size_t)(nl - line) : strlen(line);
+		const char *colon = memchr(line, ':', L);
+		char n[96], v[128];
+		if (colon && (size_t)(colon - line) < sizeof n) {
+			size_t nk = (size_t)(colon - line);
+			for (size_t i = 0; i < nk; i++) n[i] = (char)tolower((unsigned char)line[i]);
+			n[nk] = '\0';
+			const char *vs = colon + 1;
+			while (vs < line + L && (*vs == ' ' || *vs == '\t')) vs++;
+			size_t nv = (size_t)(line + L - vs);
+			while (nv && (vs[nv - 1] == '\r' || vs[nv - 1] == ' ')) nv--;
+			if (nv >= sizeof v) nv = sizeof v - 1;
+			memcpy(v, vs, nv); v[nv] = '\0';
+			size_t st;
+			const char *r;
+			char k[48];
+			if (!strncmp(n, "anthropic-ratelimit-unified-", 28)) {
+				r = n + 28;
+				int util = hkLimEnds(r, "-utilization", &st), rs = !util && hkLimEnds(r, "-reset", &st);
+				if ((util || rs) && st < sizeof un[0].k) {
+					int i = 0;
+					while (i < nun && (strncmp(un[i].k, r, st) || un[i].k[st])) i++;
+					if (i == nun && nun < 6) { memcpy(un[i].k, r, st); un[i].k[st] = '\0'; un[i].pct = -1; un[i].reset = 0; nun++; }
+					if (i < nun) { if (util) un[i].pct = atof(v) * 100; else un[i].reset = hkLimReset(v); }
+				}
+			} else if (!strncmp(n, "x-codex-primary-", 16) || !strncmp(n, "x-codex-secondary-", 18)) {
+				int w = n[8] == 's';
+				r = n + (w ? 18 : 16);
+				if (!strcmp(r, "used-percent")) cx[w].pct = atof(v);
+				else if (!strcmp(r, "window-minutes")) cx[w].mins = atol(v);
+				else if (!strcmp(r, "reset-after-seconds")) cx[w].reset = hk_time_unix() + atol(v);
+				else if (!strcmp(r, "reset-at") && !cx[w].reset) cx[w].reset = hkLimReset(v);
+			} else {
+				int what = -1;          /* 0 limit, 1 remaining, 2 reset */
+				k[0] = '\0';
+				const char *x = !strncmp(n, "x-ratelimitbysize-", 18) ? n + 18 : !strncmp(n, "x-ratelimit-", 12) ? n + 12 : NULL;
+				if (x) {
+					static const char *const W[] = { "limit-", "remaining-", "reset-" };
+					for (int j = 0; j < 3; j++)
+						if (!strncmp(x, W[j], strlen(W[j]))) { what = j; snprintf(k, sizeof k, "%s", x + strlen(W[j])); }
+				} else if (!strncmp(n, "anthropic-ratelimit-", 20)) {
+					r = n + 20;
+					if (hkLimEnds(r, "-limit", &st)) what = 0;
+					else if (hkLimEnds(r, "-remaining", &st)) what = 1;
+					else if (hkLimEnds(r, "-reset", &st)) what = 2;
+					if (what >= 0 && st < sizeof k) { memcpy(k, r, st); k[st] = '\0'; }
+				}
+				if (what >= 0 && *k && strlen(k) < sizeof rl[0].k) {
+					int i = 0;
+					while (i < nrl && strcmp(rl[i].k, k)) i++;
+					if (i == nrl && nrl < 8) { memcpy(rl[i].k, k, strlen(k) + 1); rl[i].lim = rl[i].rem = -1; rl[i].reset = 0; nrl++; }
+					if (i < nrl) {
+						if (what == 0) rl[i].lim = atof(v);
+						else if (what == 1) rl[i].rem = atof(v);
+						else rl[i].reset = hkLimReset(v);
+					}
+				}
+			}
+		}
+		if (!nl) break;
+		line = nl + 1;
+	}
+	char name[24];
+	int before = hk_lim_n;
+	for (int i = 0; i < nun; i++) {
+		if (un[i].pct < 0) continue;
+		hkLimName(un[i].k, name, sizeof name);
+		hkLimSet(name, un[i].pct, un[i].reset);
+	}
+	for (int w = 0; w < 2; w++) {
+		if (cx[w].pct < 0) continue;
+		if (cx[w].mins > 0) hkLimWindowName(cx[w].mins, name, sizeof name);
+		else snprintf(name, sizeof name, "%s", w ? "week" : "5h");
+		hkLimSet(name, cx[w].pct, cx[w].reset);
+	}
+	for (int i = 0; i < nrl; i++) {
+		if (rl[i].lim <= 0 || rl[i].rem < 0) continue;
+		hkLimName(rl[i].k, name, sizeof name);
+		hkLimSet(name, (rl[i].lim - rl[i].rem) * 100.0 / rl[i].lim, rl[i].reset);
+	}
+	if (nun || nrl || cx[0].pct >= 0 || cx[1].pct >= 0 || hk_lim_n > before) hk_lim_hdr = 1;
+}
+
+/* A number after "key": in src, or -1. Quoted numbers count ("110.00"). */
+static double hkJsonNum(const char *src, const char *key) {
+	if (!src) return -1;
+	const char *p = src, *q;
+	while ((q = hkJsonValue(&p, key)) != NULL) {
+		if (*q == '"') q++;
+		if ((*q >= '0' && *q <= '9') || *q == '.') return strtod(q, NULL);
+		return -1;
+	}
+	return -1;
+}
+
+/* The object a key opens, or NULL (absent, or null). */
+static const char *hkJsonObjAt(const char *src, const char *key) {
+	const char *p = src;
+	const char *q = src ? hkJsonValue(&p, key) : NULL;
+	return q && *q == '{' ? q : NULL;
+}
+
+static int hkChatGPTHeaders(char *hdr, size_t cap, const char *token, int stream);
+
+/* Ask the provider's usage endpoint, where it has one. Headers do the rest. */
+static void hkLimitsAsk(int force) {
+	hkLimWho();
+	long now = hk_time_unix();
+	if (!force && hk_lim_asked && now - hk_lim_asked < 600) return;
+	hk_lim_asked = now;
+	const char *key = E.ai_api_key;
+	const char *ep = E.ai_endpoint ? E.ai_endpoint : "";
+	char hdr[4096], *r = NULL;
+	hkHttpReq q = { .method = "GET", .headers = hdr, .timeout_s = 6 };
+	hdr[0] = '\0';
+	if (hkOAuthIs("anthropic") && key && *key) {
+		if (!hkFmtFits(hdr, sizeof hdr, "-H 'Authorization: Bearer %s' -H 'anthropic-beta: oauth-2025-04-20'", key)) return;
+		q.url = "https://api.anthropic.com/api/oauth/usage";
+		if (!(r = hk_http_fetch(&q))) return;
+		static const char *const W[][2] = { { "five_hour", "5h" }, { "seven_day", "week" },
+			{ "seven_day_opus", "week opus" }, { "seven_day_sonnet", "week sonnet" } };
+		for (size_t i = 0; i < sizeof W / sizeof *W; i++) {
+			const char *o = hkJsonObjAt(r, W[i][0]);
+			if (!o) continue;
+			const char *end = strchr(o, '}');
+			double u = hkJsonNum(o, "utilization");
+			if (u < 0) continue;
+			char *at = hkExtractJsonString(o, "resets_at");
+			long rs = at && (!end || strstr(o, "\"resets_at\"") < end) ? hkLimReset(at) : 0;
+			free(at);
+			hkLimSet(W[i][1], u, rs);
+		}
+	} else if (hkOAuthIs("chatgpt") && key && *key) {
+		if (!hkChatGPTHeaders(hdr, sizeof hdr, key, 0)) return;
+		q.url = "https://chatgpt.com/backend-api/wham/usage";
+		if (!(r = hk_http_fetch(&q))) return;
+		static const char *const W[] = { "primary_window", "secondary_window" };
+		for (int w = 0; w < 2; w++) {
+			const char *o = hkJsonObjAt(r, W[w]);
+			if (!o) continue;
+			double u = hkJsonNum(o, "used_percent");
+			if (u < 0) continue;
+			double secs = hkJsonNum(o, "limit_window_seconds");
+			double after = hkJsonNum(o, "reset_after_seconds"), at = hkJsonNum(o, "reset_at");
+			char name[24];
+			if (secs > 0) hkLimWindowName((long)(secs / 60), name, sizeof name);
+			else snprintf(name, sizeof name, "%s", w ? "week" : "5h");
+			hkLimSet(name, u, after >= 0 ? now + (long)after : at > 1e9 ? (long)at : 0);
+		}
+	} else if (hkOAuthIs("github-copilot") && E.ai_oauth_refresh && *E.ai_oauth_refresh) {
+		if (!hkFmtFits(hdr, sizeof hdr, "-H 'Authorization: token %s' -H 'Editor-Version: %s' -H 'Editor-Plugin-Version: %s'",
+		               E.ai_oauth_refresh, HAKO_COPILOT_EDITOR_VER, HAKO_COPILOT_PLUGIN_VER)) return;
+		q.url = "https://api.github.com/copilot_internal/user";
+		if (!(r = hk_http_fetch(&q))) return;
+		char *day = hkExtractJsonString(r, "quota_reset_date");
+		long rs = day ? hkLimReset(day) : 0;
+		free(day);
+		static const char *const W[][2] = { { "premium_interactions", "premium" }, { "chat", "chat" } };
+		const char *snaps = hkJsonObjAt(r, "quota_snapshots");
+		for (size_t i = 0; snaps && i < sizeof W / sizeof *W; i++) {
+			const char *o = hkJsonObjAt(snaps, W[i][0]);
+			if (!o) continue;
+			const char *un = strstr(o, "\"unlimited\":true");
+			const char *end = strchr(o, '}');
+			if (un && (!end || un < end)) continue;
+			double left = hkJsonNum(o, "percent_remaining");
+			if (left >= 0) hkLimSet(W[i][1], 100 - left, rs);
+		}
+	} else if (strstr(ep, "openrouter.ai") && key && *key) {
+		if (!hkFmtFits(hdr, sizeof hdr, "-H 'Authorization: Bearer %s'", key)) return;
+		q.url = "https://openrouter.ai/api/v1/key";
+		if ((r = hk_http_fetch(&q))) {
+			double lim = hkJsonNum(r, "limit"), left = hkJsonNum(r, "limit_remaining");
+			if (lim > 0 && left >= 0) hkLimSet("key limit", (lim - left) * 100 / lim, 0);
+			free(r);
+		}
+		q.url = "https://openrouter.ai/api/v1/credits";
+		if (!(r = hk_http_fetch(&q))) return;
+		double got = hkJsonNum(r, "total_credits"), used = hkJsonNum(r, "total_usage");
+		if (got > 0 && used >= 0) {
+			hkLimSet("credit", used * 100 / got, 0);
+			snprintf(hk_lim_note, sizeof hk_lim_note, "$%.2f left", got - used);
+			hk_lim_dirty = 1;
+		}
+	} else if (strstr(ep, "deepseek.com") && key && *key) {
+		if (!hkFmtFits(hdr, sizeof hdr, "-H 'Authorization: Bearer %s'", key)) return;
+		q.url = "https://api.deepseek.com/user/balance";
+		if (!(r = hk_http_fetch(&q))) return;
+		double bal = hkJsonNum(r, "total_balance");
+		char *cur = hkExtractJsonString(r, "currency");
+		if (bal >= 0) {
+			if (!cur || !strcmp(cur, "USD")) snprintf(hk_lim_note, sizeof hk_lim_note, "$%.2f left", bal);
+			else snprintf(hk_lim_note, sizeof hk_lim_note, "%.2f %.8s left", bal, cur);
+			hk_lim_at = now; hk_lim_dirty = 1;
+		}
+		free(cur);
+	}
+	free(r);
+}
+
+/* "resets in 2h 14m" */
+static void hkLimIn(long reset, char *out, size_t cap) {
+	long s = reset - hk_time_unix();
+	out[0] = '\0';
+	if (reset <= 0 || s <= 0) return;
+	if (s >= 86400) snprintf(out, cap, "%ldd %ldh", s / 86400, s % 86400 / 3600);
+	else if (s >= 3600) snprintf(out, cap, "%ldh %ldm", s / 3600, s % 3600 / 60);
+	else if (s >= 60) snprintf(out, cap, "%ldm", s / 60);
+	else snprintf(out, cap, "%lds", s);
+}
+
+/* New numbers for the front ends, on their own: a state message would flash Rei's status line each call. */
+static void clPipeEmitLimits(void) {
+	hk_lim_dirty = 0;
+	if (!E.pipe_mode && !hs_attached) return;
+	char *b = NULL; size_t len = 0, cap = 0;
+	hkSbAdd(&b, &len, &cap, "{\"type\":\"limits\"", 16);
+	hkLimitsJson(&b, &len, &cap);
+	hkSbAdd(&b, &len, &cap, "}", 1);
+	if (b) clPipeEmitRaw(b);
+	free(b);
+}
+
+/* :usage's lines: the headline first, then every window the provider names. */
+static void hkLimitsSay(aiData *data) {
+	if (!hk_lim_n && !hk_lim_note[0]) {
+		aiAddHistory(data, "limits:   none reported yet (they come with the next reply, where the provider sends them)");
+		return;
+	}
+	int m = hkLimMain();
+	char line[160], in[32];
+	for (int k = -1; k < hk_lim_n; k++) {
+		int i = k < 0 ? m : k;
+		if (i < 0 || (k >= 0 && i == m)) continue;
+		hkLimIn(hk_lim[i].reset, in, sizeof in);
+		snprintf(line, sizeof line, "%s %-12s %3d%% used%s%s",
+		         k < 0 ? "limits:  " : "         ", hk_lim[i].name, hkLimPct(i), *in ? ", resets in " : "", in);
+		aiAddHistory(data, line);
+	}
+	if (hk_lim_note[0]) {
+		snprintf(line, sizeof line, "%s %s", hk_lim_n ? "         " : "limits:  ", hk_lim_note);
+		aiAddHistory(data, line);
+	}
+}
+
+/* The headline in a few cells: "5h 23%", or the balance. */
+static void hkLimHead(char *out, size_t cap) {
+	int m = hkLimMain();
+	if (m >= 0) snprintf(out, cap, "%s %d%%", hk_lim[m].name, hkLimPct(m));
+	else snprintf(out, cap, "%s", hk_lim_note);
+}
+
+/* In the bar (and Rei's header, which follows it) only when usage_bar=1. */
+static int hk_lim_bar = 0;
+static void hkLimBar(char *out, size_t cap) {
+	out[0] = '\0';
+	if (hk_lim_bar) hkLimHead(out, cap);
+}
+
+/* For the front ends: ,"limits":{"main":0,"note":"..","at":..,"windows":[{"name":"5h","pct":23,"reset":..}]} */
+static void hkLimitsJson(char **b, size_t *len, size_t *cap) {
+	hkLimWho();
+	if (!hk_lim_n && !hk_lim_note[0]) { hkSbAdd(b, len, cap, ",\"limits\":null", 14); return; }   /* another sign-in's are gone */
+	char tmp[512], ne[96], head[64], he[96];
+	hkJsonEscapeInto(hk_lim_note, ne, (int)sizeof ne);
+	hkLimHead(head, sizeof head);
+	hkJsonEscapeInto(head, he, (int)sizeof he);
+	snprintf(tmp, sizeof tmp, ",\"limits\":{\"main\":%d,\"head\":\"%s\",\"bar\":%d,\"note\":\"%s\",\"at\":%ld,\"windows\":[",
+	         hkLimMain(), he, hk_lim_bar, ne, hk_lim_at);
+	hkSbAdd(b, len, cap, tmp, strlen(tmp));
+	for (int i = 0; i < hk_lim_n; i++) {
+		hkJsonEscapeInto(hk_lim[i].name, ne, (int)sizeof ne);
+		snprintf(tmp, sizeof tmp, "%s{\"name\":\"%s\",\"pct\":%d,\"reset\":%ld}", i ? "," : "", ne, hkLimPct(i), hk_lim[i].reset);
+		hkSbAdd(b, len, cap, tmp, strlen(tmp));
+	}
+	hkSbAdd(b, len, cap, "]}", 2);
 }
 
 /* Walk the lines of a buffer read through the seam. */
@@ -4897,6 +5386,7 @@ static int hkClipCopy(const char *s) {
 	(void)s;
 	return 0;
 #else
+	if (!HK_DESK_ACTIONS_OK()) return 0;
 	int ok = 0;
 	FILE *f = fopen("/dev/clipboard", "w");
 	if (f) { ok = fputs(s, f) >= 0; return (fclose(f) == 0) && ok; }
@@ -4978,7 +5468,7 @@ static void clOpenUrl(const char *url) {
 	(void)url;      /* the front end opens links; there is no launcher to call */
 	return;
 #else
-	if (!url || !hkHasDesktop()) return;
+	if (!url || !hkHasDesktop() || !HK_DESK_ACTIONS_OK()) return;
 	char cmd[2048];
 	/* A truncated URL is a DIFFERENT url, and this one goes to a shell.
 	   Refuse rather than open something the user did not ask for. */
@@ -5004,6 +5494,16 @@ static void clReadHidden(const char *what, char *buf, size_t cap) {
 	hkServeInput(ask, 1, buf, cap);
 	return;
 #else
+	/* :remote on and a device sent the command: the device answers. This keyboard
+	   was never asked, and this computer's clipboard is not the device's to take */
+	if (hs_attached && hk_cmd_from_device) {
+		snprintf(ask, sizeof ask, "paste %s (input hidden): ", what);
+		hs_input_wait_s = 300;
+		hkServeInput(ask, 1, buf, cap);
+		hs_input_wait_s = 0;
+		hkSqueezeSpace(buf);
+		return;
+	}
 	if (E.serve_mode) { hkServeInput(ask, 1, buf, cap); hkSqueezeSpace(buf); return; }
 	if (E.pipe_mode) {
 		/* stdin is the wire: a raw fgets took the pane's next JSON line as the key */
@@ -9328,12 +9828,23 @@ static char *hkToolGrep(const char *input_json) {
 		free(pat);
 		return strdup(HK_ERR_OUTSIDE);
 	}
+	/* a path that is one file searches that file: small models ask grep about
+	   room.c and, told it is not a directory, ask again the same way */
+	char proj[PATH_MAX];
+	const char *one = NULL;
 	if (root_rc > 0) {
-		free(pat);
-		return strdup("error: that path is not a directory in this project. Use \".\" for the project root, or call list_dir first to see what is there.");
+		int is_dir = 1;
+		size_t pl = 0;
+		if (hk_fs_exists(root, NULL, NULL, &is_dir) && !is_dir && getcwd(proj, sizeof proj)
+		    && (pl = strlen(proj)) && !strncmp(root, proj, pl) && root[pl] == '/')
+			one = root + pl + 1;
+		if (!one) {
+			free(pat);
+			return strdup("error: that path is not a directory in this project. Use \".\" for the project root, or call list_dir first to see what is there.");
+		}
 	}
 
-	char *fglob = hkJsonFirst(input_json, "glob", "include", "file_pattern", NULL);
+	char *fglob = one ? NULL : hkJsonFirst(input_json, "glob", "include", "file_pattern", NULL);
 
 	hkGrepCtx g;
 	memset(&g, 0, sizeof(g));
@@ -9343,7 +9854,8 @@ static char *hkToolGrep(const char *input_json) {
 	g.icase = hkExtractJsonInt(input_json, "ignore_case") > 0;
 	g.wild  = (strchr(pat, '*') || strchr(pat, '?')) ? 1 : 0;
 
-	hkWalk(root, hkGrepVisit, &g);
+	if (one) { g.root = proj; hkGrepVisit(&g, one, 0); }
+	else hkWalk(root, hkGrepVisit, &g);
 
 	char tail[160];
 	if (!g.hits) {
@@ -15261,8 +15773,10 @@ static void *aiWorkerTurn(void *arg) {
 			return NULL;
 		}
 
+		/* a provider whose replies say nothing of limits: its usage endpoint, now and then */
+		if (!hk_lim_hdr) hkLimitsAsk(0);
 		hkHttpReq hreq = { .method = "POST", .url = parts.url, .headers = parts.headers,
-		                   .body = parts.body, .stream = parts.stream };
+		                   .body = parts.body, .stream = parts.stream, .limits = 1 };
 		void *http = hk_http_open(&hreq);
 		free(parts.url); free(parts.headers); free(parts.body);
 		if (!http) {
@@ -15394,6 +15908,7 @@ static void *aiWorkerTurn(void *arg) {
 			if (acc_len > 0) {
 				char *fixed = hkNormalizeToolDialect(acc);
 				if (fixed) { free(acc); acc = fixed; acc_len = strlen(acc); }
+				if (hk_lim_dirty) clPipeEmitLimits();
 				pthread_mutex_lock(&data->lock);
 				hkUpdateUsage(data, full_response);
 				aiPushHistoryStore(data, acc, HK_ROLE_AI);
@@ -15536,6 +16051,7 @@ static void *aiWorkerTurn(void *arg) {
 			continue;
 		}
 
+		if (hk_lim_dirty) clPipeEmitLimits();     /* the studio's ring follows each call */
 		pthread_mutex_lock(&data->lock);
 		hkUpdateUsage(data, full_response);
 		if (content && *content) {
@@ -15907,7 +16423,7 @@ static const hkCmd HK_CMDS[] = {
 	{ "login",     ':', "account",  "[provider|api]",  "sign in",                          0 },
 	{ "logout",    ':', "account",  "[provider]",      "forget a sign-in",                 0 },
 	{ "accounts",  ':', "account",  "",                "saved sign-ins",                   HK_CF_TURN },
-	{ "usage",     ':', "account",  "",                "tokens and cost",                  HK_CF_TURN },
+	{ "usage",     ':', "account",  "[bar|reset]",     "plan limits, tokens, cost",        HK_CF_TURN },
 	{ "skills",    ':', "skill",    "[reload]",        "installed skills",                 HK_CF_TURN },
 	{ "skill",     ':', "skill",    "install|uninstall", "add or remove skills",           0 },
 	{ "use",       ':', "skill",    "<skill|none>",    "a skill as a mode (= /<skill>)",   0 },
@@ -16325,6 +16841,7 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			prov = id;
 		}
 		hkEchoFlush(data);                           /* a sign-in prints; show what started it */
+		hk_lim_who[0] = '\0';                       /* another account's usage is not this one's */
 		if (strcmp(prov, "ollama") == 0 || strcmp(prov, "local") == 0 || strcmp(prov, "koi") == 0) {
 			hkApplyProviderAlias(prov);
 			hkSaveSession();
@@ -16361,8 +16878,10 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			return 1;
 		}
 		if (strcmp(prov, "openrouter") == 0) {
-			if (clOAuthOpenRouter(data) == 0) return 1;
-			aiAddHistory(data, "(browser sign-in did not finish; paste a key instead)");
+			/* its browser sign-in comes back to 127.0.0.1 here, which a phone cannot reach */
+			if (!HK_DESK_ACTIONS_OK()) aiAddHistory(data, "openrouter's browser sign-in finishes on this computer; paste a key instead");
+			else if (clOAuthOpenRouter(data) == 0) return 1;
+			else aiAddHistory(data, "(browser sign-in did not finish; paste a key instead)");
 			prov = "openrouter-api";
 		}
 		if (strcmp(prov, "nous") == 0) {
@@ -16382,7 +16901,9 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			else aiSayf(data, "no sign-in called '%s'. :login lists them", prov);
 			return 1;
 		}
-		if (url) {
+		if (url && hs_attached && hk_cmd_from_device) {
+			aiSayf(data, "get a key at %s, then paste it here", url);   /* the device asked: no browser opens on this desk */
+		} else if (url) {
 			aiSayf(data, "opening %s", url);
 			clOpenUrl(url);
 		} else {
@@ -17237,6 +17758,23 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 			aiAddHistory(data, "(usage counters reset)");
 			return 1;
 		}
+		if (arg && !strcmp(arg, "ask")) {          /* the studio's refresh: ask now, answer in one line */
+			hkLimitsAsk(1);
+			clPipeEmitLimits();
+			int m = hkLimMain();
+			if (m >= 0) aiSayf(data, "limits: %s %d%% used", hk_lim[m].name, hkLimPct(m));
+			else aiAddHistory(data, hk_lim_note[0] ? hk_lim_note : "limits: none reported yet");
+			return 1;
+		}
+		if (arg && !strncmp(arg, "bar", 3)) {      /* the plan's fullest window in the bar, or not */
+			const char *v = arg + 3; while (*v == ' ') v++;
+			hk_lim_bar = !strcmp(v, "on") ? 1 : !strcmp(v, "off") ? 0 : !hk_lim_bar;
+			hkRcSet("usage_bar", hk_lim_bar ? "1" : "0");
+			aiSayf(data, "usage in the bar: %s", hk_lim_bar ? "on" : "off");
+			if (hk_lim_bar && !hk_lim_n && !hk_lim_note[0]) hkLimitsAsk(1);
+			clPipeEmitLimits();                   /* Rei's header follows the bar */
+			return 1;
+		}
 		char msg[256];
 		aiSayf(data, "provider: %s", hkProviderLabel());
 		aiSayf(data, "model:    %s", E.ai_model ? E.ai_model : "(unset)");
@@ -17266,6 +17804,9 @@ static int hkHandleSlashCmd(aiData *data, const char *prompt) {
 				data->total_cache_write, data->total_cache_read);
 			aiAddHistory(data, msg);
 		}
+		hkLimitsAsk(1);
+		if (hk_lim_dirty) clPipeEmitLimits();
+		hkLimitsSay(data);
 		double cost = hkSessionCostUSD(data);
 		const char *flat = hkFreeTierLabel();
 		if (flat && !strcmp(flat, "sub")) {
@@ -17451,7 +17992,7 @@ static int hkRcFindGlobal(char *out, size_t cap) {
 
 /* Keys a cloned repo may not set: they could run something or carry the key off. */
 static int hkRcProjectDenied(const char *key) {
-	static const char *DENY[] = { "ai_api_key", "ai_endpoint", "ai_auto_approve", "editor", "voice_cmd", NULL };
+	static const char *DENY[] = { "ai_api_key", "ai_endpoint", "ai_auto_approve", "editor", "voice_cmd", "remote_idle", NULL };   /* remote_idle: how long this computer stays reachable */
 	for (int i = 0; DENY[i]; i++) if (!strcmp(key, DENY[i])) return 1;
 	size_t n = strlen(key);
 	if (n > 4 && !strcmp(key + n - 4, "_cmd"))
@@ -17638,6 +18179,8 @@ static void clRcApplyKey(const char *key, const char *val) {
 	else if (strcmp(key, "ai_auto_approve") == 0) { E.ai_auto_approve = atoi(val) ? 1 : 0; hk_rc_pin.auto_approve = 1; }
 	else if (strcmp(key, "update_check") == 0) { E.update_check = atoi(val) ? 1 : 0; }
 	else if (strcmp(key, "voice") == 0) { E.voice = atoi(val) ? 1 : 0; }
+	else if (strcmp(key, "remote_idle") == 0) { hk_remote_idle = atol(val); if (hk_remote_idle < 0) hk_remote_idle = 0; }
+	else if (strcmp(key, "usage_bar") == 0) { hk_lim_bar = atoi(val) ? 1 : 0; }
 	else if (strcmp(key, "voice_rate") == 0) { E.voice_rate = atoi(val); }
 	else if (strcmp(key, "voice_cmd") == 0) { free(E.voice_cmd); E.voice_cmd = *val ? strdup(val) : NULL; }
 	else if (strcmp(key, "anim_style") == 0) {
@@ -17843,6 +18386,8 @@ static void hkStateExtras(char **b, size_t *len, size_t *cap, int tool, int with
 		snprintf(tmp, sizeof tmp, ",\"update\":{\"current\":\"%s\",\"latest\":\"%s\"}", HAKO_VERSION, hk_update_latest);
 		hkSbAdd(b, len, cap, tmp, strlen(tmp));
 	}
+	hkLimitsJson(b, len, cap);
+	hk_lim_dirty = 0;
 	static long sent_sig = -1;
 	long sig = hkCmdCount();
 	for (int i = 0; i < hk_skill_n; i++) for (const char *q = hk_skill_names[i]; *q; q++) sig = sig * 31 + (unsigned char)*q;
@@ -21678,8 +22223,13 @@ static int hkServeInput(const char *prompt, int hidden, char *out, size_t cap) {
 	clPipeEmitRaw(req);
 
 	pthread_mutex_lock(&HS.a_lock);
-	while (!HS.input_ready)
-		pthread_cond_wait(&HS.a_cond, &HS.a_lock);
+	struct timespec until;
+	clock_gettime(CLOCK_REALTIME, &until);
+	until.tv_sec += hs_input_wait_s;
+	while (!HS.input_ready) {
+		if (hs_input_wait_s <= 0) pthread_cond_wait(&HS.a_cond, &HS.a_lock);
+		else if (pthread_cond_timedwait(&HS.a_cond, &HS.a_lock, &until) == ETIMEDOUT) { HS.input[0] = '\0'; break; }   /* the device went away */
+	}
 	snprintf(out, cap, "%s", HS.input);
 	HS.input_ready = 0;
 	HS.input_waiting = 0;
@@ -21689,12 +22239,18 @@ static int hkServeInput(const char *prompt, int hidden, char *out, size_t cap) {
 	return 0;
 }
 
-static void hsInputSet(const char *value) {
+/* An answer only while something asks: one that comes after the ask gave up (a phone's
+   box answered past the five minutes) would sit here, a key in memory, until the next ask */
+static int hsInputSet(const char *value) {
 	pthread_mutex_lock(&HS.a_lock);
-	snprintf(HS.input, sizeof(HS.input), "%s", value ? value : "");
-	HS.input_ready = 1;
-	pthread_cond_broadcast(&HS.a_cond);
+	int took = HS.input_waiting && !HS.input_ready;
+	if (took) {
+		snprintf(HS.input, sizeof(HS.input), "%s", value ? value : "");
+		HS.input_ready = 1;
+		pthread_cond_broadcast(&HS.a_cond);
+	}
 	pthread_mutex_unlock(&HS.a_lock);
+	return took;
 }
 
 static int hsAnswerSet(const char *ans) {
@@ -22572,7 +23128,7 @@ static int hkAgentsChats(hkAgentChat *out, int max) {
 		hkAgent a[HK_AGENTS_MAX];
 		int k = hkAgentsListFor(e->d_name, a, HK_AGENTS_MAX);
 		if (!hkAgentsWho(a, k, out[n].who, sizeof out[n].who, "")) { char p[PATH_MAX + 96]; if (hkFmtFits(p, sizeof p, "%s/%s", dir, e->d_name)) rmdir(p); continue; }
-		snprintf(out[n].sid, sizeof out[n].sid, "%s", e->d_name);
+		memcpy(out[n].sid, e->d_name, strlen(e->d_name) + 1);   /* fits: checked above */
 		n++;
 	}
 	closedir(d);
@@ -22919,7 +23475,7 @@ static void hkAgentsComings(aiData *data, const hkAgent *a, int n) {
 	static int was_n = -1;
 	static char was_sid[24];
 	int me = (int)getpid();
-	char line[200];
+	char line[256];   /* the longest names, provider and model fit whole */
 	if (was_n >= 0 && E.session_id && !strcmp(was_sid, E.session_id)) {
 		for (int i = 0; i < n; i++) {
 			if (a[i].pid == me) continue;
@@ -23586,9 +24142,9 @@ static void *hsConnThread(void *arg) {
 		hsSendOk(fd, ok);
 	} else if (!strncmp(req, "POST /api/input", 15)) {
 		char *body = hsReadBody(fd, req, used);
-		hsInputSet(body ? body : "");
-		free(body);
-		hsSendOk(fd, 1);
+		int took = hsInputSet(body ? body : "");
+		if (body) { memset(body, 0, strlen(body)); free(body); }
+		hsSendOk(fd, took);
 	} else if (!strncmp(req, "POST /api/stop", 14)) {
 		hkAbortTurn();                  /* as ^C: a local engine mid-prefill never reads the flag */
 		hsReleaseWaits();
@@ -23658,7 +24214,16 @@ static void *hsConnThread(void *arg) {
 }
 
 /* Remote reach is not left open by accident: two hours with nothing from a
-   device and --serve --token stops. HAKO_REMOTE_IDLE=<minutes>, 0 = never. */
+   device and --serve --token (this network, nobody at the desk) stops. :remote on
+   is the person at this terminal sharing it through their account: it stays on
+   until :remote off or the terminal closes, since a phone checks in hours later.
+   remote_idle=<minutes> in the rc or HAKO_REMOTE_IDLE sets either, 0 = never. */
+static long hsIdleMinutes(int attached) {
+	const char *iv = getenv("HAKO_REMOTE_IDLE");
+	if (iv && *iv) { long m = atol(iv); return m > 0 ? m : 0; }
+	if (hk_remote_idle >= 0) return hk_remote_idle;
+	return attached ? 0 : 120;
+}
 
 #if HK_ATTACH
 static void hsAttachOff(void);
@@ -23756,8 +24321,7 @@ static int hsStartThreads(int srv) {
 	}
 	pthread_detach(acc);
 	if (hs_remote) {
-		const char *iv = getenv("HAKO_REMOTE_IDLE");
-		long mins = iv && *iv ? atol(iv) : 120;
+		long mins = hsIdleMinutes(hs_attached);
 		pthread_t idle;
 		hs_last_seen = time(NULL);
 		if (mins > 0 && pthread_create(&idle, NULL, hsIdleThread, (void *)(intptr_t)mins) == 0)
@@ -24908,7 +25472,9 @@ static int clRepl(aiData *data) {
 				if (hs_attached) clPipeEmitMsg("user", line);
 			}
 			clOutBegin();
+			hk_cmd_from_device = from_remote && !from_agent;
 			int r = hkHandleSlash(data, line);
+			hk_cmd_from_device = 0;
 			hk_echo_pending = NULL;
 			clOutEnd(data);
 			if (hs_attached) { clPipeEmitState(); clPipeEmitDone(NULL); }
