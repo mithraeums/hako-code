@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.3-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.3"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.4-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.3"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -374,14 +374,12 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 
 ## Change Log
 
-### Latest: v0.4.3
+### Latest: v0.4.4
 
-- **Talk while it works.** `ctrl+t` puts a line into the running turn, read after the step it is on; enter still waits for the turn to end. Studio's **send now** does the same, and hake's Rei pane has it too.
-- **Mode switches take at once.** `:mode auto` from studio or a phone mid-turn takes right away and answers the tool that is waiting, instead of after every approval it was meant to skip.
-- **Chats that no longer get stuck.** A small model's broken tool call (a shell command for a name, arguments that are not JSON) is rebuilt before it goes back, so the provider stops refusing every later request. A call with no id runs once, and output that is not UTF-8 is mended.
-- **A file can't be flattened to one line.** The write and edit tools refuse a body that is only hako's receipt of an old write.
-- **Shared chats on the page.** Replies say which hako gave them, other hakos' lines reach a linked page, and `:say` shows there as chat.
-- `:login` works from hake's Rei pane, and the embedded studio follows long chats to their end again.
+- **Knows what is left.** The plan's usage as each provider reports it: a Claude or ChatGPT plan's 5 hour and weekly windows, Copilot's premium requests, an API key's rate ceilings, an OpenRouter or DeepSeek balance. `:usage` lists them, fullest first; `:usage bar` keeps the headline in the bar, and studio shows it as a ring.
+- **A phone can sign in through `:remote`.** A key or sign-in asked from the phone is answered on the phone; the desk's browser and clipboard are left alone.
+- **`:remote on` stays on** until `:remote off` or the terminal closes.
+- `grep` searches a single file given as its path, and the embedded studio has a tab bar on a phone and compact settings.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
 

@@ -3,7 +3,7 @@
 All notable changes to hako-code. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes between minor versions).
 
-## [Unreleased]
+## [v0.4.4] - 2026-11-24
 
 ### added
 - plan usage, as each provider reports it: a Claude or ChatGPT plan's 5 hour and weekly windows, Copilot's premium requests, an API key's rate ceilings, an OpenRouter or DeepSeek balance. read from the headers every reply carries, and from the provider's usage endpoint where one exists (`:usage`, then now and then for a provider whose replies say nothing). `:usage` lists every window with when it resets; the headline is the fullest, so the week leads when it is nearly gone and the 5 hours otherwise
