@@ -69,6 +69,9 @@ while True:
         if role == "user": last = body
         if role == "system": system = body
     log.write("---\n"); log.flush()
+    # a hako on a shared chat hears what the others said before the line for it:
+    # only that line picks the reply (an earlier "SLOW" there slept 30 s, 11-25)
+    if "[Now, to you" in last: last = last.split("[Now, to you", 1)[1]
     time.sleep(float(os.environ.get("HAKO_FAKE_DELAY", "0")))   # a slow turn, on demand
     if "SLOW" in last: time.sleep(30)
     rep = reply_for(last, system)

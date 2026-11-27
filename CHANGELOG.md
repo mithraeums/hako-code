@@ -21,6 +21,13 @@ This project follows semver (`v0.1.x` is pre-1.0; expect breaking changes betwee
 - the input row stood empty for a moment after a line was sent (the bar was drawn before the field's prompt); the bar draws the prompt itself
 - `grep` given one file as its path (`adventure/room.c`) searches that file; it said "not a directory", and a small model asked the same way again
 - three `-Wformat-truncation` warnings in a gcc build at `-O0` (iSh, Alpine): a chat id copied after its length was checked, and a notice of who came onto a chat sized for the longest names
+- a turn ended without a word when the model asked for a call it had already made that turn: reading a file again after editing it, or running the tests again after changing them. a call after a write, an edit, a shell command or a subagent is a new one now; a reply that only repeats a call gets the repeat notice and a chance to answer it, and a model that keeps at it is stopped with a line that says so
+- a subagent that stopped on a call that never ran handed back that raw call as its answer, and the asking model told you nothing had changed after it had edited four files; it says the subagent stopped mid-task and may already have changed files
+- over a Claude or ChatGPT sign-in, the start of a tool call (`<t`) reached a linked phone or `--serve` page as a reply row of its own before the call was recognized; the stream holds back what may still become a tag, as the local engine's already did
+- `:remote on` with two hakos on a chat: an `@name` line from the phone left the page saying "thinking" with a stop button until some later turn ended (the line was echoed as a turn and never got its end)
+- `:remote on` with two hakos on a chat: each row the other hako wrote reached the phone twice, as its own row and as this terminal's short note of it ("gpt was asked: ...", "gpt: ...")
+- a chat renamed or recolored on one hako (or from the phone) kept its old name on the other hakos on it, in their bar and on their linked pages
+- ctrl+c (or `:q`) while a local model was still thinking logged "hakm engine unavailable" as an error; it says the turn was interrupted
 
 ## [v0.4.3] - 2026-11-19
 

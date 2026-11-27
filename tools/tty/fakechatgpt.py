@@ -17,12 +17,47 @@ PORT, LOG = int(sys.argv[1]), sys.argv[2]
 def chunks(s, n=3):
     return [s[i:i + n] for i in range(0, len(s), n)]
 
+def text_of(item):
+    c = item.get("content", "")
+    if isinstance(c, list):
+        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return c
+
+def call(name, args):
+    return '<tool name="%s">\n%s\n</tool>' % (name, json.dumps(args))
+
+def repeat_scene(prompt, c, first):
+    """Calls repeated inside one turn (r.txt holds FIRSTLINE):
+      GPTREREAD:  read r.txt, write SECONDLINE, read r.txt again (same call, file changed)
+      GPTDUP:     read r.txt twice with nothing between; answers the repeat notice
+      GPTDUPLOOP: reads r.txt whatever it is told"""
+    read = call("read_file", {"path": "r.txt"})
+    if "GPTDUPLOOP" in prompt:
+        return read
+    if first:
+        return read
+    if "(repeat)" in c:
+        return "REPEAT NOTICE READ" if "GPTDUP" in prompt else "REREAD REFUSED"
+    if "GPTDUP" in prompt:
+        return read
+    if "wrote" in c:
+        return read
+    if "SECONDLINE" in c:
+        return "REREAD SAW SECONDLINE"
+    return call("write_file", {"path": "r.txt", "content": "SECONDLINE\n"})
+
 def reply_for(body):
     items = body.get("input", [])
     last = items[-1] if items else {}
-    c = last.get("content", "")
-    if isinstance(c, list):
-        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    c = text_of(last)
+    prompts = [text_of(i) for i in items if i.get("role") == "user" and "<observation" not in text_of(i)]
+    prompt = prompts[-1] if prompts else ""
+    if "GPTDELEGATE" in prompt and c == prompt:    # a subagent that will end on a call that never runs
+        return call("delegate", {"task": "GPTDUPLOOP read r.txt"})
+    if "GPTDELEGATE" in prompt:
+        return "DELEGATE CAME BACK"
+    if any(k in prompt for k in ("GPTREREAD", "GPTDUP")):
+        return repeat_scene(prompt, c, c == prompt)
     if "observation" in c:
         return "Found alpha.txt in the folder.\nThat is everything here."
     if "GPTGOESON" in c:

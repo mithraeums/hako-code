@@ -191,5 +191,26 @@ rm -f "$T/rc"
 init=$(printf '{"type":"quit"}\n' | HOME="$T/h" "$BIN" --pipe 2>/dev/null | head -1)
 case $init in *'"type":"init"'*'"commands":[{'*'"n":"theme"'*) ok "--pipe init carries the command table";; *) no "init has no commands: $init";; esac
 
+# 11-25: over a ChatGPT sign-in the reply streams in small pieces, and a "<t" sent
+# before "ool" arrived reached the phone as a row of its own ("HAKO <")
+GP=${HAKO_TEST_GPORT:-18913}
+python3 "$(cd "$(dirname "$0")" && pwd)/tty/fakechatgpt.py" $GP "$T/gpt.log" &
+gpid=$!
+rm -rf "$T/h" "$T/p"; mkdir -p "$T/h/.hako" "$T/p"
+printf 'ai_provider=openai\nai_model=gpt-5.5\nai_endpoint=http://127.0.0.1:%s/backend-api/codex\nshow_splash=0\nai_auto_approve=1\n' $GP >"$T/h/.hakorc"
+jwt=$(python3 -c 'import base64,json
+b=lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+print("%s.%s.sig" % (b({"alg":"none"}), b({"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-1"}})))')
+printf 'ai_provider=openai\nai_oauth_provider=chatgpt\nai_api_key=%s\nai_oauth_refresh=r\nai_oauth_expires_at=4102444800\n' "$jwt" >"$T/h/.hako/state"
+HOME="$T/h" "$BIN" --serve --port $P --dir "$T/p" </dev/null >"$T/serve.out" 2>&1 &
+pid=$!; i=0; until curl -s -o /dev/null "$U/api/state" || [ $i -ge 50 ]; do sleep 0.1; i=$((i+1)); done
+curl -s -N "$U/api/events" >"$T/ev" 2>/dev/null &
+cp=$!; sleep 0.3
+curl -s -o /dev/null -X POST --data 'GPTTOOL' "$U/api/prompt"
+i=0; until [ "$(dones)" -ge 1 ] || [ $i -ge 100 ]; do sleep 0.1; i=$((i+1)); done
+grep '"type":"delta"' "$T/ev" | grep -q 'check what' && ok "a ChatGPT reply streams to the page" || no "no ChatGPT deltas reached the page"
+grep '"type":"delta"' "$T/ev" | grep -q '<\|\\u003c' && no "the start of a ChatGPT tool tag reached the page as reply text" || ok "no part of a ChatGPT tool tag reaches the page"
+finish; kill $gpid 2>/dev/null; wait $gpid 2>/dev/null
+
 rm -rf "$T"
 [ $fail = 0 ] && echo "RESULT: PASS" || { echo "RESULT: FAIL"; exit 1; }

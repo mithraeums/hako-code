@@ -694,6 +694,26 @@ L = r.all_lines()
 sent = open(GLOG, errors="replace").read()
 check("no project directory" not in sent and not any("no project directory" in l for l in L),
       "hako hangs up at </tool>, so an invented result goes nowhere", r)
+# a call repeated inside one turn. The repeat check ended the turn without a word
+# when gpt read room.c again after editing it (11-25, the user's phone test).
+open(os.path.join(PROJ, "r.txt"), "w").write("FIRSTLINE\n")
+def turn_saw(r, prompt, text, secs=20):   # the old code ends these turns silently: no text to wait on
+    r.send(prompt + "\r")
+    try: r.wait_for(text, secs)
+    except SystemExit: pass
+    settle(r)
+turn_saw(r, "GPTREREAD", "SAW SECONDLINE")
+check(any("REREAD SAW SECONDLINE" in l for l in r.all_lines()), "reading a file again after writing it runs, not a repeat", r)
+turn_saw(r, "GPTDUPLOOP", "already ran")
+check(any("asked again for a call it already ran" in l for l in r.all_lines()),
+      "a model stuck on one call is stopped with a line that says so", r)
+turn_saw(r, "GPTDUP", "NOTICE READ")
+check(any("REPEAT NOTICE READ" in l for l in r.all_lines()),
+      "a reply that only repeats a call gets the notice and answers it", r)
+turn_saw(r, "GPTDELEGATE", "CAME BACK", 40)
+obs = re.findall(r'<observation tool=\\"delegate\\">(.*?)</observation>', open(GLOG, errors="replace").read())
+check(obs and "stopped mid-task" in obs[-1] and "<tool" not in obs[-1],
+      "a subagent that ends on a call that never ran says so, not its raw call", r)
 r.send("GPTLIMIT\r"); r.wait_for("usage limit", 20); settle(r)
 check(any("The usage limit has been reached (resets in 3h 12m)" in l for l in r.all_lines()), "a usage limit says when it resets", r)
 r.send(":models refresh\r"); r.wait_for("gpt-fake-mini", 10); settle(r)
@@ -945,6 +965,10 @@ check(any("runs when this turn ends" in l for l in r.all_lines()), "a command th
 check(any("1 queued" in l for l in r.lines()), "queued, where the bar shows it", r)
 r.send("\x03"); r.pump(0.8)
 r.close()
+r = start(engine="slowhakm.py")                 # stopped while it thinks: no word from the engine yet
+r.send("hello\r"); r.pump(1.5); r.send("\x03"); r.pump(1.5)
+check(not any("engine unavailable" in l for l in r.all_lines()), "ctrl+c while the model thinks says interrupted, not that the engine is gone", r)
+r.close()
 os.environ["HAKO_FAKE_DELAY"] = "0"
 
 print("§picker a picker fits the screen it is on (image 4)")
@@ -1026,6 +1050,11 @@ check(any("\u00b7 alpha.txt" in l for l in r2.all_lines()) and not any("* `alpha
 check(both_wait(r1, "sho2 is on this chat now (mithraeum hako-sho)", 10), "the one already there is told who came", r1)
 r2.send(":join\r"); r2.pump(0.8)
 check(any("sho is on this chat with you already" in l for l in r2.lines()), "a :join once joined says who is here, not that nobody is", r2)
+# 11-25: a rename from the phone reached one hako; the other kept the old name
+r1.send(":name chat b\r"); r1.pump(0.5)
+check(both_wait(r2, "chat b", 10) and any("chat b" in l and "─" in l for l in r2.lines()),
+      "a chat renamed on one hako shows the new name on the other", r2)
+r1.send(":name chat a\r"); both_wait(r2, "chat a", 10)
 r1.send(":agents\r"); r1.pump(1.0)
 check(any("sho (this one)" in l for l in r1.lines()) and any("sho2 · mithraeum" in l for l in r1.lines()),
       "each hako is listed by its model's name, the second one numbered", r1)
@@ -1100,7 +1129,8 @@ r1.send("\x15"); quiet()
 r2.send("please fix the file\r"); quiet()
 open(FAKE_LOG, "w").close()
 r1.send("thanks\r"); fake_has("please fix the file"); quiet()
-check('<observation tool="list_dir">' not in open(FAKE_LOG).read(),
+mine = [q for q in open(FAKE_LOG).read().split("\n---\n") if "(sho):]" in q]   # this hako's requests: sho2 may work on its own task
+check(mine and not any('<observation tool="list_dir">' in q for q in mine),
       "a task in what another hako was asked does not set this model off on one (the line asked is judged)")
 open(FAKE_LOG, "w").close()
 r2.send("GREET him\r")

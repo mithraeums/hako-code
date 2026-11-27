@@ -10809,6 +10809,19 @@ static char hk_repeat_sig[512] = "";
 static int  hk_repeat_count = 0;
 #define HK_REPEAT_LIMIT 3
 
+/* Bumps each time a tool that can change something runs (a write, an edit, a
+   shell, a subagent). A read repeated after one is a new question, not a loop:
+   reading room.c again after editing it was refused as a repeat and the turn
+   ended without a word. */
+static unsigned hk_world_epoch = 0;
+static int hkToolReadOnly(const char *name) {
+	static const char *ro[] = { "read_file", "list_dir", "glob", "grep", "read_skill",
+	                            "web_fetch", "ask_user", "remember", NULL };
+	if (!name) return 0;
+	for (int i = 0; ro[i]; i++) if (!strcmp(name, ro[i])) return 1;
+	return 0;
+}
+
 static void hkRepeatReset(void) {
 	for (int i = 0; i < HK_REPEAT_RING; i++) hk_repeat_ring[i][0] = '\0';
 	hk_repeat_head = 0;
@@ -11111,8 +11124,11 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 		return strdup("(benchmark: tool recorded, not executed)");
 	}
 	{
-		char sig[512];
-		snprintf(sig, sizeof(sig), "%s|%.400s", name, input_json ? input_json : "");
+		char sig[512];   /* a read counts again once something changed; a change always counts */
+		if (hkToolReadOnly(name))
+			snprintf(sig, sizeof(sig), "%u|%s|%.400s", hk_world_epoch, name, input_json ? input_json : "");
+		else
+			snprintf(sig, sizeof(sig), "%s|%.400s", name, input_json ? input_json : "");
 		if (hkRepeatSeen(sig) > HK_REPEAT_LIMIT)
 			return strdup("error: this exact call has already run several times with the same "
 			              "result. Do not repeat it. Change the arguments, try a different tool, "
@@ -11123,7 +11139,9 @@ static char *hkExecToolInner(const char *name, const char *input_json) {
 		if (d) snprintf(d, 160, "error: user denied tool '%s'. Do not retry it; explain or ask the user how to proceed.", name);
 		return d ? d : strdup("error: user denied tool");
 	}
-	return hkExecToolLocked(name, input_json);
+	char *out = hkExecToolLocked(name, input_json);
+	if (!hkToolReadOnly(name)) hk_world_epoch++;
+	return out;
 }
 
 /* ---- one writer at a time ----
@@ -12694,10 +12712,11 @@ static char *hkExtractRawJsonArray(const char *src, const char *key) {
 static int hkDupCall(char ***seen, int *n, int *cap, const char *name, const char *args) {
 	if (!name) return 0;
 	if (!args) args = "";
-	size_t need = strlen(name) + 1 + strlen(args) + 1;
+	size_t need = 12 + strlen(name) + 1 + strlen(args) + 1;
 	char *sig = malloc(need);
 	if (!sig) return 0;
-	snprintf(sig, need, "%s\037%s", name, args);
+	/* "this turn" means since the last change: the same call after a write is new */
+	snprintf(sig, need, "%u\037%s\037%s", hk_world_epoch, name, args);
 	for (int i = 0; i < *n; i++) if (!strcmp((*seen)[i], sig)) { free(sig); return 1; }
 	if (*n == *cap) {
 		int nc = *cap ? *cap * 2 : 8;
@@ -14531,6 +14550,19 @@ static char *hkFindHakm(void) {
 #endif
 }
 
+/* How much of s may show now: all of it but a tail from its last '<' that could
+   still grow into a tag the stream hides, so no page or screen draws "<to" as text. */
+static size_t hkTagSafe(const char *s, size_t n) {
+	static const char *tags[] = { "<tool", "<write_file", "<invoke", "<observation" };
+	size_t i = n;
+	while (i > 0 && s[i - 1] != '<') i--;
+	if (!i) return n;
+	size_t lt = i - 1, tl = n - lt;
+	for (size_t k = 0; k < sizeof tags / sizeof *tags; k++)
+		if (tl < strlen(tags[k]) && !strncmp(s + lt, tags[k], tl)) return lt;
+	return n;
+}
+
 #if !defined(_WIN32) && !defined(HAKO_WASM)
 #ifndef HAKO_WASM
 static pid_t g_hakm_pid = -1;
@@ -14599,19 +14631,6 @@ static int hkHakmEnsure(const char *hakm, const char *weights) {
 	if (!g_hakm_w || !g_hakm_r) { hkHakmKill(); return -1; }
 	g_hakm_weights = strdup(weights);
 	return 0;
-}
-
-/* How much of s may show now: all of it but a tail from its last '<' that could
-   still grow into a tag the stream hides, so no page or screen draws "<to" as text. */
-static size_t hkTagSafe(const char *s, size_t n) {
-	static const char *tags[] = { "<tool", "<write_file", "<invoke", "<observation" };
-	size_t i = n;
-	while (i > 0 && s[i - 1] != '<') i--;
-	if (!i) return n;
-	size_t lt = i - 1, tl = n - lt;
-	for (size_t k = 0; k < sizeof tags / sizeof *tags; k++)
-		if (tl < strlen(tags[k]) && !strncmp(s + lt, tags[k], tl)) return lt;
-	return n;
 }
 
 static char *hkHakmRoundtrip(const char *frame, size_t flen, char **eng) {
@@ -15059,9 +15078,10 @@ static char *hkMithraeumChat(aiData *data, char **err) {
 	if (!out) {
 		if (err) {
 			char m[1024];
-			if (E.interrupt && engine_said[0]) {
+			if (E.interrupt) {
 				/* We killed it: :q or ^C SIGTERMs the engine on purpose. That is
-				   not an error and must not read like one. */
+				   not an error and must not read like one, said something or not
+				   (11-25: one stopped while thinking logged "engine unavailable") */
 				snprintf(m, sizeof(m), "(interrupted — engine stopped)");
 			} else if (engine_said[0]) {
 				const char *said = engine_said;
@@ -15510,6 +15530,7 @@ static void *aiWorkerTurn(void *arg) {
 	int oriented = 0;
 	char **xseen = NULL; int xseen_n = 0, xseen_cap = 0;
 	int loop_warned = 0;
+	int dup_stop = 0;                   /* ended on a call it already ran: say so */
 	int token_retried = 0;
 	int cache_retried = 0;
 	int stream_retried = 0;
@@ -15632,6 +15653,7 @@ static void *aiWorkerTurn(void *arg) {
 					}
 					if (dups > 0) {
 						if (!loop_warned) { loop_warned = 1; continue; }
+						dup_stop = 1;
 						break;
 					}
 					if (!repaired) {
@@ -15802,6 +15824,7 @@ static void *aiWorkerTurn(void *arg) {
 		if (streaming_mode) {
 			char *acc = calloc(1, 1);
 			size_t acc_len = 0, acc_cap = 1;
+			size_t shown = 0;                 /* how much of acc went out live */
 			int printed_prefix = 0;
 			/* Live, like the local engine: the text dialect (what Claude uses over
 			   OAuth) goes quiet at its first tag and the partial line is taken back.
@@ -15839,10 +15862,18 @@ static void *aiWorkerTurn(void *arg) {
 						if (printed_prefix) { clStreamUnecho(&sline); sline.len = 0; clStreamPark(&sline); }
 					}
 				}
-				if (!quiet && !E.pipe_mode && !E.output_json) {
-					if (!printed_prefix) { clStopAnim(data); printed_prefix = 1; }
-					clStreamPush(&sline, text);
-				} else if (!quiet && E.serve_mode) hkDeltaPush(text);
+				/* out goes all but a tail that may still grow into a tag: a "<" sent
+				   before "tool" arrived reached the page as its own row */
+				size_t safe = quiet ? 0 : hkTagSafe(acc + shown, acc_len - shown);
+				if (safe) {
+					char keep = acc[shown + safe]; acc[shown + safe] = '\0';
+					if (!E.pipe_mode && !E.output_json) {
+						if (!printed_prefix) { clStopAnim(data); printed_prefix = 1; }
+						clStreamPush(&sline, acc + shown);
+					} else if (E.serve_mode) hkDeltaPush(acc + shown);
+					acc[shown + safe] = keep;
+					shown += safe;
+				}
 				free(text);
 				/* no stop sequences on this API: hang up at the call ourselves,
 				   before the model writes on and invents the result */
@@ -15852,6 +15883,12 @@ static void *aiWorkerTurn(void *arg) {
 			hk_http_close(http);
 			clStopAnim(data);
 			if (full_response) full_response[total] = '\0';
+			if (!quiet && shown < acc_len) {   /* a "<" that never became a tag */
+				if (!E.pipe_mode && !E.output_json) {
+					if (!printed_prefix) { clStopAnim(data); printed_prefix = 1; }
+					clStreamPush(&sline, acc + shown);
+				} else if (E.serve_mode) hkDeltaPush(acc + shown);
+			}
 
 			int has_tool_call_in_acc = acc_len > 0 && hkHasToolBlock(acc);
 			if (!E.pipe_mode && printed_prefix) {
@@ -15929,6 +15966,14 @@ static void *aiWorkerTurn(void *arg) {
 						used_tool = 1;
 						continue;
 					}
+					/* only calls it already made: let it read the notice and answer,
+					   once. Breaking here ended the turn mid-task without a word. */
+					if (dups > 0 && !loop_warned) {
+						loop_warned = 1;
+						free(full_response);
+						continue;
+					}
+					if (dups > 0) dup_stop = 1;
 					if (has_tool_call_in_acc && !dups) {
 						pthread_mutex_lock(&data->lock);
 						aiAddHistoryRole(data, acc, HK_ROLE_AI);
@@ -16105,7 +16150,11 @@ static void *aiWorkerTurn(void *arg) {
 			int n = hkReactToolExecAll(data, content, &xseen, &xseen_n, &xseen_cap, &dups, NULL);
 			free(content);
 			free(full_response);
-			if (n == 0) break;
+			if (n == 0) {
+				if (dups > 0 && !loop_warned) { loop_warned = 1; continue; }
+				if (dups > 0) dup_stop = 1;
+				break;
+			}
 			used_tool = 1;
 			continue;
 		}
@@ -16141,6 +16190,8 @@ static void *aiWorkerTurn(void *arg) {
 	pthread_mutex_lock(&data->lock);
 	if (hk_repeat_count > HK_REPEAT_LIMIT)
 		aiAddHistory(data, "(stopped: the same tool call was repeating with no progress)");
+	else if (dup_stop)
+		aiAddHistory(data, "(stopped: it asked again for a call it already ran, with nothing changed since)");
 	else if (iter >= max_iters && used_tool) aiSayf(data, "(tool loop cap: %d tool rounds this turn. continue picks it up; HAKO_MAX_ITERS raises it, up to 40)", max_iters);
 	data->last_turn_ms = clWallMs() - data->turn_start_ms;
 	data->streaming = 0;
@@ -20552,6 +20603,13 @@ static char *hkToolDelegate(const char *input_json) {
 	                : strstr(out, "error: command timed out") ? "it ran past its time limit" : NULL;
 	free(out);
 	char *body = resp ? hkJsonUnescape(resp, (int)strlen(resp)) : err ? hkJsonUnescape(err, (int)strlen(err)) : NULL;
+	if (body && resp && hkHasToolBlock(body)) {
+		/* it ended on a step that never ran: its raw call came back as the answer,
+		   and the parent told the user nothing was changed after four edits */
+		free(body);
+		body = strdup("it stopped mid-task: its last step was a tool call that never ran. "
+		              "It may already have changed files; read them before redoing its work.");
+	}
 	free(resp); free(err);
 	size_t n = (body ? strlen(body) : 0) + strlen(head) + 160;
 	char *res = malloc(n);
@@ -23286,6 +23344,22 @@ static void hkPeerEmit(const char *role, const char *by, const char *to, const c
 static void hkAgentsRow(aiData *data, const char *row, int *said) {
 	char role[16], by[24], to[24];
 	hkRowField(row, "role", role, sizeof role);
+	if (!strcmp(role, "meta")) {                  /* named or colored on another hako: the chat's, so here too */
+		char *nm = hkExtractJsonString(row, "name"), *co = hkExtractJsonString(row, "color");
+		if (strcmp(nm ? nm : "", E.session_name ? E.session_name : "")
+		    || strcmp(co ? co : "", E.session_color ? E.session_color : "")) {
+			free(E.session_name);  E.session_name  = nm && *nm ? nm : NULL;
+			free(E.session_color); E.session_color = co && *co ? co : NULL;
+			if (!E.session_name) free(nm);
+			if (!E.session_color) free(co);
+			nm = co = NULL;
+			if (!*said) clOutBegin();             /* its end draws the bar again, with the new name */
+			*said = 1;
+			if (hs_attached) clPipeEmitState();   /* and a linked page shows it (11-25: it kept the old one) */
+		}
+		free(nm); free(co);
+		return;
+	}
 	hkRowField(row, "by", by, sizeof by);
 	hkRowField(row, "to", to, sizeof to);
 	if (!by[0] || !strcmp(by, hk_agent_name)) return;
@@ -23304,7 +23378,9 @@ static void hkAgentsRow(aiData *data, const char *row, int *said) {
 		*said = 1;
 		char line[480];                               /* shown and sent to a linked device, not logged again: the row is in the log */
 		snprintf(line, sizeof line, "chat from %s: %.400s", by, c);
+		hk_say_secret = 1;                            /* the terminal's note; the page gets the row below */
 		aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
+		hk_say_secret = 0;
 		if (hs_attached) hkPeerEmit("chat", by, "", c);  /* a linked page draws it as a line between people */
 		free(c);
 		return;
@@ -23347,7 +23423,11 @@ static void hkAgentsRow(aiData *data, const char *row, int *said) {
 	*said = 1;
 	char line[520];
 	snprintf(line, sizeof line, "%s: %s%s", head, shown, cut ? " \xE2\x80\xA6" : "");
+	/* the short note is for this terminal: a linked page got it twice, the note
+	   ("gpt was asked: ...") and the row itself, for every line another hako wrote */
+	hk_say_secret = 1;
 	aiAddHistoryRole(data, line, HK_ROLE_SYSTEM);
+	hk_say_secret = 0;
 	if (hs_attached) hkPeerEmit(user ? "user" : "ai", by, to, c);   /* a linked page shows it whole, as theirs */
 	free(c);
 }
@@ -25485,7 +25565,12 @@ static int clRepl(aiData *data) {
 
 #if HK_ATTACH
 		/* @name, or :route: the line goes to another hako on this session */
-		if (!from_agent && hkAgentsRoute(data, line, sizeof line)) continue;
+		if (!from_agent && hkAgentsRoute(data, line, sizeof line)) {
+			/* nothing runs here, but the page took the echoed line as a turn: it
+			   said "thinking" with a stop button until some later turn ended */
+			if (hs_attached) clPipeEmitDone(NULL);
+			continue;
+		}
 #endif
 		/* Wipe the composing area, then print what was written as part of the
 		   conversation. */

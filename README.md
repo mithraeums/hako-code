@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.4-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.3"/></a>
+  <a href="https://github.com/mithraeums/hako-code/releases"><img src="https://img.shields.io/badge/version-v0.4.4-ece7da?style=flat-square&labelColor=14130f" alt="v0.4.4"/></a>
   <img src="https://img.shields.io/badge/license-GPL--3.0-ece7da?style=flat-square&labelColor=14130f" alt="GPL-3.0"/>
   <img src="https://img.shields.io/badge/C99-single%20file-ece7da?style=flat-square&labelColor=14130f" alt="C99 single file"/>
   <img src="https://img.shields.io/badge/providers-14-ece7da?style=flat-square&labelColor=14130f" alt="14 providers"/>
@@ -379,6 +379,7 @@ Browse the catalog: [mithraeums/skills](https://github.com/mithraeums/skills).
 - **Knows what is left.** The plan's usage as each provider reports it: a Claude or ChatGPT plan's 5 hour and weekly windows, Copilot's premium requests, an API key's rate ceilings, an OpenRouter or DeepSeek balance. `:usage` lists them, fullest first; `:usage bar` keeps the headline in the bar, and studio shows it as a ring.
 - **A phone can sign in through `:remote`.** A key or sign-in asked from the phone is answered on the phone; the desk's browser and clipboard are left alone.
 - **`:remote on` stays on** until `:remote off` or the terminal closes.
+- **Two hakos on one chat, from a phone.** A turn never ends without a word (a re-read after an edit runs; a model stuck repeating itself is stopped with a line that says so), each line shows once, an `@name` line ends cleanly, and a rename reaches every hako on the chat.
 - `grep` searches a single file given as its path, and the embedded studio has a tab bar on a phone and compact settings.
 
 Every earlier release, and the full detail, is in **[CHANGELOG.md](CHANGELOG.md)**.
